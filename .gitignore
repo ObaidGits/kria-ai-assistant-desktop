@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+.coverage.*
+
+# Environment & secrets
+.env
+docker/secrets/*.txt
+docker/secrets/*.key
+
+# Data & models
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Large model files (download via scripts/download_models.py)
+*.gguf
+*.onnx
+*.onnx.json
+*.bin
+*.pt
+*.safetensors
+
+# Logs
+*.log
+data/logs/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Node (dashboard tooling)
+node_modules/

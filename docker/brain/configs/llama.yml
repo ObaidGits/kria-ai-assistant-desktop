@@ -1,0 +1,26 @@
+# llama.cpp server configuration for K.R.I.A.
+# These values are passed as CLI args in entrypoint.sh
+
+model: /models/qwen3-8b-moe-q4_k_m.gguf
+draft_model: /models/qwen3-0.6b-q8_0.gguf
+
+# Server settings
+host: 0.0.0.0
+port: 8080
+
+# Inference settings
+context_length: 8192
+gpu_layers: 99
+threads: 8
+batch_size: 512
+flash_attention: true
+mlock: true
+continuous_batching: true
+
+# Speculative decoding
+draft_tokens: 5
+
+# Sampling defaults (overridable per request)
+temperature: 0.3
+top_p: 0.9
+repeat_penalty: 1.1

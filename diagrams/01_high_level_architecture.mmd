@@ -1,0 +1,66 @@
+graph TB
+    subgraph USER["👤 User Interface Layer"]
+        MIC["🎙️ Microphone Array"]
+        SPK["🔊 Speaker Output"]
+        GUI["🖥️ Web Dashboard<br/>React + WebSocket"]
+    end
+
+    subgraph SENSORY["⚡ Sensory Pipeline — Sub-500ms Loop"]
+        VAD["Silero VAD<br/>Voice Activity Detection"]
+        STT["Whisper.cpp<br/>Streaming STT — GPU Accelerated"]
+        TTS["Piper TTS<br/>VITS Neural Voices"]
+        WAKE["OpenWakeWord<br/>Custom Hotword Engine"]
+    end
+
+    subgraph BRAIN["🧠 Reasoning Brain — Local LLM"]
+        ROUTER["Intent Router<br/>Lightweight Classifier"]
+        LLM["Qwen3-8B MoE<br/>via llama.cpp GGUF Q4_K_M"]
+        CTX["Context Manager<br/>Sliding Window + RAG"]
+        PLAN["Agentic Planner<br/>ReAct Loop"]
+    end
+
+    subgraph EXEC["⚙️ Execution Layer — OS Integration"]
+        TOOLS["Tool Registry<br/>Function Calling Interface"]
+        SANDBOX["Sandboxed Code Executor<br/>Bubblewrap + seccomp"]
+        OS_API["OS Control API<br/>PowerShell / WMI / Win32"]
+        FS["File System Agent<br/>Scoped Access Control"]
+        APP["App Launcher<br/>COM Automation"]
+    end
+
+    subgraph SAFETY["🛡️ Safety & Guardrails"]
+        HITL["Human-in-the-Loop<br/>Approval Gateway"]
+        AUDIT["Audit Logger<br/>Tamper-Proof Logs"]
+        POLICY["Policy Engine<br/>Action Classification"]
+        ROLLBACK["Rollback Manager<br/>System Restore Points"]
+    end
+
+    subgraph INFRA["🐳 Infrastructure Layer"]
+        DOCKER["Docker Compose<br/>GPU Passthrough"]
+        VRAM["VRAM Orchestrator<br/>Dynamic Model Swapping"]
+        REDIS["Redis<br/>State & Message Bus"]
+        SQLITE["SQLite<br/>Conversation Memory"]
+    end
+
+    MIC --> WAKE --> VAD --> STT
+    STT --> ROUTER
+    ROUTER --> LLM
+    LLM --> PLAN
+    PLAN --> TOOLS
+    TOOLS --> SANDBOX
+    TOOLS --> OS_API
+    TOOLS --> FS
+    TOOLS --> APP
+    TOOLS --> SAFETY
+    SAFETY --> HITL
+    LLM --> TTS --> SPK
+    GUI -.->|WebSocket| BRAIN
+    INFRA -.->|Manages| BRAIN
+    INFRA -.->|Manages| SENSORY
+    INFRA -.->|Manages| EXEC
+
+    style USER fill:#1a1a2e,stroke:#e94560,color:#fff
+    style SENSORY fill:#16213e,stroke:#0f3460,color:#fff
+    style BRAIN fill:#0f3460,stroke:#533483,color:#fff
+    style EXEC fill:#533483,stroke:#e94560,color:#fff
+    style SAFETY fill:#2d132c,stroke:#e94560,color:#fff
+    style INFRA fill:#1a1a2e,stroke:#0f3460,color:#fff

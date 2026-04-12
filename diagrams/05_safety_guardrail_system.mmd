@@ -1,0 +1,38 @@
+graph TD
+    ACTION["Incoming Action Request"] --> CLASSIFY{"Policy Engine<br/>Risk Classification"}
+    
+    CLASSIFY -->|🟢 GREEN| AUTO["Auto-Execute"]
+    CLASSIFY -->|🟡 YELLOW| NOTIFY["Execute + Notify User"]
+    CLASSIFY -->|🔴 RED| CONFIRM["Block + Request Approval"]
+    CLASSIFY -->|⛔ BLACK| DENY["Hard Deny — Always Blocked"]
+    
+    AUTO --> LOG["Audit Log"]
+    NOTIFY --> LOG
+    CONFIRM --> HITL_GATE{"Human Decision"}
+    
+    HITL_GATE -->|"Approved + PIN"| EXEC_SAFE["Execute with Rollback Point"]
+    HITL_GATE -->|Denied| CANCEL["Cancel + Log Denial"]
+    
+    EXEC_SAFE --> SNAPSHOT["Create System Restore Point"]
+    SNAPSHOT --> EXECUTE["Execute Action"]
+    EXECUTE --> VERIFY{"Verify Success"}
+    VERIFY -->|OK| LOG
+    VERIFY -->|Failed| ROLLBACK["Auto-Rollback to Snapshot"]
+    ROLLBACK --> LOG
+    
+    DENY --> LOG
+    CANCEL --> LOG
+
+    subgraph EXAMPLES["Risk Level Examples"]
+        G["🟢 GREEN: Open app, read file,<br/>get system info, web search"]
+        Y["🟡 YELLOW: Install package,<br/>modify user config, kill process"]
+        R["🔴 RED: Delete files, modify registry,<br/>change network settings, sudo ops"]
+        B["⛔ BLACK: Format disk, disable firewall,<br/>modify boot config, delete system files"]
+    end
+
+    style CLASSIFY fill:#1a1a2e,stroke:#e94560,color:#fff
+    style AUTO fill:#1b4332,stroke:#40916c,color:#fff
+    style NOTIFY fill:#7b6d00,stroke:#ffd60a,color:#fff
+    style CONFIRM fill:#6a040f,stroke:#d00000,color:#fff
+    style DENY fill:#000,stroke:#d00000,color:#fff
+    style EXAMPLES fill:#161b22,stroke:#8b949e,color:#fff

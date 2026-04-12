@@ -1,0 +1,56 @@
+graph TB
+    subgraph DOCKER["🐳 Docker Compose Stack"]
+        direction TB
+        
+        subgraph GPU_CONTAINER["kria-brain — GPU Container"]
+            LLAMA["llama.cpp Server<br/>OpenAI-compatible API"]
+            WHISPER_S["Whisper.cpp Server<br/>Streaming gRPC"]
+        end
+        
+        subgraph CPU_CONTAINER["kria-voice — CPU Container"]
+            PIPER_S["Piper TTS Server<br/>HTTP API"]
+            VAD_S["VAD + Wake Word<br/>Audio Pipeline"]
+            AUDIO["PulseAudio Bridge<br/>Host Audio Access"]
+        end
+        
+        subgraph CORE_CONTAINER["kria-core — Orchestrator"]
+            FASTAPI["FastAPI Orchestrator<br/>Main Event Loop"]
+            TOOL_REG["Tool Registry<br/>Plugin System"]
+            AGENT_LOOP["ReAct Agent Loop<br/>Planning & Execution"]
+        end
+        
+        subgraph DATA_CONTAINER["kria-data — Persistence"]
+            REDIS_S["Redis 7<br/>Pub/Sub + Cache"]
+            SQLITE_S["SQLite<br/>Conversations + Logs"]
+            CHROMA["ChromaDB<br/>Vector Memory"]
+        end
+        
+        subgraph SAFETY_CONTAINER["kria-guard — Safety"]
+            POLICY_S["Policy Engine"]
+            AUDIT_S["Audit Logger"]
+            HITL_S["HITL WebSocket"]
+        end
+    end
+
+    subgraph HOST["🖥️ Host System"]
+        NVIDIA["NVIDIA Container Toolkit"]
+        PULSE["PulseAudio / PipeWire"]
+        DBUS["D-Bus / PowerShell Remoting"]
+    end
+
+    GPU_CONTAINER -->|nvidia-docker| NVIDIA
+    CPU_CONTAINER -->|audio passthrough| PULSE
+    CORE_CONTAINER -->|OS commands| DBUS
+    
+    CORE_CONTAINER --> GPU_CONTAINER
+    CORE_CONTAINER --> CPU_CONTAINER
+    CORE_CONTAINER --> DATA_CONTAINER
+    CORE_CONTAINER --> SAFETY_CONTAINER
+
+    style DOCKER fill:#0d1117,stroke:#58a6ff,color:#fff
+    style HOST fill:#161b22,stroke:#8b949e,color:#fff
+    style GPU_CONTAINER fill:#1b4332,stroke:#40916c,color:#fff
+    style CPU_CONTAINER fill:#003049,stroke:#669bbc,color:#fff
+    style CORE_CONTAINER fill:#533483,stroke:#e94560,color:#fff
+    style DATA_CONTAINER fill:#3d405b,stroke:#81b29a,color:#fff
+    style SAFETY_CONTAINER fill:#6a040f,stroke:#d00000,color:#fff

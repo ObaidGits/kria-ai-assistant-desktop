@@ -1,0 +1,49 @@
+{
+  "theme": "dark",
+  "themeVariables": {
+    "primaryColor": "#0f3460",
+    "primaryTextColor": "#ffffff",
+    "primaryBorderColor": "#533483",
+    "lineColor": "#e94560",
+    "secondaryColor": "#16213e",
+    "tertiaryColor": "#1a1a2e",
+    "fontFamily": "Segoe UI, Arial, sans-serif",
+    "fontSize": "16px",
+    "noteBkgColor": "#16213e",
+    "noteTextColor": "#ffffff",
+    "noteBorderColor": "#533483",
+    "actorBkg": "#0f3460",
+    "actorTextColor": "#ffffff",
+    "actorBorder": "#533483",
+    "activationBkgColor": "#533483",
+    "activationBorderColor": "#e94560",
+    "signalColor": "#e94560",
+    "signalTextColor": "#ffffff",
+    "labelBoxBkgColor": "#16213e",
+    "labelBoxBorderColor": "#533483",
+    "labelTextColor": "#ffffff",
+    "loopTextColor": "#ffffff",
+    "altSectionBkgColor": "#1a1a2e"
+  },
+  "flowchart": {
+    "curve": "basis",
+    "padding": 20,
+    "nodeSpacing": 50,
+    "rankSpacing": 60,
+    "htmlLabels": true,
+    "useMaxWidth": false
+  },
+  "sequence": {
+    "diagramMarginX": 50,
+    "diagramMarginY": 30,
+    "actorMargin": 80,
+    "width": 200,
+    "height": 65,
+    "boxMargin": 10,
+    "boxTextMargin": 5,
+    "noteMargin": 10,
+    "messageMargin": 40,
+    "mirrorActors": true,
+    "useMaxWidth": false
+  }
+}

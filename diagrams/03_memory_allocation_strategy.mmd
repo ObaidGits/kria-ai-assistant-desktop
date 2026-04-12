@@ -1,0 +1,26 @@
+graph LR
+    subgraph VRAM["🎮 GPU VRAM — 6-8 GB RTX"]
+        LLM_GPU["Qwen3-8B Q4_K_M<br/>~5.2 GB VRAM"]
+        WHISPER_GPU["Whisper-medium<br/>~1.5 GB VRAM"]
+    end
+
+    subgraph RAM["💾 System RAM — 16 GB"]
+        OS_RAM["Windows OS<br/>~4 GB"]
+        PIPER["Piper TTS<br/>~300 MB"]
+        VAD_R["VAD + Wake<br/>~100 MB"]
+        REDIS_R["Redis + SQLite<br/>~200 MB"]
+        ORCHESTRATOR["KRIA Core<br/>~500 MB"]
+        HEADROOM["Free Headroom<br/>~3.9 GB"]
+        LLM_SPILL["LLM Overflow<br/>CPU Offload ~2 GB"]
+    end
+
+    subgraph SWAP["📀 NVMe Swap — Fallback"]
+        SWAP_FILE["Pagefile 8-16 GB<br/>Emergency Overflow"]
+    end
+
+    LLM_GPU -.->|Offload layers| LLM_SPILL
+    LLM_SPILL -.->|If RAM full| SWAP_FILE
+
+    style VRAM fill:#1b4332,stroke:#40916c,color:#fff
+    style RAM fill:#003049,stroke:#669bbc,color:#fff
+    style SWAP fill:#6a040f,stroke:#d00000,color:#fff

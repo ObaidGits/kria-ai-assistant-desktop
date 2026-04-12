@@ -1,0 +1,70 @@
+sequenceDiagram
+    participant U as 👤 User
+    participant W as OpenWakeWord
+    participant V as Silero VAD
+    participant S as Whisper.cpp STT
+    participant R as Intent Router
+    participant L as Qwen3-8B LLM
+    participant P as Policy Engine
+    participant H as HITL Gateway
+    participant T as Tool Executor
+    participant K as TTS Piper
+    
+    Note over U,K: Target under 500ms End-to-End Voice Loop
+
+    U->>W: Hey KRIA... (~50ms)
+    activate W
+    W->>V: Wake word detected
+    deactivate W
+    activate V
+    V->>S: Voice segment stream
+    deactivate V
+    activate S
+    Note right of S: GPU-accelerated ~120ms for 3s audio
+    S->>R: Transcribed text ~120ms
+    deactivate S
+    activate R
+    R->>R: Classify intent (~5ms)
+    
+    alt Simple Command (e.g., "open Chrome")
+        R->>T: Direct tool dispatch
+        activate T
+        T->>P: Check policy
+        activate P
+        P-->>T: GREEN — Auto-approve
+        deactivate P
+        T->>T: Execute action (~30ms)
+        T->>K: Chrome opened
+        deactivate T
+    else Complex Query (needs reasoning)
+        R->>L: Forward to LLM
+        deactivate R
+        activate L
+        Note right of L: Streaming tokens ~200ms first token
+        L->>P: Proposed action plan
+        activate P
+        P-->>L: Action risk level
+        deactivate P
+        
+        alt HIGH RISK action
+            L->>H: Request approval
+            activate H
+            H->>U: Allow format C drive? [Y/N]
+            U->>H: Decision
+            H->>L: Approved/Denied
+            deactivate H
+        end
+        
+        L->>T: Execute tool calls
+        activate T
+        T->>T: Sandboxed execution
+        T-->>L: Results
+        deactivate T
+        L->>K: Generate response
+        deactivate L
+    end
+    
+    activate K
+    Note right of K: Neural TTS ~80ms
+    K->>U: 🔊 Spoken response
+    deactivate K

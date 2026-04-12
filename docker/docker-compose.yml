@@ -1,0 +1,225 @@
+# K.R.I.A. Docker Compose — Production Deployment
+# Requires: Docker 27+, Docker Compose 2.x
+# GPU mode:  docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+# CPU mode:  docker compose up -d
+
+services:
+  # ============================================================
+  # kria-brain: LLM + STT inference (CPU by default)
+  # For GPU add: docker-compose.gpu.yml override
+  # ============================================================
+  kria-brain:
+    build:
+      context: ./brain
+      dockerfile: Dockerfile
+    container_name: kria-brain
+    environment:
+      # Default: 0.6B model (~2GB RAM). Set 8b for Qwen3-8B (~10GB RAM or GPU mode).
+      - LLAMA_MODEL_SIZE=0.6b
+      - LLAMA_GPU_LAYERS=0
+    volumes:
+      - kria-models:/models:ro
+      # configs/ is baked into the image at build time (COPY configs/ /configs/)
+      # No bind-mount needed — avoids Docker Desktop NTFS path restrictions.
+    ports:
+      - "127.0.0.1:8080:8080"  # llama.cpp API
+      - "127.0.0.1:8081:8081"  # whisper.cpp API
+    networks:
+      - kria-net
+    # No memory limit — Qwen3-8B needs ~10 GB (8 GB model + KV cache).
+    # Requires swap space to run on systems with < 12 GB free RAM.
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 300s
+    restart: unless-stopped
+
+  # ============================================================
+  # kria-voice: Piper TTS HTTP server
+  # Audio I/O handled by host-side kria_bridge.py
+  # ============================================================
+  kria-voice:
+    build:
+      context: ./voice
+      dockerfile: Dockerfile
+    container_name: kria-voice
+    environment:
+      - PIPER_DEFAULT_VOICE=en_US-lessac-high
+    volumes:
+      - kria-models:/models:ro
+    ports:
+      - "127.0.0.1:8082:8082"  # Piper TTS API
+    networks:
+      - kria-net
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    depends_on:
+      kria-brain:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ============================================================
+  # kria-core: Main orchestrator (FastAPI + Agent Loop)
+  # ============================================================
+  kria-core:
+    build:
+      context: ..
+      dockerfile: docker/core/Dockerfile
+    container_name: kria-core
+    environment:
+      - KRIA_ENV=production
+      - KRIA_LLAMA_API_URL=http://kria-brain:8080
+      - KRIA_WHISPER_API_URL=http://kria-brain:8081
+      - KRIA_PIPER_API_URL=http://kria-voice:8082
+      - KRIA_REDIS_URL=redis://kria-data:6379/0
+      - KRIA_CHROMA_URL=http://kria-data:8083
+      - KRIA_BRIDGE_URL=http://host.docker.internal:9000
+      - KRIA_BRIDGE_SECRET_FILE=/run/secrets/bridge_secret
+      - KRIA_SQLITE_PATH=/data/kria.db
+      - KRIA_CHROMADB_HOST=kria-data
+      - KRIA_VOICE_ENABLED=false
+      # TTS voice (must match a .onnx model in /models/piper/)
+      - KRIA_TTS_VOICE=en_US-lessac-high
+      # Set to a partial mic label to prefer a specific microphone in the web UI.
+      # Leave blank (default) to use the browser's default device.
+      # Example: KRIA_MIC_DEVICE_LABEL=Yeti
+      - KRIA_MIC_DEVICE_LABEL=
+    volumes:
+      - kria-data:/data
+      - kria-core-cache:/home/kria/.cache
+    ports:
+      - "127.0.0.1:8000:8000"  # REST API + WebSocket
+    networks:
+      - kria-net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    secrets:
+      - bridge_secret
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    depends_on:
+      kria-brain:
+        condition: service_healthy
+      kria-data:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+    restart: unless-stopped
+
+  # ============================================================
+  # kria-data: Persistence layer (Redis + ChromaDB)
+  # ============================================================
+  kria-data:
+    build:
+      context: ./data
+      dockerfile: Dockerfile
+    container_name: kria-data
+    volumes:
+      - kria-redis-data:/data/redis
+      - kria-chroma-data:/data/chroma
+      - kria-data:/data/sqlite
+    ports:
+      - "127.0.0.1:6379:6379"   # Redis
+      - "127.0.0.1:8083:8083"   # ChromaDB
+    networks:
+      - kria-net
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  # ============================================================
+  # kria-dashboard: Web UI (static HTML served by Nginx)
+  # ============================================================
+  kria-dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: kria-dashboard
+    ports:
+      - "127.0.0.1:3000:80"  # Nginx serving UI
+    networks:
+      - kria-net
+    depends_on:
+      kria-core:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+    restart: unless-stopped
+
+  # ============================================================
+  # kria-init: One-shot model downloader (runs on first boot)
+  # ============================================================
+  kria-init:
+    build:
+      context: ..
+      dockerfile: docker/init/Dockerfile
+    container_name: kria-init
+    volumes:
+      - kria-models:/models
+    environment:
+      - HF_HUB_ENABLE_HF_TRANSFER=1
+    profiles:
+      - setup  # Only runs with: docker compose --profile setup up kria-init
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+# ================================================================
+# Volumes
+# ================================================================
+volumes:
+  kria-models:
+    name: kria-models
+    driver: local
+  kria-data:
+    name: kria-data
+    driver: local
+  kria-redis-data:
+    name: kria-redis-data
+    driver: local
+  kria-chroma-data:
+    name: kria-chroma-data
+    driver: local
+  kria-core-cache:
+    name: kria-core-cache
+    driver: local
+
+# ================================================================
+# Networks
+# ================================================================
+networks:
+  kria-net:
+    name: kria-net
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+# ================================================================
+# Secrets
+# ================================================================
+secrets:
+  bridge_secret:
+    # Must be on a Linux filesystem — NTFS bind-mounts are not supported by Docker.
+    # The setup script copies this to ~/.kria/bridge_secret.txt automatically.
+    file: /home/obaid/.kria/bridge_secret.txt

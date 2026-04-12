@@ -1,0 +1,88 @@
+# K.R.I.A. Brain Container — LLM + STT (CUDA/GPU mode)
+#
+# Builds both llama-server and whisper-server from source with CUDA support.
+# No Linux CUDA pre-built binaries exist for either project, so source compilation
+# is required.
+#
+# WARNING: First build takes 20-40 minutes. Docker layer caching makes
+#          subsequent rebuilds fast when the version tags don't change.
+#
+# Used automatically by:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+
+# ── Builder base (CUDA dev kit for compiling both projects) ───────
+FROM nvidia/cuda:12.6.0-devel-ubuntu24.04 AS builder-base
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+# Make CUDA driver stubs available for linking (no real GPU during docker build)
+RUN ln -s /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/lib/libcuda.so \
+    && ln -s /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/lib/libcuda.so.1 \
+    && ldconfig
+
+# ── Stage 1: Build llama-server with CUDA ─────────────────────────
+FROM builder-base AS llama-builder
+ARG LLAMA_CPP_VERSION=b8762
+WORKDIR /src
+RUN git clone --depth 1 --branch ${LLAMA_CPP_VERSION} \
+        https://github.com/ggml-org/llama.cpp .
+RUN cmake -B build \
+        -DGGML_CUDA=ON \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DLLAMA_BUILD_TESTS=OFF \
+    && cmake --build build --target llama-server -j$(nproc)
+
+# ── Stage 2: Build whisper-server with CUDA ───────────────────────
+FROM builder-base AS whisper-builder
+ARG WHISPER_VERSION=v1.8.4
+WORKDIR /src
+RUN git clone --depth 1 --branch ${WHISPER_VERSION} \
+        https://github.com/ggml-org/whisper.cpp .
+RUN cmake -B build \
+        -DGGML_CUDA=ON \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DWHISPER_BUILD_TESTS=OFF \
+    && cmake --build build --target whisper-server -j$(nproc)
+
+# ── Stage 3: Runtime image ────────────────────────────────────────
+FROM nvidia/cuda:12.6.0-runtime-ubuntu24.04
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# llama.cpp: binary + ALL shared libraries from entire build tree
+COPY --from=llama-builder /src/build/bin/llama-server /usr/local/bin/llama-server
+COPY --from=llama-builder /src/build/ /tmp/llama-build/
+RUN find /tmp/llama-build -name '*.so*' -exec cp -P {} /usr/local/lib/ \; \
+    && find /tmp/llama-build -name 'libggml-*.so' -exec cp {} /usr/local/bin/ \; \
+    && rm -rf /tmp/llama-build
+
+# whisper.cpp: binary + shared libraries
+COPY --from=whisper-builder /src/build/bin/whisper-server /usr/local/bin/whisper-server
+COPY --from=whisper-builder /src/build/src/ /tmp/whisper-libs/
+COPY --from=whisper-builder /src/build/ggml/src/ /tmp/whisper-ggml-libs/
+RUN find /tmp/whisper-libs /tmp/whisper-ggml-libs -name '*.so*' -exec cp -P {} /usr/local/lib/ \; \
+    && rm -rf /tmp/whisper-libs /tmp/whisper-ggml-libs
+
+RUN ldconfig \
+    && chmod +x /usr/local/bin/llama-server /usr/local/bin/whisper-server
+
+# Model directory (mounted as volume)
+VOLUME /models
+
+# Copy startup configuration
+COPY configs/ /configs/
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+EXPOSE 8080 8081
+
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=60s \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+ENTRYPOINT ["/entrypoint.sh"]
