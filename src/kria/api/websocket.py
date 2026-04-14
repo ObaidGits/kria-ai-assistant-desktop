@@ -54,6 +54,11 @@ async def broadcast(data: dict | str) -> None:
     _connections.difference_update(dead)
 
 
+def ws_clients_count() -> int:
+    """Return the number of active WebSocket connections."""
+    return len(_connections)
+
+
 # ── WebSocket endpoint ────────────────────────────────────────────
 
 @ws_router.websocket("/ws")
@@ -99,6 +104,10 @@ async def _handle_message(ws: WebSocket, msg: dict) -> None:
 
     if msg_type == "hitl":
         await _handle_hitl(ws, msg)
+        return
+
+    if msg_type == "interaction_choice":
+        await _handle_interaction_choice(ws, msg)
         return
 
     await ws.send_json({"type": "error", "message": f"Unknown message type: {msg_type!r}"})
@@ -157,6 +166,25 @@ async def _handle_hitl(ws: WebSocket, msg: dict) -> None:
             "request_id": request_id,
             "resolved": resolved,
             "approved": approved,
+        })
+    except Exception as exc:
+        await ws.send_json({"type": "error", "message": str(exc)})
+
+
+async def _handle_interaction_choice(ws: WebSocket, msg: dict) -> None:
+    request_id = msg.get("request_id", "")
+    choice_index = msg.get("choice_index", 0)
+    if not request_id:
+        await ws.send_json({"type": "error", "message": "Missing request_id"})
+        return
+    try:
+        from kria.agent.interaction import interaction_gateway
+        resolved = await interaction_gateway.submit_choice(request_id, int(choice_index))
+        await ws.send_json({
+            "type": "interaction_response",
+            "request_id": request_id,
+            "resolved": resolved,
+            "choice_index": choice_index,
         })
     except Exception as exc:
         await ws.send_json({"type": "error", "message": str(exc)})

@@ -1,0 +1,23 @@
+# llama.cpp server configuration for K.R.I.A. — SECONDARY brain
+# Used by kria-brain-secondary container (Qwen2.5-VL-7B-Instruct)
+# These values are passed as CLI args in entrypoint.sh
+
+model: /models/llm/Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf   # Unsloth Q4_K_M
+
+# Server settings
+host: 0.0.0.0
+port: 8085
+
+# Inference settings — more context for complex multi-step reasoning
+context_length: 16384
+gpu_layers: 99
+threads: 8
+batch_size: 512
+flash_attention: true
+mlock: true
+continuous_batching: true
+
+# Sampling defaults (overridable per request)
+temperature: 0.6
+top_p: 0.95
+repeat_penalty: 1.05

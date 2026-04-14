@@ -69,23 +69,135 @@ async def search_files(
     directory: str = ".",
     recursive: bool = True,
     file_extension: Optional[str] = None,
+    hierarchical: bool = True,
 ) -> dict:
+    """
+    Search for files/folders matching a name pattern (regex).
+
+    When hierarchical=True (default), searches outward in stages:
+      1. Starting directory
+      2. Parent directory
+      3. Current disk/mount root
+      4. All mounted storage devices
+    Stops expanding once matches are found at a given level.
+
+    When hierarchical=False, searches only the given directory.
+    """
     base = _safe_path(directory)
     if not base.exists():
         return {"error": f"Directory not found: {directory}"}
-    glob_fn = base.rglob if recursive else base.glob
-    ext_filter = f"*.{file_extension.lstrip('.')}" if file_extension else "*"
-    matches = []
+
     try:
         pat = re.compile(pattern, re.IGNORECASE)
     except re.error as exc:
         return {"error": f"Invalid regex pattern: {exc}"}
-    for f in glob_fn(ext_filter):
-        if f.is_file() and pat.search(f.name):
-            matches.append({"path": str(f), "name": f.name, "size_bytes": f.stat().st_size})
-        if len(matches) >= 200:
+
+    ext_filter = f"*.{file_extension.lstrip('.')}" if file_extension else "*"
+    max_per_level = 200
+
+    def _scan(search_dir: Path) -> list[dict]:
+        """Scan a directory and return matches."""
+        if not search_dir.exists() or not search_dir.is_dir():
+            return []
+        glob_fn = search_dir.rglob if recursive else search_dir.glob
+        hits: list[dict] = []
+        try:
+            for f in glob_fn(ext_filter):
+                if pat.search(f.name):
+                    entry = {
+                        "path": str(f),
+                        "name": f.name,
+                        "type": "directory" if f.is_dir() else "file",
+                        "parent": str(f.parent),
+                    }
+                    if f.is_file():
+                        try:
+                            entry["size_bytes"] = f.stat().st_size
+                        except OSError:
+                            pass
+                    hits.append(entry)
+                if len(hits) >= max_per_level:
+                    break
+        except PermissionError:
+            pass
+        return hits
+
+    # Simple (non-hierarchical) mode
+    if not hierarchical:
+        matches = _scan(base)
+        return {"matches": matches, "count": len(matches), "truncated": len(matches) == max_per_level}
+
+    # Hierarchical search: expand outward
+    levels_searched: list[str] = []
+    all_matches: list[dict] = []
+
+    # Level 1: Starting directory
+    matches = _scan(base)
+    levels_searched.append(str(base))
+    if matches:
+        return {
+            "matches": matches,
+            "count": len(matches),
+            "search_level": "current_directory",
+            "searched": levels_searched,
+            "truncated": len(matches) == max_per_level,
+        }
+
+    # Level 2: Parent directory
+    parent = base.parent
+    if parent != base:
+        matches = _scan(parent)
+        levels_searched.append(str(parent))
+        if matches:
+            return {
+                "matches": matches,
+                "count": len(matches),
+                "search_level": "parent_directory",
+                "searched": levels_searched,
+                "truncated": len(matches) == max_per_level,
+            }
+
+    # Level 3: Current disk/mount root
+    # Find the mount point for the current directory
+    mount_root = base
+    while mount_root.parent != mount_root:
+        if mount_root.is_mount() or str(mount_root) == "/":
             break
-    return {"matches": matches, "count": len(matches), "truncated": len(matches) == 200}
+        mount_root = mount_root.parent
+
+    if str(mount_root) not in levels_searched:
+        matches = _scan(mount_root)
+        levels_searched.append(str(mount_root))
+        if matches:
+            return {
+                "matches": matches,
+                "count": len(matches),
+                "search_level": "current_disk",
+                "searched": levels_searched,
+                "truncated": len(matches) == max_per_level,
+            }
+
+    # Level 4: All mounted storage (Linux: /media, /mnt, /home; plus /)
+    extra_roots: list[Path] = []
+    for mp in [Path("/media"), Path("/mnt"), Path("/home"), Path("/")]:
+        if mp.exists() and str(mp) not in levels_searched:
+            extra_roots.append(mp)
+
+    for er in extra_roots:
+        found = _scan(er)
+        levels_searched.append(str(er))
+        all_matches.extend(found)
+        if len(all_matches) >= max_per_level:
+            all_matches = all_matches[:max_per_level]
+            break
+
+    return {
+        "matches": all_matches,
+        "count": len(all_matches),
+        "search_level": "all_disks",
+        "searched": levels_searched,
+        "truncated": len(all_matches) == max_per_level,
+    }
 
 
 @isolated
@@ -164,8 +276,14 @@ tool_registry.register("list_directory", list_directory,
     description="List files and folders in a directory.",
     parameters_schema={"path": {"type": "string", "default": "."}, "show_hidden": {"type": "boolean", "default": False}})
 tool_registry.register("search_files", search_files,
-    description="Search for files matching a pattern name (regex) in a directory.",
-    parameters_schema={"pattern": {"type": "string"}, "directory": {"type": "string", "default": "."}, "recursive": {"type": "boolean"}, "file_extension": {"type": "string"}})
+    description="Search for files and folders matching a name pattern (regex). By default searches hierarchically: current dir → parent → disk → all disks. Shows full paths.",
+    parameters_schema={
+        "pattern": {"type": "string", "description": "Name pattern (regex) to search for"},
+        "directory": {"type": "string", "default": ".", "description": "Starting directory for search"},
+        "recursive": {"type": "boolean", "default": True},
+        "file_extension": {"type": "string", "description": "Filter by file extension (e.g. 'pdf', 'py')"},
+        "hierarchical": {"type": "boolean", "default": True, "description": "Search outward: current dir → parent → disk → all disks"},
+    })
 tool_registry.register("write_file", write_file,
     description="Write text content to a file (creates parent directories if needed).",
     parameters_schema={"path": {"type": "string"}, "content": {"type": "string"}, "overwrite": {"type": "boolean", "default": True}})

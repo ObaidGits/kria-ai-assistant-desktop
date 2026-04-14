@@ -3,10 +3,10 @@
 # Requires: NVIDIA Container Toolkit installed on the host
 #
 # VRAM Budget (RTX 4050 6 GB):
-#   Whisper medium.en  : ~1.5 GB (GPU, --gpu-layers 99)
-#   Qwen3-0.6B-Q8_0   : ~0.9 GB (GPU, LLAMA_GPU_LAYERS=99)
-#   CUDA overhead      : ~0.5 GB
-#   Total              : ~2.9 GB / 6.0 GB  (3.1 GB headroom)
+#   Whisper large-v3-turbo : ~1.5 GB (GPU, --gpu-layers 99)
+#   Phi-4-mini-instruct    : ~2.5 GB (GPU, LLAMA_GPU_LAYERS=99)
+#   CUDA overhead          : ~0.5 GB
+#   Total                  : ~4.5 GB / 6.0 GB  (1.5 GB headroom)
 
 services:
   kria-brain:
@@ -18,11 +18,11 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - CUDA_MODULE_LOADING=LAZY
-      # LLM: 0.6B on GPU (0.9 GB VRAM). Set 8b + LLAMA_GPU_LAYERS=0 for CPU if VRAM is tight.
-      - LLAMA_MODEL_SIZE=0.6b
+      # LLM: Phi-4-mini-instruct on GPU (~2.5 GB VRAM)
+      - LLAMA_BRAIN_ROLE=primary
       - LLAMA_GPU_LAYERS=99
-      # STT: medium.en on GPU (~1.5 GB VRAM). Best accuracy/speed balance.
-      - WHISPER_MODEL=ggml-medium.en.bin
+      # STT: large-v3-turbo on GPU (~1.5 GB VRAM). Best accuracy/speed balance.
+      - WHISPER_MODEL=ggml-large-v3-turbo.bin
       - WHISPER_GPU_LAYERS=99
     deploy:
       resources:

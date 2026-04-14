@@ -1,9 +1,10 @@
 """
 Web Tools (GREEN tier — read-only network requests)
 ====================================================
-web_search   → DuckDuckGo HTML scraping (no API key required)
+web_search    → DuckDuckGo HTML scraping (no API key required)
 fetch_webpage → Extract main text via trafilatura
-get_weather  → wttr.in JSON API (no API key required)
+get_weather   → wttr.in JSON API (no API key required)
+deep_search   → Combined search: DuckDuckGo discovery + Trafilatura extraction
 """
 import logging
 import urllib.parse
@@ -19,41 +20,38 @@ logger = logging.getLogger("kria.tools.web_tools")
 _HTTP_TIMEOUT = 15.0
 _MAX_CONTENT = 20 * 1024  # 20 KB cap on response content
 
+_BROWSER_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+)
+
 
 @isolated
 async def web_search(query: str, max_results: int = 5) -> dict:
-    """Search the web via DuckDuckGo HTML endpoint (no API key required)."""
-    encoded = urllib.parse.quote_plus(query)
-    url = f"https://html.duckduckgo.com/html/?q={encoded}"
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; KRIA/1.0)"}
+    """Search the web via DuckDuckGo (no API key required)."""
+    import asyncio
     try:
-        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT, follow_redirects=True) as client:
-            resp = await client.get(url, headers=headers)
-            resp.raise_for_status()
+        from duckduckgo_search import DDGS
+
+        def _do_search():
+            with DDGS() as ddgs:
+                return list(ddgs.text(query, max_results=max_results))
+
+        raw = await asyncio.to_thread(_do_search)
+        results = []
+        for i, r in enumerate(raw):
+            results.append({
+                "rank": i + 1,
+                "title": r.get("title", ""),
+                "snippet": r.get("body", ""),
+                "url": r.get("href", ""),
+            })
+        return {"query": query, "results": results, "count": len(results)}
+    except ImportError:
+        return {"error": "duckduckgo-search package not installed", "results": []}
     except Exception as exc:
+        logger.warning("web_search failed: %s", exc)
         return {"error": str(exc), "results": []}
-
-    # Parse result snippets from raw HTML (no external HTML parser required)
-    import re
-    html = resp.text
-    results = []
-    # DuckDuckGo result structure: class="result__a" and class="result__snippet"
-    titles = re.findall(r'class="result__a"[^>]*>(.*?)</a>', html, re.DOTALL)
-    snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</div>', html, re.DOTALL)
-    urls_raw = re.findall(r'class="result__url"[^>]*>(.*?)</a>', html, re.DOTALL)
-
-    def _strip_tags(text: str) -> str:
-        return re.sub(r"<[^>]+>", "", text).strip()
-
-    for i in range(min(max_results, len(titles))):
-        results.append({
-            "rank": i + 1,
-            "title": _strip_tags(titles[i]),
-            "snippet": _strip_tags(snippets[i]) if i < len(snippets) else "",
-            "url": _strip_tags(urls_raw[i]) if i < len(urls_raw) else "",
-        })
-
-    return {"query": query, "results": results, "count": len(results)}
 
 
 @isolated
@@ -62,30 +60,20 @@ async def fetch_webpage(
     include_headers: bool = False,
     include_links: bool = False,
 ) -> dict:
-    """Fetch and extract the main text content of a webpage using trafilatura."""
+    """Fetch and extract the main text content of a webpage using the preprocessing pipeline."""
     if not url.startswith(("http://", "https://")):
         return {"url": url, "content": "", "error": "Invalid URL scheme — only http:// and https:// allowed"}
     try:
-        import trafilatura
-        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT, follow_redirects=True) as client:
-            resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0 (compatible; KRIA/1.0)"})
-            resp.raise_for_status()
-        html = resp.text
-        text = trafilatura.extract(html, include_links=include_links, include_tables=True)
+        from kria.preprocessing.web import preprocess_url
+        payload = await preprocess_url(url, include_links=include_links)
         return {
             "url": url,
-            "content": (text or "")[:_MAX_CONTENT],
-            "truncated": len(text or "") > _MAX_CONTENT,
-            "status_code": resp.status_code,
+            "content": payload.text,
+            "truncated": payload.truncated,
+            "token_estimate": payload.token_estimate,
+            "parser": payload.metadata.get("parser", "unknown"),
+            "status_code": payload.metadata.get("status_code", 0),
         }
-    except ImportError:
-        # Fallback: strip tags manually
-        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT, follow_redirects=True) as client:
-            resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0 (compatible; KRIA/1.0)"})
-        import re
-        text = re.sub(r"<[^>]+>", " ", resp.text)
-        text = " ".join(text.split())
-        return {"url": url, "content": text[:_MAX_CONTENT], "truncated": True, "status_code": resp.status_code}
     except Exception as exc:
         return {"url": url, "content": "", "error": str(exc)}
 
@@ -101,7 +89,7 @@ async def get_weather(location: str, units: str = "metric") -> dict:
     url = f"https://wttr.in/{encoded}?format=j1&{unit_flag}"
     try:
         async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
-            resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0 (compatible; KRIA/1.0)"})
+            resp = await client.get(url, headers={"User-Agent": _BROWSER_UA})
             resp.raise_for_status()
             data = resp.json()
         current = data["current_condition"][0]
@@ -119,6 +107,81 @@ async def get_weather(location: str, units: str = "metric") -> dict:
         return {"error": str(exc), "location": location}
 
 
+@isolated
+async def deep_search(query: str, max_pages: int = 3) -> dict:
+    """
+    Deep web search: DuckDuckGo discovery + Trafilatura extraction.
+
+    1. Runs a DuckDuckGo search to find relevant URLs.
+    2. Fetches the top results and extracts clean text via Trafilatura.
+    3. Returns structured results with full article content as markdown.
+
+    Use this when a user asks for detailed/current information from the web.
+    """
+    import asyncio
+    import re
+
+    # Step 1: DuckDuckGo discovery via duckduckgo-search library
+    try:
+        from duckduckgo_search import DDGS
+
+        def _do_search():
+            with DDGS() as ddgs:
+                return list(ddgs.text(query, max_results=max_pages + 2))
+
+        raw = await asyncio.to_thread(_do_search)
+    except ImportError:
+        return {"error": "duckduckgo-search package not installed", "results": []}
+    except Exception as exc:
+        return {"error": f"Search failed: {exc}", "results": []}
+
+    # Collect valid URLs
+    discovered: list[dict] = []
+    for r in raw:
+        url = r.get("href", "")
+        if url and url.startswith("http"):
+            discovered.append({
+                "title": r.get("title", ""),
+                "url": url,
+                "snippet": r.get("body", ""),
+            })
+
+    if not discovered:
+        return {"query": query, "results": [], "error": "No results found", "count": 0}
+
+    # Step 2: Extract content via preprocessing pipeline from top results
+    results: list[dict] = []
+    from kria.preprocessing.web import preprocess_url
+
+    for item in discovered[:max_pages]:
+        try:
+            payload = await preprocess_url(item["url"], max_tokens=3500)
+            results.append({
+                "title": item["title"],
+                "url": item["url"],
+                "snippet": item["snippet"],
+                "content": payload.text[:_MAX_CONTENT],
+                "extracted": bool(payload.text),
+                "token_estimate": payload.token_estimate,
+            })
+        except Exception as exc:
+            logger.debug("deep_search: failed to extract %s: %s", item["url"], exc)
+            results.append({
+                "title": item["title"],
+                "url": item["url"],
+                "snippet": item["snippet"],
+                "content": "",
+                "error": str(exc),
+            })
+
+    return {
+        "query": query,
+        "results": results,
+        "count": len(results),
+        "extraction_method": "preprocessing_pipeline",
+    }
+
+
 # ── Register ─────────────────────────────────────────────────────
 
 tool_registry.register("web_search", web_search,
@@ -130,3 +193,6 @@ tool_registry.register("fetch_webpage", fetch_webpage,
 tool_registry.register("get_weather", get_weather,
     description="Get current weather for a location. No API key required.",
     parameters_schema={"location": {"type": "string"}, "units": {"type": "string", "default": "metric"}})
+tool_registry.register("deep_search", deep_search,
+    description="Deep web search: searches DuckDuckGo, then extracts full article text from top results via Trafilatura. Use for detailed/current information.",
+    parameters_schema={"query": {"type": "string", "description": "Search query"}, "max_pages": {"type": "integer", "default": 3, "description": "Number of pages to extract (1-5)"}})

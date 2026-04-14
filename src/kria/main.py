@@ -39,7 +39,7 @@ async def lifespan(app: FastAPI):
     """Managed startup / shutdown for all K.R.I.A. services."""
     setup_logging()
     logger.info("=" * 56)
-    logger.info("  K.R.I.A. v1.0.0 — Starting up")
+    logger.info("  K.R.I.A. v2.0.0 — Starting up")
     logger.info("=" * 56)
 
     # ── Phase 1: Infrastructure ───────────────────────────────────
@@ -62,8 +62,10 @@ async def lifespan(app: FastAPI):
         from kria.safety.policy_engine import policy_engine   # noqa: F401
         from kria.safety.rollback import rollback_manager
         from kria.safety.hitl import hitl_gateway
-        from kria.api.websocket import broadcast
-        hitl_gateway.set_broadcast_handler(broadcast)
+        from kria.agent.interaction import interaction_gateway
+        from kria.api.websocket import broadcast, ws_clients_count
+        hitl_gateway.set_broadcast_handler(broadcast, ws_clients_count)
+        interaction_gateway.set_broadcast_handler(broadcast, ws_clients_count)
         await rollback_manager.cleanup_expired()
         logger.info("[P2] Safety system ready")
     except Exception as exc:
@@ -77,15 +79,36 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning("[P3] ChromaDB unavailable — RAG disabled: %s", exc)
 
+    # ── Phase 3b: Mem0 Fact Memory ────────────────────────────────
+    try:
+        from kria.memory.mem0_memory import mem0_memory
+        await mem0_memory.connect()
+        logger.info("[P3b] Mem0 fact memory connected")
+    except Exception as exc:
+        logger.warning("[P3b] Mem0 unavailable — fact memory disabled: %s", exc)
+
     # ── Phase 4: Agent (tools auto-register on import) ────────────
     try:
         from kria.tools.registry import tool_registry
         tool_registry.load_all()
-        from kria.agent.llm_client import llm_client
-        await llm_client.wait_for_ready(max_retries=15, delay=2.0)
-        logger.info("[P4] LLM client ready — %d tools registered", len(tool_registry))
+        from kria.agent.model_router import model_router
+        await model_router.wait_all_ready()
+        logger.info("[P4] LLM clients ready — mode=%s — %d tools registered",
+                    model_router.mode, len(tool_registry))
     except Exception as exc:
         logger.warning("[P4] LLM/tool init partial failure: %s", exc)
+
+    # ── Phase 4b: MCP servers (optional external tools) ───────────
+    try:
+        if settings.mcp_enabled:
+            from kria.mcp import mcp_manager
+            await mcp_manager.start(tool_registry, health_registry)
+            logger.info("[P4b] MCP client started — %d servers, %d tools",
+                        mcp_manager.server_count, mcp_manager.tool_count)
+        else:
+            logger.info("[P4b] MCP integration disabled")
+    except Exception as exc:
+        logger.warning("[P4b] MCP init failed (non-fatal): %s", exc)
 
     # ── Phase 5: Voice (optional — gracefully absent without audio HW) ──
     try:
@@ -97,6 +120,25 @@ async def lifespan(app: FastAPI):
         logger.info("[P5] sounddevice not installed — text-only mode")
     except Exception as exc:
         logger.warning("[P5] Voice pipeline unavailable: %s", exc)
+
+    # ── Phase 5b: Scheduler ──────────────────────────────────────
+    try:
+        from kria.automation.scheduler import scheduler
+        scheduler.start()
+        logger.info("[P5b] Scheduler started")
+    except Exception as exc:
+        logger.warning("[P5b] Scheduler unavailable: %s", exc)
+
+    # ── Phase 5c: Plugins ─────────────────────────────────────────
+    try:
+        if settings.plugins_enabled:
+            from kria.plugins.loader import plugin_loader
+            for plugin_info in plugin_loader.discover():
+                if plugin_info.get("enabled", True):
+                    plugin_loader.load(plugin_info.get("name", ""))
+            logger.info("[P5c] Plugins loaded: %d", len(plugin_loader.list_loaded()))
+    except Exception as exc:
+        logger.warning("[P5c] Plugin loading failed: %s", exc)
 
     # ── Phase 6: Probe external services for health dashboard ─────
     try:
@@ -120,11 +162,20 @@ async def lifespan(app: FastAPI):
                                            f"HTTP {resp.status_code}")
             except Exception as exc:
                 health_registry.update("stt", ServiceStatus.DOWN, str(exc))
+            try:
+                resp = await client.get(f"{settings.qdrant_url}/healthz")
+                if resp.status_code == 200:
+                    health_registry.update("qdrant", ServiceStatus.HEALTHY)
+                else:
+                    health_registry.update("qdrant", ServiceStatus.DOWN,
+                                           f"HTTP {resp.status_code}")
+            except Exception as exc:
+                health_registry.update("qdrant", ServiceStatus.DOWN, str(exc))
         logger.info("[P6] Service health probes done")
     except Exception as exc:
         logger.warning("[P6] Health probes failed: %s", exc)
 
-    logger.info("K.R.I.A. ready — http://localhost:8000")
+    logger.info("K.R.I.A. ready — http://localhost:8088")
     yield
 
     # ── Shutdown ──────────────────────────────────────────────────
@@ -133,6 +184,25 @@ async def lifespan(app: FastAPI):
     try:
         from kria.voice.pipeline import voice_pipeline
         await voice_pipeline.stop()
+    except Exception:
+        pass
+
+    try:
+        from kria.automation.scheduler import scheduler
+        scheduler.stop()
+    except Exception:
+        pass
+
+    try:
+        from kria.tools.file_watcher import file_watcher
+        file_watcher.stop_all()
+    except Exception:
+        pass
+
+    try:
+        if settings.mcp_enabled:
+            from kria.mcp import mcp_manager
+            await mcp_manager.stop()
     except Exception:
         pass
 
@@ -149,8 +219,8 @@ async def lifespan(app: FastAPI):
         pass
 
     try:
-        from kria.agent.llm_client import llm_client
-        await llm_client.close()
+        from kria.agent.model_router import model_router
+        await model_router.close_all()
     except Exception:
         pass
 
@@ -160,8 +230,8 @@ async def lifespan(app: FastAPI):
 # ── Application factory ───────────────────────────────────────────
 app = FastAPI(
     title="K.R.I.A.",
-    description="Kernel-Responsive Intelligent Agent — Local OS control via voice & text",
-    version="1.0.0",
+    description="Kernel-Responsive Intelligent Agent — Complete AI Assistant",
+    version="2.0.0",
     lifespan=lifespan,
 )
 

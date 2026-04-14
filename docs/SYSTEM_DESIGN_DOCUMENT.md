@@ -137,7 +137,7 @@ graph TB
 
     subgraph BRAIN["Reasoning Brain — Local LLM"]
         ROUTER[Intent Router — Lightweight Classifier]
-        LLM[Qwen3-8B MoE via llama.cpp GGUF Q4_K_M]
+        LLM[Phi-4-mini-instruct 3.8B via llama.cpp GGUF Q4_K_M]
         CTX[Context Manager — Sliding Window + RAG]
         PLAN[Agentic Planner — ReAct Loop]
     end
@@ -248,23 +248,26 @@ graph TB
 
 ## 4. Module 1 — The Reasoning Brain
 
-### 4.1 LLM Selection: Why Qwen3-8B (MoE)
+### 4.1 LLM Selection: Dual-Model Architecture
 
-After evaluating the 2026 landscape of local LLMs, the recommendation is **Qwen3-8B** in its MoE configuration, quantized to **GGUF Q4_K_M** format and served via **llama.cpp**.
+K.R.I.A. uses a **dual-model architecture** with two complementary LLMs served via **llama.cpp**:
 
-**Why This Model:**
+- **Primary:** Microsoft **Phi-4-mini-instruct** (3.8B parameters), quantized to **GGUF Q4_K_M** (~2.5 GB VRAM)
+- **Secondary (opt-in):** **Qwen2.5-VL-7B-Instruct** (7B parameters + vision projector `mmproj-F16.gguf`), quantized to **GGUF Q4_K_M** (~4.7 GB VRAM)
 
-| Criterion | Qwen3-8B MoE (Q4_K_M) | Alternatives Considered |
+**Why This Architecture:**
+
+| Criterion | Phi-4-mini-instruct Q4_K_M (Primary) | Qwen2.5-VL-7B-Instruct Q4_K_M (Secondary) |
 |---|---|---|
-| **Active Parameters** | ~2.4B per forward pass (MoE routing) | Llama-3.3-8B: 8B always active |
-| **VRAM Usage** | ~5.2 GB at Q4_K_M | Mistral-Small-3.1: ~6.8 GB |
-| **Tool Calling** | Native function-calling support, top-tier on Berkeley FC benchmark | Phi-4: Good but less reliable |
-| **Coding Ability** | Top-5 on HumanEval/MBPP at this size class | DeepSeek-Coder-V3-Lite: Strong but larger |
-| **Agentic Reasoning** | Trained with ReAct/Chain-of-Thought traces | Gemma-3: Weaker at multi-step planning |
-| **Context Window** | 128K tokens native | Most 8B models: 8K–32K |
-| **License** | Apache 2.0 | Fully open for commercial and academic use |
+| **Parameters** | 3.8B | 7B |
+| **VRAM Usage** | ~2.5 GB | ~4.7 GB |
+| **Purpose** | Fast reasoning, tool calling, everyday tasks | Vision tasks, complex reasoning, multimodal |
+| **Vision** | No | Yes (via mmproj-F16.gguf) |
+| **Context Window** | 128K tokens | 32K tokens |
+| **License** | MIT | Apache 2.0 |
+| **Port** | 8080 | 8085 |
 
-**The MoE Advantage:** Mixture-of-Experts architecture means Qwen3-8B has 8 billion total parameters but only activates ~2.4B for any given token. This gives you the intelligence of a much larger model with the VRAM footprint and speed of a 3B model. On your RTX GPU, this translates to:
+**The Dual-Model Advantage:** Phi-4-mini handles 80%+ of requests with extremely low latency (~2.5 GB VRAM), leaving ample room for Whisper STT on the GPU. For vision tasks or complex multi-modal reasoning, the secondary Qwen2.5-VL-7B loads on demand. On the RTX 4050 (6 GB VRAM):
 - **First-token latency:** ~180ms
 - **Token generation speed:** ~45–60 tokens/second
 - **Concurrent tool-call + reasoning:** Possible without VRAM pressure
@@ -283,8 +286,8 @@ After evaluating the 2026 landscape of local LLMs, the recommendation is **Qwen3
 **llama.cpp Configuration for K.R.I.A.:**
 
 ```yaml
-# llama.cpp server launch configuration
-model: Qwen3-8B-MoE-Q4_K_M.gguf
+# llama.cpp server launch configuration (Primary — Phi-4-mini)
+model: microsoft_Phi-4-mini-instruct-Q4_K_M.gguf
 context_length: 8192          # Sufficient for agent tasks; saves VRAM vs 128K
 gpu_layers: 99                # Offload all layers to GPU
 threads: 8                    # CPU threads for non-GPU ops
@@ -293,13 +296,20 @@ flash_attention: true         # Enable FlashAttention-2
 mlock: true                   # Lock model in memory — prevent swapping
 numa: false                   # Single-socket laptop
 cont_batching: true           # Continuous batching for streaming
-speculative_decoding:
-  enabled: true
-  draft_model: Qwen3-0.6B-Q8_0.gguf  # Tiny draft model for 2-3x speedup
-  draft_tokens: 5
+port: 8080                    # Primary brain port
 ```
 
-> **Advocacy Note:** Speculative decoding is a *game-changer* for local inference. The draft model (Qwen3-0.6B at Q8, ~600MB VRAM) predicts 5 tokens ahead, and the main model verifies them in a single forward pass. For tool-call outputs and structured responses, acceptance rates exceed 80%, effectively doubling generation speed for free.
+```yaml
+# llama.cpp server launch configuration (Secondary — Qwen2.5-VL-7B)
+model: Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf
+mmproj: mmproj-F16.gguf       # Vision projector for multimodal input
+context_length: 4096
+gpu_layers: 99
+flash_attention: true
+port: 8085                    # Secondary brain port
+```
+
+> **Architecture Note:** The primary model (Phi-4-mini, ~2.5 GB) runs alongside Whisper STT (~1.5 GB) within the 6 GB VRAM budget. The secondary model (Qwen2.5-VL-7B, ~4.7 GB) is opt-in via Docker profile and requires either dedicated GPU headroom or CPU offloading.
 
 ### 4.3 Agentic Framework: Custom ReAct Loop
 
@@ -1093,9 +1103,8 @@ This is the critical engineering challenge: fitting a full agent stack into 16GB
 │                    GPU VRAM (~8 GB Total)                     │
 │                                                               │
 │  ┌─────────────────────────┐  ┌───────────────────────┐      │
-│  │   Qwen3-8B Q4_K_M       │  │   Whisper-medium       │      │
-│  │   ~5.2 GB               │  │   ~1.5 GB              │      │
-│  │   (+ 0.6 GB draft model)│  │                        │      │
+│  │   Phi-4-mini Q4_K_M       │  │   Whisper-medium       │      │
+│  │   ~2.5 GB               │  │   ~1.5 GB              │      │
 │  └─────────────────────────┘  └───────────────────────┘      │
 │                                                               │
 │  Remaining VRAM: ~0.7 GB (KV cache + CUDA overhead)          │
@@ -1297,8 +1306,8 @@ CREATE TABLE audit_log (
 
 | Layer | Technology | Version (2026) | Role |
 |---|---|---|---|
-| **LLM** | Qwen3-8B MoE (GGUF Q4_K_M) | Qwen3 | Primary reasoning engine |
-| **Draft LLM** | Qwen3-0.6B (GGUF Q8_0) | Qwen3 | Speculative decoding draft |
+| **LLM (Primary)** | Phi-4-mini-instruct (GGUF Q4_K_M) | Microsoft | Primary reasoning engine |
+| **LLM (Secondary)** | Qwen2.5-VL-7B-Instruct (GGUF Q4_K_M) + mmproj-F16.gguf | Qwen/Unsloth | Vision & complex reasoning (opt-in) |
 | **Inference Engine** | llama.cpp | Latest | CUDA-accelerated LLM serving |
 | **STT** | whisper.cpp | Latest | GPU-accelerated speech recognition |
 | **TTS** | Piper | 2.x | CPU-based neural text-to-speech |
@@ -1346,9 +1355,9 @@ CREATE TABLE audit_log (
 |---|---|---|---|
 | Wake Word + VAD + STT | Pipeline | ~200 | 200 |
 | Intent Routing | Router | ~5 | 205 |
-| LLM (tool selection) | Qwen3-8B | ~200 | 405 |
+| LLM (tool selection) | Phi-4-mini | ~200 | 405 |
 | Web API Call | wttr.in | ~300 | 705 |
-| LLM (format response) | Qwen3-8B | ~200 | 905 |
+| LLM (format response) | Phi-4-mini | ~200 | 905 |
 | TTS | Piper | ~80 | **~985 ms** |
 
 **Result: ~1s for internet-backed queries.** Acceptable with streaming TTS starting at ~700ms.
@@ -1358,7 +1367,7 @@ CREATE TABLE audit_log (
 | Stage | Component | Latency (ms) | Cumulative (ms) |
 |---|---|---|---|
 | Wake Word + VAD + STT | Pipeline | ~200 | 200 |
-| LLM Reasoning | Qwen3-8B (first token) | ~180 | 380 |
+| LLM Reasoning | Phi-4-mini (first token) | ~180 | 380 |
 | LLM Planning | 3-step plan generation | ~400 | 780 |
 | File Search | pathlib.rglob | ~100 | 880 |
 | Document Parse | PyMuPDF (per PDF) | ~500 | 1380 |
@@ -1383,7 +1392,8 @@ CREATE TABLE audit_log (
 
 ## 21. References
 
-1. Qwen Team. "Qwen3 Technical Report." arXiv, 2025/2026.
+1. Microsoft. "Phi-4-mini Technical Report." 2025.
+2. Qwen Team. "Qwen2.5-VL Technical Report." arXiv, 2025.
 2. Georgi Gerganov. "llama.cpp — LLM inference in C/C++." GitHub, 2023–2026.
 3. Georgi Gerganov. "whisper.cpp — Port of OpenAI's Whisper in C/C++." GitHub, 2022–2026.
 4. Rhasspy. "Piper — A fast, local neural text to speech system." GitHub, 2023–2026.

@@ -3,9 +3,9 @@ VRAM Orchestrator
 =================
 Monitors GPU VRAM and calculates safe GPU-layer offload counts for llama.cpp.
 
-Because the RTX on the Predator Helios Neo 16 comfortably holds both
-Whisper-medium (~1.5 GB) and Qwen3-8B Q4_K_M (~5.2 GB) + draft model
-(~0.6 GB) simultaneously, the default path never triggers a swap.
+The primary brain runs Phi-4-mini-instruct Q4_K_M (~2.5 GB) and the
+secondary brain runs Qwen2.5-VL-7B-Instruct Q4_K_M (~4.7 GB).
+Whisper-medium (~1.5 GB) runs alongside the primary brain.
 
 The orchestrator is still implemented so that on tighter GPUs (6 GB cards)
 it can automatically reduce GPU layers at runtime via the llama.cpp API.
@@ -18,13 +18,17 @@ logger = logging.getLogger("kria.vram")
 
 # Approximate VRAM requirements (MB)
 MODEL_VRAM_MB = {
-    "qwen3_8b_q4": 5_200,
-    "qwen3_0_6b_q8": 600,
-    "whisper_medium": 1_500,
+    "phi4_mini_q4":     2_500,   # Phi-4-mini-instruct Q4_K_M (primary,  3.8B)
+    "qwen25_vl_7b_q4": 4_700,   # Qwen2.5-VL-7B-Instruct Q4_K_M (secondary, 7B)
+    "whisper_medium":  1_500,
 }
 CUDA_OVERHEAD_MB = 512
 SAFETY_MARGIN_MB = 512
-QWEN3_TOTAL_LAYERS = 36   # transformer block count for Qwen3-8B
+# Transformer layer counts for partial GPU offload calculation
+MODEL_TOTAL_LAYERS = {
+    "phi4_mini_q4":     32,
+    "qwen25_vl_7b_q4": 28,
+}
 
 
 @dataclass
@@ -62,10 +66,11 @@ class VRAMOrchestrator:
             return 0
 
         ratio = available / model_mb
-        layers = max(1, int(ratio * QWEN3_TOTAL_LAYERS))
+        total_layers = MODEL_TOTAL_LAYERS.get(model_key, 32)
+        layers = max(1, int(ratio * total_layers))
         logger.info(
             "[vram] Partial offload for %s: %d/%d layers (%.0f MB available)",
-            model_key, layers, QWEN3_TOTAL_LAYERS, available,
+            model_key, layers, total_layers, available,
         )
         return layers
 

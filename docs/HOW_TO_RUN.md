@@ -255,7 +255,7 @@ chroma run --path ~/.kria/chroma --port 8083
 
 Terminal 3 — Start llama.cpp (example):
 ```bash
-./llama-server -m models/llm/Qwen3-8B-Instruct-Q4_K_M.gguf --port 8080
+./llama-server -m models/llm/microsoft_Phi-4-mini-instruct-Q4_K_M.gguf --port 8080
 ```
 
 Terminal 4 — K.R.I.A. core:
@@ -354,13 +354,14 @@ The `.env` file controls everything. Here are the most important ones:
 
 | Component | Disk | RAM |
 |---|---|---|
-| Qwen3-8B LLM | ~5.2 GB | ~6–8 GB |
-| Qwen3-0.6B Draft | ~0.6 GB | ~1 GB |
+| Phi-4-mini-instruct LLM (primary) | ~2.5 GB | ~3–4 GB |
+| Qwen2.5-VL-7B LLM (secondary, opt-in) | ~4.7 GB | ~6–8 GB |
+| mmproj-F16.gguf (vision projector) | ~1.35 GB | — |
 | Whisper large-v3-turbo | ~1.5 GB | ~2 GB |
 | Piper TTS voice | ~65 MB | ~200 MB |
 | Core + services + tools | — | ~2–3 GB |
 
-Total models: **~7.4 GB** download. Minimum 16 GB RAM recommended.
+Total models: **~10 GB** download (primary only: ~4 GB). Minimum 16 GB RAM recommended.
 
 > **Note:** Document parsing (PyMuPDF, openpyxl, pandas) and web tools (httpx, trafilatura) add ~200 MB to Python dependencies. These are installed automatically by `pip install .` or the setup script.
 

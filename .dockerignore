@@ -1,0 +1,18 @@
+# Exclude heavy model files and non-build artifacts from Docker build context
+models/
+.git/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+node_modules/
+.DS_Store
+*.log
+diagrams/
+docs/
+scripts/
+*.md

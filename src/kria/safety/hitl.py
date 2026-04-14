@@ -48,10 +48,13 @@ class HITLGateway:
     def __init__(self) -> None:
         self._pending: dict[str, ApprovalRequest] = {}
         self._broadcast: Optional[Callable] = None  # injected by WebSocket manager
+        self._ws_clients_count: Callable = lambda: 0  # injected alongside broadcast
 
-    def set_broadcast_handler(self, handler: Callable) -> None:
+    def set_broadcast_handler(self, handler: Callable, clients_count: Optional[Callable] = None) -> None:
         """Wire up the WebSocket broadcaster (called during FastAPI startup)."""
         self._broadcast = handler
+        if clients_count:
+            self._ws_clients_count = clients_count
 
     # ── Request approval ──────────────────────────────────────────
 
@@ -107,6 +110,30 @@ class HITLGateway:
             f"  Timeout:     {req.timeout_seconds}s\n"
             f"  → POST /api/v1/hitl/decide  {{\"request_id\":\"{req.id}\", \"approved\":true}}\n"
         )
+
+        # Terminal-mode approval: if enabled AND no WebSocket clients connected,
+        # read Y/N directly from stdin (headless / terminal-only environments)
+        if settings.hitl_terminal_mode and self._ws_clients_count() == 0:
+            try:
+                loop = asyncio.get_running_loop()
+                answer = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None,
+                        lambda: input(f"[HITL] Approve '{action}'? (y/N): ").strip().lower(),
+                    ),
+                    timeout=req.timeout_seconds,
+                )
+                approved = answer in ("y", "yes")
+                logger.info("[HITL] Terminal decision for %s: %s",
+                            req.id, "APPROVED" if approved else "DENIED")
+                return approved
+            except asyncio.TimeoutError:
+                logger.info("[HITL] Terminal input timeout for %s — auto-deny", req.id)
+                return False
+            except (EOFError, OSError):
+                logger.warning("[HITL] Terminal input unavailable — falling back to Future")
+            finally:
+                self._pending.pop(req.id, None)
 
         try:
             if req._future is None:

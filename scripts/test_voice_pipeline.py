@@ -6,6 +6,7 @@ Run: python scripts/test_voice_pipeline.py
 """
 import io
 import sys
+import threading
 import wave
 import time
 import numpy as np
@@ -18,12 +19,51 @@ RECORD_SECONDS = 5
 WHISPER_URL = "http://127.0.0.1:8081/inference"
 LLM_URL = "http://127.0.0.1:8080/v1/chat/completions"
 TTS_URL = "http://127.0.0.1:8082/synthesize"
-CHAT_URL = "http://127.0.0.1:8000/api/v1/chat"
+CHAT_URL = "http://127.0.0.1:8088/api/v1/chat"
+
+
+_SPIN_CHARS = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
+
+
+def _spinner_thread(stop: threading.Event, label: str) -> None:
+    """Show a spinning indicator while stop is not set."""
+    i = t = 0
+    while not stop.is_set():
+        sys.stdout.write(f"\r  \033[36m{_SPIN_CHARS[i % 10]}\033[0m {label}  ({t}s)")
+        sys.stdout.flush()
+        time.sleep(1)
+        i += 1; t += 1
+    sys.stdout.write("\r\033[K")
+    sys.stdout.flush()
+
+
+def with_spinner(label: str, fn):
+    """Run fn() while showing a spinner, then return the result."""
+    stop = threading.Event()
+    t = threading.Thread(target=_spinner_thread, args=(stop, label), daemon=True)
+    t.start()
+    try:
+        result = fn()
+    finally:
+        stop.set()
+        t.join()
+    return result
 
 
 def record_audio() -> bytes:
     """Record from mic and return WAV bytes."""
-    print(f"🎙️  Recording {RECORD_SECONDS}s from device {MIC_DEVICE}...")
+    stop_flag = threading.Event()
+
+    def _countdown():
+        for i in range(RECORD_SECONDS, 0, -1):
+            if stop_flag.is_set():
+                break
+            sys.stdout.write(f"\r\U0001f3a4  Recording... [{i:2d}s remaining] Speak now!")
+            sys.stdout.flush()
+            time.sleep(1)
+
+    t = threading.Thread(target=_countdown, daemon=True)
+    t.start()
     audio = sd.rec(
         int(SAMPLE_RATE * RECORD_SECONDS),
         samplerate=SAMPLE_RATE,
@@ -32,6 +72,10 @@ def record_audio() -> bytes:
         device=MIC_DEVICE,
     )
     sd.wait()
+    stop_flag.set()
+    t.join()
+    sys.stdout.write(f"\r\U0001f3a4  Recording done ({RECORD_SECONDS}s)                         \n")
+    sys.stdout.flush()
     rms = np.sqrt(np.mean(audio.astype(np.float32) ** 2))
     print(f"   RMS level: {rms:.1f}  (should be >100 for speech)")
 
@@ -46,50 +90,62 @@ def record_audio() -> bytes:
 
 def transcribe(wav_bytes: bytes) -> str:
     """Send WAV to Whisper and return transcript."""
-    print("📝 Transcribing with Whisper...")
     t0 = time.time()
-    resp = httpx.post(
-        WHISPER_URL,
-        files={"file": ("audio.wav", wav_bytes, "audio/wav")},
-        data={"response_format": "json", "temperature": "0.0"},
-        timeout=30.0,
-    )
-    resp.raise_for_status()
+
+    def _call():
+        resp = httpx.post(
+            WHISPER_URL,
+            files={"file": ("audio.wav", wav_bytes, "audio/wav")},
+            data={"response_format": "json", "temperature": "0.0"},
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        return resp
+
+    resp = with_spinner("Transcribing with Whisper...", _call)
     elapsed = time.time() - t0
     text = resp.json().get("text", "").strip()
-    print(f"   Transcript ({elapsed:.2f}s): \"{text}\"")
+    print(f"\U0001f4dd Transcript ({elapsed:.2f}s): \"{text}\"")
     return text
 
 
 def ask_llm(text: str) -> str:
     """Send text to KRIA chat API and return response."""
-    print(f"🤖 Asking LLM: \"{text}\"")
     t0 = time.time()
-    resp = httpx.post(
-        CHAT_URL,
-        json={"message": text, "session_id": "voice_test"},
-        timeout=30.0,
-    )
-    resp.raise_for_status()
+
+    def _call():
+        resp = httpx.post(
+            CHAT_URL,
+            json={"message": text, "session_id": "voice_test"},
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        return resp
+
+    resp = with_spinner(f"Asking LLM: \"{text[:50]}\"...", _call)
     elapsed = time.time() - t0
     reply = resp.json().get("response", "")
-    print(f"   Reply ({elapsed:.2f}s): \"{reply}\"")
+    print(f"\U0001f916 Reply ({elapsed:.2f}s): \"{reply}\"")
     return reply
 
 
 def synthesize(text: str) -> bytes:
     """Send text to Piper TTS and return WAV bytes."""
-    print(f"🔊 Synthesizing TTS...")
     t0 = time.time()
-    resp = httpx.post(
-        TTS_URL,
-        json={"text": text},
-        timeout=30.0,
-    )
-    resp.raise_for_status()
+
+    def _call():
+        resp = httpx.post(
+            TTS_URL,
+            json={"text": text},
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        return resp
+
+    resp = with_spinner("Synthesizing speech (TTS)...", _call)
     elapsed = time.time() - t0
     wav_bytes = resp.content
-    print(f"   TTS audio: {len(wav_bytes)} bytes ({elapsed:.2f}s)")
+    print(f"\U0001f50a TTS audio: {len(wav_bytes)} bytes ({elapsed:.2f}s)")
     return wav_bytes
 
 

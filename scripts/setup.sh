@@ -18,7 +18,27 @@ header() { echo -e "\n${CYAN}${BOLD}  $1${RESET}"; }
 ok()     { echo -e "  ${GREEN}✓${RESET} $1"; }
 warn()   { echo -e "  ${YELLOW}!${RESET} $1"; }
 fail()   { echo -e "  ${RED}✗${RESET} $1"; }
+# ── Progress helpers ─────────────────────────────────────────────
+_SPIN=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
+_SPIN_PID=""
 
+_spin_loop() {
+    local msg="$1"; local i=0; local t=0
+    while true; do
+        printf "\r  \033[36m%s\033[0m %s  (%ds)" "${_SPIN[$((i%10))]}" "$msg" "$t"
+        sleep 1; i=$((i+1)); t=$((t+1))
+    done
+}
+start_spinner() { _spin_loop "$1" & _SPIN_PID=$!; }
+stop_spinner()  {
+    if [[ -n "$_SPIN_PID" ]]; then
+        kill "$_SPIN_PID" 2>/dev/null || true
+        wait "$_SPIN_PID" 2>/dev/null || true
+        _SPIN_PID=""
+    fi
+    printf "\r\033[K"
+}
+trap 'stop_spinner' EXIT
 echo ""
 echo -e "${CYAN}${BOLD}  K.R.I.A. Linux/macOS Setup Script${RESET}"
 echo -e "${YELLOW}  =====================================${RESET}"
@@ -37,7 +57,14 @@ check python3 --version || MISSING=$((MISSING+1))
 python3 -c "import sys; sys.exit(0 if sys.version_info >= (3,12) else 1)" \
     && ok "Python 3.12+" || { fail "Python 3.12+ required"; MISSING=$((MISSING+1)); }
 check docker version     || MISSING=$((MISSING+1))
-check nvidia-smi || warn "nvidia-smi not found — GPU features may be unavailable"
+
+HAS_GPU=false
+if nvidia-smi &>/dev/null; then
+    ok "nvidia-smi found — GPU acceleration available"
+    HAS_GPU=true
+else
+    warn "nvidia-smi not found — GPU features unavailable (CPU mode only)"
+fi
 
 [ "$MISSING" -gt 0 ] && { fail "Missing prerequisites — install them first"; exit 1; }
 
@@ -56,17 +83,31 @@ if [ ! -d "$VENV_PATH" ]; then
 fi
 
 source "$VENV_PATH/bin/activate"
+start_spinner "Upgrading pip..."
 pip install --quiet --upgrade pip
+stop_spinner
+start_spinner "Installing build tools (setuptools, wheel)..."
+pip install --quiet setuptools wheel
+stop_spinner
+start_spinner "Installing KRIA package and dependencies (this may take a minute)..."
 pip install --quiet -e "$KRIA_ROOT[dev]"
+stop_spinner
+start_spinner "Installing extra tools (httpx, tqdm)..."
+pip install --quiet httpx tqdm  # required by download_models.py
+stop_spinner
 ok "Virtualenv ready at $VENV_PATH"
 
 # ── .env ──────────────────────────────────────────────────────────
 header "Configuring .env..."
 
 if [ ! -f "$ENV_FILE" ]; then
-    cp "$ENV_EXAMPLE" "$ENV_FILE"
-    ok "Created .env from .env.example"
-    warn "Review $ENV_FILE and set KRIA_BRIDGE_SECRET"
+    if [ -f "$ENV_EXAMPLE" ]; then
+        cp "$ENV_EXAMPLE" "$ENV_FILE"
+        ok "Created .env from .env.example"
+        warn "Review $ENV_FILE and adjust values if needed"
+    else
+        warn ".env.example not found — skipping .env creation"
+    fi
 else
     ok ".env already exists — skipping"
 fi
@@ -88,32 +129,53 @@ header "Configuring bridge secret..."
 SECRET_FILE="$HOME/.kria/bridge_secret.txt"
 if [ ! -f "$SECRET_FILE" ]; then
     python3 -c "import secrets; print(secrets.token_hex(32))" > "$SECRET_FILE"
+    chmod 600 "$SECRET_FILE"
     ok "Generated new bridge secret → $SECRET_FILE"
 else
     ok "Bridge secret already exists — skipping"
 fi
 
-# Write the same secret into docker-compose.yml (uses $HOME path, not NTFS path)
-# so Docker can bind-mount it from the Linux filesystem.
+# Update docker-compose.yml with the correct secret path
 sed -i "s|file: .*bridge_secret.txt|file: ${SECRET_FILE}|" \
     "$KRIA_ROOT/docker/docker-compose.yml"
 ok "docker-compose.yml updated with secret path: $SECRET_FILE"
 
 # Make sure KRIA_BRIDGE_SECRET in .env matches
-BRIDGE_SECRET="$(cat "$SECRET_FILE")"
-if grep -q "^KRIA_BRIDGE_SECRET=" "$ENV_FILE" 2>/dev/null; then
-    sed -i "s|^KRIA_BRIDGE_SECRET=.*|KRIA_BRIDGE_SECRET=${BRIDGE_SECRET}|" "$ENV_FILE"
-else
-    echo "KRIA_BRIDGE_SECRET=${BRIDGE_SECRET}" >> "$ENV_FILE"
+if [ -f "$ENV_FILE" ]; then
+    BRIDGE_SECRET="$(cat "$SECRET_FILE")"
+    if grep -q "^KRIA_BRIDGE_SECRET=" "$ENV_FILE" 2>/dev/null; then
+        sed -i "s|^KRIA_BRIDGE_SECRET=.*|KRIA_BRIDGE_SECRET=${BRIDGE_SECRET}|" "$ENV_FILE"
+    else
+        echo "KRIA_BRIDGE_SECRET=${BRIDGE_SECRET}" >> "$ENV_FILE"
+    fi
+    ok "KRIA_BRIDGE_SECRET written to .env"
 fi
-ok "KRIA_BRIDGE_SECRET written to .env"
 
-# ── Docker ────────────────────────────────────────────────────────
+# ── Make app scripts executable ───────────────────────────────────
+header "Setting script permissions..."
+
+chmod +x "$KRIA_ROOT/scripts/app-start.sh" \
+         "$KRIA_ROOT/scripts/app-stop.sh" \
+         "$KRIA_ROOT/scripts/app-restart.sh" 2>/dev/null || true
+ok "App scripts are executable"
+
+# ── Docker images ─────────────────────────────────────────────────
 if [ "${SKIP_DOCKER:-0}" != "1" ]; then
-    header "Pulling Docker images..."
+    header "Building Docker images..."
     cd "$KRIA_ROOT/docker"
-    docker compose pull
-    ok "Docker images pulled"
+
+    COMPOSE_FILES="-f docker-compose.yml"
+    if [ -f "docker-compose.override.yml" ]; then
+        COMPOSE_FILES="$COMPOSE_FILES -f docker-compose.override.yml"
+    fi
+    if $HAS_GPU && [ -f "docker-compose.gpu.yml" ]; then
+        COMPOSE_FILES="$COMPOSE_FILES -f docker-compose.gpu.yml"
+        ok "GPU detected — building with GPU support"
+    fi
+
+    docker compose $COMPOSE_FILES build
+    ok "Docker images built"
+    cd "$KRIA_ROOT"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────
@@ -121,10 +183,20 @@ echo ""
 echo -e "${GREEN}${BOLD}  Setup complete!${RESET}"
 echo ""
 echo "  Next steps:"
-echo "    1. Edit .env and set KRIA_BRIDGE_SECRET"
-echo "    2. python scripts/download_models.py"
-echo "    3. cd docker && docker compose up -d"
-echo "    4. python scripts/kria_bridge.py  (run on host, not in Docker)"
-echo "    5. http://localhost:3000  ← Dashboard"
-echo "    6. http://localhost:8000/docs  ← API docs"
+echo "    1. Download models (first time only):"
+echo "       python3 scripts/download_models.py"
+echo ""
+echo "    2. Start KRIA:"
+echo "       bash scripts/app-start.sh"
+echo ""
+echo "    3. Open Dashboard:"
+echo "       http://localhost:3000"
+echo ""
+echo "    4. (Optional) Start host bridge for mic/speaker access:"
+echo "       python3 scripts/kria_bridge.py"
+echo ""
+echo "  Other commands:"
+echo "    bash scripts/app-stop.sh        Stop all services"
+echo "    bash scripts/app-restart.sh     Restart with latest changes"
+echo "    bash scripts/app-restart.sh --quick   Restart without rebuilding"
 echo ""

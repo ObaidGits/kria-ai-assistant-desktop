@@ -4,6 +4,9 @@ FROM python:3.12-slim-bookworm
 # System dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    util-linux \
+    procps \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -15,13 +18,13 @@ COPY src/ /app/src/
 # Install the project and runtime dependencies
 RUN pip install --no-cache-dir -e /app
 
-# Non-root user for security
+# Create kria user for app ownership but run as root for host access
 RUN adduser --disabled-password --gecos "" kria \
     && mkdir -p /data /home/kria/.kria/rollback /home/kria/.cache \
     && chown -R kria:kria /app /data /home/kria
 
-USER kria
-
+# Run as root to enable nsenter and host filesystem access
+# Security is enforced by the application-level safety policy engine
 ENV KRIA_ENV=production
 ENV KRIA_SQLITE_PATH=/data/kria.db
 ENV KRIA_LOG_DIR=/data/logs

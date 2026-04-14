@@ -57,7 +57,7 @@ The RTX 4050 has 6 GB VRAM and sits completely idle right now. Whisper inference
 is **10-20x faster**, which enables using larger/better models.
 
 **Strategy:** Build whisper.cpp with CUDA in the kria-brain container. Keep the LLM on CPU
-(Qwen3-0.6B is fast enough on CPU). Give Whisper the entire GPU.
+(Phi-4-mini is fast enough on CPU). Give Whisper the entire GPU.
 
 ```bash
 # Modified entrypoint.sh — add --gpu-layers 99 to whisper-server
@@ -145,7 +145,7 @@ The RTX 4050 has 6 GB VRAM. Budget:
 | Component | VRAM Usage | Strategy |
 |---|---|---|
 | Whisper medium.en | ~1.5 GB | Full GPU offload |
-| Qwen3-0.6B-Q8_0 | ~0.9 GB | Could GPU offload too |
+| Phi-4-mini Q4_K_M | ~2.5 GB | Could GPU offload too |
 | Overhead | ~0.5 GB | CUDA context |
 | **Total** | **~2.9 GB** | **Fits in 6 GB** |
 
@@ -155,8 +155,8 @@ Both the LLM and Whisper can run on GPU simultaneously, leaving ~3 GB headroom.
 
 The existing `src/kria/infra/vram_orchestrator.py` was designed for this. The approach:
 - Whisper gets permanent GPU residency (always ready for speech)
-- LLM loads to GPU on demand (takes ~200ms for 0.6B model)
-- If using the 8B model, Whisper stays on GPU and LLM stays on CPU
+- LLM loads to GPU on demand (takes ~200ms for Phi-4-mini model)
+- If using the secondary model (Qwen2.5-VL-7B), Whisper stays on GPU and LLM stays on CPU
 
 ---
 
@@ -370,7 +370,7 @@ RUN python3 -c "import nemo.collections.asr as asr; asr.models.ASRModel.from_pre
 | Component | VRAM |
 |---|---|
 | Parakeet TDT 0.6B | 1.5 GB |
-| Qwen3-0.6B (GPU) | 0.9 GB |
+| Phi-4-mini (GPU) | 2.5 GB |
 | Overhead | 0.5 GB |
 | **Total** | **2.9 GB / 6 GB** |
 
@@ -380,7 +380,7 @@ If maximum accuracy is needed, Canary 1B achieves ~4.0% WER on noisy data:
 
 ```python
 model = nemo_asr.models.ASRModel.from_pretrained("nvidia/canary-1b")
-# VRAM: ~2.5 GB — still fits alongside Qwen3-0.6B
+# VRAM: ~2.5 GB — still fits alongside Phi-4-mini
 ```
 
 ---
@@ -539,37 +539,37 @@ Given your hardware (RTX 4050 6GB, i7-13700HX, 16GB RAM) and current setup:
 ### Option A: Whisper + LLM Both on GPU (Recommended)
 ```
 Whisper medium.en     : 1.5 GB
-Qwen3-0.6B-Q8_0      : 0.9 GB
+Phi-4-mini Q4_K_M     : 2.5 GB
 CUDA overhead         : 0.5 GB
 ─────────────────────────────
-Total                 : 2.9 GB / 6.0 GB  ✓ (3.1 GB headroom)
+Total                 : 4.5 GB / 6.0 GB  ✓ (1.5 GB headroom)
 ```
 
 ### Option B: Distil-Whisper + LLM on GPU
 ```
 distil-large-v3       : 1.8 GB
-Qwen3-0.6B-Q8_0      : 0.9 GB
+Phi-4-mini Q4_K_M     : 2.5 GB
 CUDA overhead         : 0.5 GB
 ─────────────────────────────
-Total                 : 3.2 GB / 6.0 GB  ✓ (2.8 GB headroom)
+Total                 : 4.8 GB / 6.0 GB  ✓ (1.2 GB headroom)
 ```
 
 ### Option C: Parakeet + LLM on GPU
 ```
 Parakeet TDT 0.6B    : 1.5 GB
-Qwen3-0.6B-Q8_0      : 0.9 GB
+Phi-4-mini Q4_K_M     : 2.5 GB
 CUDA overhead         : 0.5 GB
 ─────────────────────────────
-Total                 : 2.9 GB / 6.0 GB  ✓ (3.1 GB headroom)
+Total                 : 4.5 GB / 6.0 GB  ✓ (1.5 GB headroom)
 ```
 
 ### Option D: Maximum Accuracy (Canary + LLM)
 ```
 Canary 1B             : 2.5 GB
-Qwen3-0.6B-Q8_0      : 0.9 GB
+Phi-4-mini Q4_K_M     : 2.5 GB
 CUDA overhead         : 0.5 GB
 ─────────────────────────────
-Total                 : 3.9 GB / 6.0 GB  ✓ (2.1 GB headroom)
+Total                 : 5.5 GB / 6.0 GB  ✓ (0.5 GB headroom)
 ```
 
 All options fit within 6 GB VRAM with headroom.

@@ -2411,7 +2411,7 @@ The RTX 4050 has 6 GB VRAM and sits idle during STT. Moving Whisper to GPU yield
 | Component | VRAM Usage |
 |---|---|
 | Whisper medium.en | ~1.5 GB |
-| Qwen3-0.6B-Q8_0 | ~0.9 GB |
+| Phi-4-mini Q4_K_M | ~2.5 GB |
 | CUDA overhead | ~0.5 GB |
 | **Total** | **~2.9 GB / 6.0 GB** |
 
@@ -2530,9 +2530,9 @@ transcription = model.transcribe(["audio.wav"])
 | Component | VRAM |
 |---|---|
 | Parakeet TDT 0.6B | 1.5 GB |
-| Qwen3-0.6B-Q8_0 | 0.9 GB |
+| Phi-4-mini Q4_K_M | 2.5 GB |
 | Overhead | 0.5 GB |
-| **Total** | **2.9 GB / 6.0 GB** |
+| **Total** | **4.5 GB / 6.0 GB** |
 
 ### Step 13.7 — Fine-Tuning for Specific Environment (LoRA)
 
@@ -2723,19 +2723,17 @@ User Command
 └──────┬───────┘
        │
        ├── TRIVIAL ("open Chrome") ──────→ 🟢 Direct tool dispatch (no LLM)
-       ├── SIMPLE ("search for X") ──────→ 🟡 Qwen3-0.6B (~10ms first token)
-       ├── COMPLEX ("analyze this PDF") ─→ 🔴 Qwen3-8B MoE (~180ms first token)
-       └── VISION ("what's on screen") ──→ 🟣 Qwen2.5-VL-3B (on demand)
+       ├── SIMPLE ("search for X") ──────→ 🟡 Phi-4-mini (~10ms first token)
+       ├── COMPLEX ("analyze this PDF") ─→ 🔴 Qwen2.5-VL-7B (~180ms first token)
+       └── VISION ("what's on screen") ──→ 🟣 Qwen2.5-VL-7B (on demand)
 ```
 
 ### 19.2 Available Models (All Free, All Local)
 
 | Model | VRAM | Purpose | Load Time |
 |---|---|---|---|
-| **Qwen3-0.6B** Q8_0 | ~0.8 GB | Simple tasks, routing, draft | ~1 second |
-| **Qwen3-4B** Q4_K_M | ~2.8 GB | Medium tasks (optional tier) | ~2 seconds |
-| **Qwen3-8B MoE** Q4_K_M | ~5.2 GB | Complex reasoning, coding | ~4 seconds |
-| **Qwen2.5-VL-3B** Q4_K_M | ~2.5 GB | Vision tasks | ~2 seconds |
+| **Phi-4-mini-instruct** Q4_K_M | ~2.5 GB | Primary reasoning, tool calling, everyday tasks | ~1 second |
+| **Qwen2.5-VL-7B-Instruct** Q4_K_M | ~4.7 GB | Complex reasoning, vision tasks (secondary) | ~4 seconds |
 | **nomic-embed-text** GGUF | ~270 MB (CPU) | Embeddings for RAG | Already loaded |
 
 ### 19.3 Routing Logic
@@ -2757,9 +2755,9 @@ SIMPLE_INDICATORS = [
     "search for", "what's the weather", "remind me",
     "read file", "set volume", "set brightness",
 ]
-# → Qwen3-0.6B, ~80ms total
+# → Phi-4-mini, ~80ms total
 
-# Everything else → Qwen3-8B MoE
+# Everything else → Qwen2.5-VL-7B
 # Fallback: If 0.6B responds "I need more reasoning power" → escalate to 8B
 ```
 
@@ -2780,10 +2778,10 @@ Models are swapped in/out of VRAM as needed via the existing `vram_orchestrator.
 
 | State | What's Loaded | VRAM |
 |---|---|---|
-| **Idle** | Whisper + Qwen3-0.6B | ~2.4 GB |
-| **Simple task** | Whisper + Qwen3-0.6B | ~2.4 GB |
-| **Complex task** | Whisper + Qwen3-8B | ~6.7 GB |
-| **Vision task** | Qwen2.5-VL-3B (Whisper unloaded) | ~3.0 GB |
+| **Idle** | Whisper + Phi-4-mini | ~4.5 GB |
+| **Simple task** | Whisper + Phi-4-mini | ~4.5 GB |
+| **Complex task** | Whisper + Qwen2.5-VL-7B | ~6.7 GB |
+| **Vision task** | Qwen2.5-VL-7B + mmproj (Whisper unloaded) | ~5.2 GB |
 
 - **Cold swap:** 2-4 seconds (first load)
 - **Warm swap:** <500ms (mmap caching keeps model in system RAM)
@@ -2817,7 +2815,7 @@ Models are swapped in/out of VRAM as needed via the existing `vram_orchestrator.
 | Component | Languages Supported | Configured Now |
 |---|---|---|
 | **STT (Whisper)** | 99 languages (Hindi, Urdu, Arabic, French, etc.) | English only |
-| **LLM (Qwen3-8B)** | English, Chinese, Hindi, and 20+ natively | English only |
+| **LLM (Phi-4-mini / Qwen2.5-VL-7B)** | English, Chinese, Hindi, and 20+ natively | English only |
 | **TTS (Piper)** | Voice models for 30+ languages | `en_US-lessac-high` only |
 | **Wake Word** | "Hey KRIA" is phonetic — language-independent | Works for all |
 
@@ -2842,7 +2840,7 @@ language = "hi"    # Lock to Hindi when selected
 wget https://huggingface.co/rhasspy/piper-voices/resolve/main/hi/hi_IN/...
 ```
 
-**Step 3 — LLM:** No changes needed — Qwen3 handles Hindi natively.
+**Step 3 — LLM:** No changes needed — both Phi-4-mini and Qwen2.5-VL handle Hindi natively.
 
 ### 20.3 Language Switching Tool
 
@@ -3321,7 +3319,7 @@ In demo mode, RED actions show the full approval UI but simulate execution (no a
 async def system_report() -> dict:
     return {
         "models": {
-            "llm": {"name": "Qwen3-8B-MoE", "vram_gb": 5.2, "context": 8192},
+            "llm": {"name": "Phi-4-mini-instruct", "vram_gb": 2.5, "context": 8192},
             "stt": {"name": "whisper-medium.en", "vram_gb": 1.5},
             "tts": {"name": "piper-lessac-high", "ram_mb": 300},
             "embeddings": {"name": "nomic-embed-text", "ram_mb": 270},

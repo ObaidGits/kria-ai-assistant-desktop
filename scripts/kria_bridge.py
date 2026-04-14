@@ -94,7 +94,7 @@ logging.getLogger("torchaudio").setLevel(logging.WARNING)
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 PORT             = int(os.getenv("BRIDGE_PORT",           "9000"))
-CORE_URL         = os.getenv("KRIA_CORE_URL",             "http://localhost:8000")
+CORE_URL         = os.getenv("KRIA_CORE_URL",             "http://localhost:8088")
 WHISPER_URL      = os.getenv("KRIA_WHISPER_URL",          "http://localhost:8081")
 PIPER_URL        = os.getenv("KRIA_PIPER_URL",            "http://localhost:8082")
 ENERGY_THRESHOLD = float(os.getenv("KRIA_ENERGY_THRESHOLD", "2000"))

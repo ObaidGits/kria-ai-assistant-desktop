@@ -86,13 +86,13 @@ class CircuitBreaker:
                 self._last_failure_time = time.monotonic()
                 if self._failure_count >= self.failure_threshold:
                     logger.warning(
-                        "[circuit:%s] CLOSED → OPEN after %d failures: %s",
+                        "[circuit:%s] CLOSED → OPEN after %d failures: %r",
                         self.name, self._failure_count, exc,
                     )
                     self._state = CircuitState.OPEN
                 else:
                     logger.warning(
-                        "[circuit:%s] failure %d/%d: %s",
+                        "[circuit:%s] failure %d/%d: %r",
                         self.name, self._failure_count, self.failure_threshold, exc,
                     )
             return self.fallback

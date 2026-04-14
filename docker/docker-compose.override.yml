@@ -14,9 +14,10 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - CUDA_MODULE_LOADING=LAZY
-      - LLAMA_MODEL_SIZE=0.6b
+      - LLAMA_BRAIN_ROLE=primary
       - LLAMA_GPU_LAYERS=99
-      - WHISPER_MODEL=ggml-medium.en.bin
+      - LLAMA_CTX_SIZE=4096
+      - WHISPER_MODEL=ggml-large-v3-turbo.bin
       - WHISPER_GPU_LAYERS=99
     deploy:
       resources:

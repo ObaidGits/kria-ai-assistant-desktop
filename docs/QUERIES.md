@@ -34,8 +34,8 @@
 
 | Component | License | Cost |
 |---|---|---|
-| Qwen3-8B MoE (LLM brain) | Apache 2.0 | Free |
-| Qwen3-0.6B (draft model) | Apache 2.0 | Free |
+| Phi-4-mini-instruct (LLM primary) | MIT | Free |
+| Qwen2.5-VL-7B-Instruct (LLM secondary) | Apache 2.0 | Free |
 | Whisper.cpp (speech-to-text) | MIT | Free |
 | Piper TTS (text-to-speech) | MIT | Free |
 | OpenWakeWord (wake word) | Apache 2.0 | Free |
@@ -95,7 +95,7 @@
 **Answer: K.R.I.A. v2.0 is a complete AI Assistant with 65+ tools across 12 domains.**
 
 ### 🧠 Intelligent Conversational AI
-- Natural language chat with Qwen3-8B (128K context window)
+- Natural language chat with Phi-4-mini-instruct (128K context window)
 - Multi-step reasoning via ReAct loop (Think → Act → Observe → Repeat)
 - Speculative decoding for 2x faster responses
 - Conversation memory across sessions (SQLite + ChromaDB)
@@ -252,14 +252,14 @@ The `kria-bridge` daemon runs on the host machine (outside Docker) and detects t
 | Component | Multilingual Capability | Configured In Docs |
 |---|---|---|
 | **STT (Whisper)** | Supports 99 languages (Hindi, Urdu, Arabic, French, etc.) | English only |
-| **LLM (Qwen3-8B)** | Natively supports English, Chinese, Hindi, and 20+ languages | English only |
+| **LLM (Phi-4-mini / Qwen2.5-VL-7B)** | Natively supports English, Chinese, Hindi, and 20+ languages | English only |
 | **TTS (Piper)** | Voice models for 30+ languages | `en_US-lessac-high` only |
 | **Wake Word** | "Hey KRIA" is language-independent (phonetic) | ✅ Works for all |
 
 ### How to Enable Multilingual
 
 - **STT:** Change the `language` parameter in Whisper config (or set to `auto-detect`)
-- **LLM:** No changes needed — Qwen3 handles Hindi/Urdu natively
+- **LLM:** No changes needed — both Phi-4-mini and Qwen2.5-VL handle Hindi/Urdu natively
 - **TTS:** Download additional Piper voice models (e.g., `hi_IN-*` for Hindi) — ~65MB each, free
 - **Switching:** Add a `set_language` tool or auto-detect via Whisper
 
@@ -306,7 +306,7 @@ By the underlying models: English, Hindi, Urdu, Chinese, French, Spanish, Arabic
 
 ### What It Is NOT
 
-The learning system is **pattern tracking and preference storage**, not model retraining. The LLM itself (Qwen3-8B) is not fine-tuned on user data — it uses stored context to personalize responses without modifying model weights.
+The learning system is **pattern tracking and preference storage**, not model retraining. The LLM itself (Phi-4-mini) is not fine-tuned on user data — it uses stored context to personalize responses without modifying model weights.
 
 ---
 
@@ -494,22 +494,20 @@ User Command
 └──────┬───────┘
        │
        ├── Simple ("open Chrome") ───→ 🟢 No model needed — direct tool call
-       ├── Medium ("search web") ────→ 🟡 Qwen3-0.6B (~10ms)
-       ├── Complex ("analyze PDF") ──→ 🔴 Qwen3-8B MoE (~180ms)
-       └── Vision ("what's on screen")→ 🟣 Qwen2.5-VL-3B (on demand)
+       ├── Medium ("search web") ────→ 🟡 Phi-4-mini (~10ms)
+       ├── Complex ("analyze PDF") ──→ 🔴 Qwen2.5-VL-7B (~180ms)
+       └── Vision ("what's on screen")→ 🟣 Qwen2.5-VL-7B (on demand)
 ```
 
 ### Available Models (All Free, All Local)
 
 | Model | VRAM | Purpose | Load Time |
 |---|---|---|---|
-| **Qwen3-0.6B** Q8_0 | ~0.8 GB | Simple tasks, routing, draft | ~1 second |
-| **Qwen3-4B** Q4_K_M | ~2.8 GB | Medium tasks (optional tier) | ~2 seconds |
-| **Qwen3-8B MoE** Q4_K_M | ~5.2 GB | Complex reasoning, coding | ~4 seconds |
-| **Qwen2.5-VL-3B** Q4_K_M | ~2.5 GB | Vision tasks | ~2 seconds |
+| **Phi-4-mini-instruct** Q4_K_M | ~2.5 GB | Primary reasoning, tool calling, everyday tasks | ~1 second |
+| **Qwen2.5-VL-7B-Instruct** Q4_K_M | ~4.7 GB | Complex reasoning, vision tasks (secondary) | ~4 seconds |
 | **nomic-embed-text** GGUF | ~270 MB (CPU) | Embeddings for RAG | Already loaded |
 
-Total download: ~10.7 GB (vs current 7.4 GB — only ~3 GB more)
+Total download: ~10 GB (primary only: ~4 GB)
 
 ### Performance Gains
 
@@ -541,18 +539,18 @@ TRIVIAL patterns (no LLM needed):
 
 SIMPLE patterns (small model):
   "search for", "what's the weather", "remind me", "read file"
-  → Qwen3-0.6B
+  → Phi-4-mini
 
 Everything else:
-  → Qwen3-8B MoE (full reasoning)
+  → Qwen2.5-VL-7B (full reasoning)
 
 Fallback:
-  If small model says "I need more reasoning power" → escalate to big model
+  If primary model says "I need more reasoning power" → escalate to secondary model
 ```
 
 ### Verdict
 
-**Yes, do it.** The simplest starting point: route pattern-matched trivial commands directly to tools with NO model, and use the existing Qwen3-8B for everything else. That alone gets 80% of the benefit with minimal code changes.
+**Yes, do it.** The simplest starting point: route pattern-matched trivial commands directly to tools with NO model, and use the existing Phi-4-mini for everything else. That alone gets 80% of the benefit with minimal code changes.
 
 ---
 

@@ -34,6 +34,39 @@ _TOOL_MODULES = [
     "kria.tools.process_mgmt",
     "kria.tools.code_executor",
     "kria.tools.web_tools",
+    # Phase 5 — Internet & Connectivity
+    "kria.tools.download_mgr",
+    "kria.tools.rss_reader",
+    "kria.tools.network_mgmt",
+    "kria.tools.api_tools",
+    # Phase 6 — Document Intelligence
+    "kria.tools.document_parser",
+    "kria.tools.document_convert",
+    "kria.tools.file_organizer",
+    "kria.tools.file_watcher",
+    # Phase 7 — OS-Level Management
+    "kria.tools.service_mgmt",
+    "kria.tools.disk_mgmt",
+    "kria.tools.power_mgmt",
+    "kria.tools.env_mgmt",
+    "kria.tools.task_scheduler",
+    # Phase 8 — Application Lifecycle
+    "kria.tools.app_lifecycle",
+    # Phase 9 — Notification & Communication
+    "kria.tools.notification",
+    "kria.tools.email_composer",
+    "kria.tools.clipboard_mgr",
+    "kria.tools.reminder",
+    # Phase 10 — Knowledge Base
+    "kria.tools.knowledge_tools",
+    "kria.tools.doc_ingest",
+    "kria.tools.snippet_lib",
+    # Phase 10 — User Preferences
+    "kria.memory.user_prefs",
+    # Phase 12 — Plugin Manager
+    "kria.plugins.manager",
+    # Interaction (ask_user)
+    "kria.tools.interaction_tools",
 ]
 
 
@@ -134,6 +167,14 @@ class ToolRegistry:
         "get_memory_info", "get_disk_space", "get_time",
         "get_battery_status", "web_search", "get_weather",
         "execute_shell", "list_directory", "read_file",
+        "search_files", "write_file",
+        "send_notification", "get_clipboard", "set_clipboard",
+        "remember_fact", "recall_fact", "search_knowledge",
+        "lock_screen", "get_news", "get_public_ip",
+        "schedule_reminder", "download_file",
+        "ping_host", "fetch_webpage", "deep_search",
+        "rss_feed_read",
+        "ask_user",
     }
 
     def _build_schema(self, name: str, spec: dict) -> dict:
@@ -154,6 +195,14 @@ class ToolRegistry:
     def get_openai_schemas(self) -> list[dict]:
         """Return tool schemas in OpenAI function-calling format."""
         return [self._build_schema(n, s) for n, s in self._tools.items()]
+
+    def get_openai_schemas_filtered(self, names: list[str]) -> list[dict]:
+        """Return schemas for only the specified tool names."""
+        return [
+            self._build_schema(n, s)
+            for n, s in self._tools.items()
+            if n in names
+        ]
 
     def get_openai_schemas_lite(self) -> list[dict]:
         """Return only the most common tool schemas (smaller payload for DIRECT_TOOL)."""

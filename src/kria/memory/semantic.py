@@ -13,6 +13,7 @@ Collection schema:
   document    — text content
   metadata    — {"session_id", "timestamp", "type"}
 """
+import asyncio
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -85,7 +86,9 @@ class SemanticMemory:
             **(extra_metadata or {}),
         }
         try:
-            self._collection.add(
+            col = self._collection
+            await asyncio.to_thread(
+                col.add,
                 documents=[text],
                 ids=[chunk_id],
                 metadatas=[metadata],
@@ -115,11 +118,17 @@ class SemanticMemory:
         elif memory_type:
             where = {"type": memory_type}
         try:
-            results = self._collection.query(
-                query_texts=[query_text],
-                n_results=min(n_results, self._collection.count() or 1),
-                where=where,
-            )
+            col = self._collection
+
+            def _do_query():
+                count = col.count() or 1
+                return col.query(
+                    query_texts=[query_text],
+                    n_results=min(n_results, count),
+                    where=where,
+                )
+
+            results = await asyncio.to_thread(_do_query)
             docs = results.get("documents", [[]])[0]
             metas = results.get("metadatas", [[]])[0]
             dists = results.get("distances", [[]])[0]
@@ -135,7 +144,8 @@ class SemanticMemory:
         if not self._available or not self._collection:
             return
         try:
-            self._collection.delete(where={"session_id": session_id})
+            col = self._collection
+            await asyncio.to_thread(col.delete, where={"session_id": session_id})
         except Exception as exc:
             logger.warning("SemanticMemory.delete failed: %s", exc)
 

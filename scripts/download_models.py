@@ -8,13 +8,17 @@ Default destination: <project-root>/models/  (no sudo needed)
 Override with:       MODELS_DIR=/your/path python scripts/download_models.py
 
 Models downloaded:
-  LLM:    Qwen3-8B-Q4_K_M.gguf        (~5.2 GB)
-  Draft:  Qwen3-0.6B-Q8_0.gguf        (~0.6 GB)
-  STT:    ggml-large-v3-turbo.bin      (~1.6 GB)
-  TTS:    en_US-ryan-high.onnx + .json (~65 MB)
+  Primary LLM:   microsoft_Phi-4-mini-instruct-Q4_K_M.gguf  (~2.5 GB)  — fast / lightweight
+  Secondary LLM: Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf         (~4.68 GB) — smart / vision  [Unsloth]
+  Vision Proj:   mmproj-F16.gguf                             (~1.35 GB) — mmproj encoder  [Unsloth]
+  STT:           ggml-large-v3-turbo.bin                     (~1.6 GB)
+  TTS:           en_US-ryan-high.onnx + .json                (~65 MB)
 
 Only downloads if the target file does not already exist.
 Set DRY_RUN=1 to print URLs without downloading.
+
+On first run the script will offer to delete the old bartowski/second-state
+Qwen files (if present) before downloading the improved Unsloth versions.
 """
 import hashlib
 import os
@@ -34,19 +38,45 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 MODELS_DIR = Path(os.getenv("MODELS_DIR", str(_SCRIPT_DIR.parent / "models")))
 DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
 
+# Auto-load .env from project root if HF_TOKEN not already set
+_ENV_FILE = _SCRIPT_DIR.parent / ".env"
+if not os.getenv("HF_TOKEN") and _ENV_FILE.exists():
+    for _line in _ENV_FILE.read_text().splitlines():
+        _line = _line.strip()
+        if _line.startswith("HF_TOKEN=") and not _line.startswith("#"):
+            os.environ["HF_TOKEN"] = _line.split("=", 1)[1].strip()
+            break
+
+HF_TOKEN = os.getenv("HF_TOKEN", "")
+
 # HuggingFace download base
 HF_BASE = "https://huggingface.co"
 
+# ── Old files that were replaced by the Unsloth versions ──────────
+# These were downloaded from bartowski / second-state repos.
+# The Unsloth release has better vision calibration.
+OLD_QWEN_FILES: list[Path] = [
+    MODELS_DIR / "llm" / "Qwen_Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf",   # bartowski (~4.7 GB)
+    MODELS_DIR / "llm" / "Qwen2.5-VL-7B-Instruct-vision.gguf",          # second-state mmproj (~1.3 GB)
+]
+
 DOWNLOADS = [
     {
-        "url": f"{HF_BASE}/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf",
-        "dest": MODELS_DIR / "llm" / "Qwen3-8B-Q4_K_M.gguf",
-        "desc": "Qwen3-8B LLM (5.2 GB)",
+        "url": f"{HF_BASE}/bartowski/microsoft_Phi-4-mini-instruct-GGUF/resolve/main/microsoft_Phi-4-mini-instruct-Q4_K_M.gguf",
+        "dest": MODELS_DIR / "llm" / "microsoft_Phi-4-mini-instruct-Q4_K_M.gguf",
+        "desc": "Phi-4-mini-instruct Primary LLM (~2.5 GB)",
     },
     {
-        "url": f"{HF_BASE}/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf",
-        "dest": MODELS_DIR / "llm" / "Qwen3-0.6B-Q8_0.gguf",
-        "desc": "Qwen3-0.6B Draft (0.6 GB)",
+        # Unsloth — better vision quality than bartowski build
+        "url": f"{HF_BASE}/unsloth/Qwen2.5-VL-7B-Instruct-GGUF/resolve/main/Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf",
+        "dest": MODELS_DIR / "llm" / "Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf",
+        "desc": "Qwen2.5-VL-7B-Instruct Secondary LLM — Unsloth Q4_K_M (~4.68 GB)",
+    },
+    {
+        # Unsloth mmproj (F16 precision, matched to above weights)
+        "url": f"{HF_BASE}/unsloth/Qwen2.5-VL-7B-Instruct-GGUF/resolve/main/mmproj-F16.gguf",
+        "dest": MODELS_DIR / "llm" / "mmproj-F16.gguf",
+        "desc": "Qwen2.5-VL Vision Encoder — Unsloth mmproj-F16 (~1.35 GB)",
     },
     {
         "url": f"{HF_BASE}/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin",
@@ -90,7 +120,11 @@ def download_file(url: str, dest: Path, desc: str) -> None:
     for attempt in range(1, MAX_RETRIES + 1):
         # Resume from existing .tmp file if present
         resume_from = tmp.stat().st_size if tmp.exists() else 0
-        headers = {"Range": f"bytes={resume_from}-"} if resume_from else {}
+        headers: dict[str, str] = {}
+        if HF_TOKEN:
+            headers["Authorization"] = f"Bearer {HF_TOKEN}"
+        if resume_from:
+            headers["Range"] = f"bytes={resume_from}-"
 
         if resume_from:
             print(f"  [RESUME] attempt {attempt}/{MAX_RETRIES} — resuming from {resume_from:,} bytes")
@@ -132,10 +166,58 @@ def download_file(url: str, dest: Path, desc: str) -> None:
             print(f"  [FAIL] attempt {attempt}/{MAX_RETRIES}: {exc}")
             if attempt < MAX_RETRIES:
                 import time
-                print(f"         Waiting {RETRY_WAIT}s before retry...")
-                time.sleep(RETRY_WAIT)
+                for remaining in range(RETRY_WAIT, 0, -1):
+                    print(f"\r         Retrying in {remaining:2d}s...  ", end="", flush=True)
+                    time.sleep(1)
+                print(f"\r                              \r", end="", flush=True)
 
     raise RuntimeError(f"Failed after {MAX_RETRIES} attempts")
+
+
+def delete_old_qwen_models() -> None:
+    """
+    Offer to delete the old bartowski / second-state Qwen files that were
+    replaced by the Unsloth versions.  Skips silently if none are found.
+    """
+    present = [p for p in OLD_QWEN_FILES if p.exists()]
+    if not present:
+        return
+
+    total_bytes = sum(p.stat().st_size for p in present)
+    total_gb = total_bytes / (1024 ** 3)
+
+    print()
+    print("  [INFO] Old Qwen model files found (bartowski / second-state builds):")
+    for p in present:
+        size_gb = p.stat().st_size / (1024 ** 3)
+        print(f"         {p.name}  ({size_gb:.2f} GB)")
+    print(f"         Total: {total_gb:.2f} GB")
+    print()
+    print("  These have been replaced by improved Unsloth builds.")
+    print("  Delete them to reclaim disk space? (new files will be downloaded)")
+    print()
+
+    if DRY_RUN:
+        print("  [DRY]  Would prompt to delete old Qwen files (DRY_RUN=1 — skipping)")
+        return
+
+    try:
+        answer = input("  Delete old files? [Y/N]: ").strip().upper()
+    except (EOFError, KeyboardInterrupt):
+        print("\n  Skipping deletion.")
+        return
+
+    if answer == "Y":
+        for p in present:
+            try:
+                p.unlink()
+                print(f"  [DEL]  Deleted {p.name}")
+            except OSError as exc:
+                print(f"  [WARN] Could not delete {p.name}: {exc}")
+        print()
+    else:
+        print("  Keeping old files — proceeding with downloads.")
+        print()
 
 
 def main() -> None:
@@ -144,6 +226,9 @@ def main() -> None:
     print(f"Models directory: {MODELS_DIR}")
     if DRY_RUN:
         print("DRY_RUN=1 — no files will be downloaded\n")
+
+    # Offer to clean up old Qwen files before starting
+    delete_old_qwen_models()
 
     errors = []
     for item in DOWNLOADS:

@@ -15,7 +15,7 @@ K.R.I.A. is a **complete AI Assistant** that runs entirely on your laptop. It go
 ## Key Features
 
 ### 🧠 Intelligent Agent
-- **Agentic Reasoning** — Qwen3-8B MoE via llama.cpp with ReAct planning for multi-step tasks
+- **Dual-Model Architecture** — Phi-4-mini-instruct (3.8B, primary) + Qwen2.5-VL-7B-Instruct (7B, secondary with vision) via llama.cpp with ReAct planning for multi-step tasks
 - **Voice-First Interaction** — Custom wake word ("Hey KRIA"), sub-500ms response for simple commands
 - **65+ Built-in Tools** — Organized across 12 capability domains
 - **Four-Tier Safety System** — GREEN/YELLOW/RED/BLACK risk classification with human-in-the-loop approval
@@ -93,7 +93,10 @@ bash scripts/setup.sh        # Linux
 python3 scripts/download_models.py
 
 # Launch
-docker compose up -d
+bash scripts/app-start.sh
+
+# Optional: start secondary model (Qwen2.5-VL-7B vision)
+docker compose --profile secondary -f docker/docker-compose.yml up -d kria-brain-secondary
 
 # Dashboard
 open http://localhost:3000

@@ -101,6 +101,20 @@ class ConversationMemory:
         )
         return count
 
+    async def delete_all_sessions(self) -> int:
+        """Delete every conversation turn across all sessions. Returns row count."""
+        rows = await sqlite_manager.execute(
+            "SELECT COUNT(*) AS cnt FROM conversations",
+            (),
+        )
+        count = rows[0]["cnt"] if rows else 0
+        await sqlite_manager.execute(
+            "DELETE FROM conversations",
+            (),
+            fetch=False,
+        )
+        return count
+
     # ── LLM message formatting ────────────────────────────────────
 
     async def build_messages(

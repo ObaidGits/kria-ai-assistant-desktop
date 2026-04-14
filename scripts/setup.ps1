@@ -5,9 +5,9 @@
 .DESCRIPTION
     Checks prerequisites, installs Python dependencies,
     creates required directories, generates .env file,
-    and optionally starts Docker services.
+    and builds Docker images.
 .PARAMETER SkipDocker
-    Skip Docker service startup
+    Skip Docker image build
 .PARAMETER DownloadModels
     Download AI models after setup
 #>
@@ -53,7 +53,15 @@ $ok = $true
 $ok = $ok -and (Test-Prerequisite "Python 3.12+" { python --version | Where-Object { $_ -match "3\.(1[2-9]|[2-9]\d)" } })
 if (-not $SkipDocker) {
     $ok = $ok -and (Test-Prerequisite "Docker Desktop" { docker info })
-    $ok = $ok -and (Test-Prerequisite "nvidia-smi" { nvidia-smi --query-gpu=name --format=csv,noheader })
+}
+
+$hasGpu = $false
+try {
+    nvidia-smi --query-gpu=name --format=csv,noheader | Out-Null
+    Write-Host "  GPU detected — NVIDIA acceleration available" -ForegroundColor Green
+    $hasGpu = $true
+} catch {
+    Write-Host "  [!] nvidia-smi not found — GPU features unavailable (CPU mode)" -ForegroundColor Yellow
 }
 
 if (-not $ok) {
@@ -65,7 +73,7 @@ if (-not $ok) {
 
 # ── Python virtual environment ─────────────────────────────────────
 Write-Host ""
-Write-Host "  [1/4] Setting up Python virtualenv..." -ForegroundColor Yellow
+Write-Host "  [1/5] Setting up Python virtualenv..." -ForegroundColor Yellow
 
 if (-not (Test-Path $VENV_PATH)) {
     python -m venv $VENV_PATH
@@ -74,26 +82,35 @@ if (-not (Test-Path $VENV_PATH)) {
 $pip = Join-Path $VENV_PATH "Scripts\pip.exe"
 $python = Join-Path $VENV_PATH "Scripts\python.exe"
 
+Write-Progress -Activity "Installing Python packages" -Status "Upgrading pip..." -PercentComplete 0
 & $pip install --quiet --upgrade pip
-& $pip install --quiet setuptools wheel  # ensure build backend is available
+Write-Progress -Activity "Installing Python packages" -Status "Installing setuptools, wheel..." -PercentComplete 25
+& $pip install --quiet setuptools wheel
+Write-Progress -Activity "Installing Python packages" -Status "Installing KRIA package and dependencies..." -PercentComplete 50
 & $pip install --quiet -e "$KRIA_ROOT[dev,windows]"
-& $pip install --quiet httpx tqdm  # required by download_models.py
+Write-Progress -Activity "Installing Python packages" -Status "Installing httpx, tqdm..." -PercentComplete 85
+& $pip install --quiet httpx tqdm
+Write-Progress -Activity "Installing Python packages" -Completed
 
 Write-Host "        Done." -ForegroundColor Green
 
 # ── Environment file ───────────────────────────────────────────────
-Write-Host "  [2/4] Configuring .env..." -ForegroundColor Yellow
+Write-Host "  [2/5] Configuring .env..." -ForegroundColor Yellow
 
 if (-not (Test-Path $ENV_FILE)) {
-    Copy-Item $ENV_EXAMPLE $ENV_FILE
-    Write-Host "        Created .env from .env.example" -ForegroundColor Green
-    Write-Host "        [!] Review $ENV_FILE and set KRIA_BRIDGE_SECRET" -ForegroundColor Yellow
+    if (Test-Path $ENV_EXAMPLE) {
+        Copy-Item $ENV_EXAMPLE $ENV_FILE
+        Write-Host "        Created .env from .env.example" -ForegroundColor Green
+        Write-Host "        [!] Review $ENV_FILE and adjust values if needed" -ForegroundColor Yellow
+    } else {
+        Write-Host "        [!] .env.example not found — skipping" -ForegroundColor Yellow
+    }
 } else {
     Write-Host "        .env already exists — skipping" -ForegroundColor Cyan
 }
 
 # ── Directories ────────────────────────────────────────────────────
-Write-Host "  [3/4] Creating data directories..." -ForegroundColor Yellow
+Write-Host "  [3/5] Creating data directories..." -ForegroundColor Yellow
 $dirs = @(
     "$env:USERPROFILE\.kria",
     "$env:USERPROFILE\.kria\rollback",
@@ -108,6 +125,8 @@ foreach ($d in $dirs) {
 Write-Host "        Done." -ForegroundColor Green
 
 # ── Bridge secret ──────────────────────────────────────────────────
+Write-Host "  [4/5] Configuring bridge secret..." -ForegroundColor Yellow
+
 $secretFile = "$env:USERPROFILE\.kria\bridge_secret.txt"
 if (-not (Test-Path $secretFile)) {
     $bridgeSecret = [System.Convert]::ToHexString([System.Security.Cryptography.RandomNumberGenerator]::GetBytes(32)).ToLower()
@@ -136,13 +155,27 @@ $dockerSecretFile = Join-Path $dockerSecretDir "bridge_secret.txt"
 New-Item -ItemType Directory -Force -Path $dockerSecretDir | Out-Null
 Copy-Item -Path $secretFile -Destination $dockerSecretFile -Force
 Write-Host "        Bridge secret copied to docker\secrets\bridge_secret.txt" -ForegroundColor Green
-# ── Docker / model download ────────────────────────────────────────
+
+# ── Docker build ───────────────────────────────────────────────────
 if (-not $SkipDocker) {
-    Write-Host "  [4/4] Pulling Docker images..." -ForegroundColor Yellow
+    Write-Host "  [5/5] Building Docker images..." -ForegroundColor Yellow
     Push-Location (Join-Path $KRIA_ROOT "docker")
-    docker compose pull
+
+    $composeFiles = @("-f", "docker-compose.yml")
+    if (Test-Path "docker-compose.override.yml") {
+        $composeFiles += @("-f", "docker-compose.override.yml")
+    }
+    if ($hasGpu -and (Test-Path "docker-compose.gpu.yml")) {
+        $composeFiles += @("-f", "docker-compose.gpu.yml")
+        Write-Host "        GPU detected — building with GPU support" -ForegroundColor Green
+    }
+
+    Write-Host "        Building images (live output below)..." -ForegroundColor Cyan
+    docker compose @composeFiles build
     Pop-Location
     Write-Host "        Done." -ForegroundColor Green
+} else {
+    Write-Host "  [5/5] Skipping Docker build (-SkipDocker)" -ForegroundColor Cyan
 }
 
 if ($DownloadModels) {
@@ -150,15 +183,26 @@ if ($DownloadModels) {
     Write-Host "  Downloading AI models (this may take a while)..." -ForegroundColor Yellow
     & $python (Join-Path $KRIA_ROOT "scripts\download_models.py")
 }
+
 Write-Host ""
 Write-Host "  =============================================" -ForegroundColor Green
 Write-Host "  K.R.I.A. setup complete!" -ForegroundColor Green
 Write-Host ""
-Write-Host "  Quick start (Docker):" -ForegroundColor White
-Write-Host "    1. Download models:   python scripts\download_models.py"
-Write-Host "    2. Start stack (CPU): Set-Location docker; docker compose up -d"
-Write-Host "       Start stack (GPU): Set-Location docker; docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d"
-Write-Host "    3. Start bridge:      python scripts\kria_bridge.py   (in a separate terminal)"
-Write-Host "    4. Dashboard:         http://localhost:3000"
-Write-Host "    5. API docs:          http://localhost:8000/docs"
+Write-Host "  Next steps:" -ForegroundColor White
+Write-Host "    1. Download models (first time only):"
+Write-Host "       python scripts\download_models.py"
+Write-Host ""
+Write-Host "    2. Start KRIA (Linux/macOS/WSL):"
+Write-Host "       bash scripts/app-start.sh"
+Write-Host ""
+Write-Host "    3. Open Dashboard:"
+Write-Host "       http://localhost:3000"
+Write-Host ""
+Write-Host "    4. (Optional) Start host bridge for mic/speaker:"
+Write-Host "       python scripts\kria_bridge.py"
+Write-Host ""
+Write-Host "  Other commands:" -ForegroundColor White
+Write-Host "    bash scripts/app-stop.sh           Stop all services"
+Write-Host "    bash scripts/app-restart.sh        Restart with latest changes"
+Write-Host "    bash scripts/app-restart.sh --quick Restart without rebuilding"
 Write-Host ""

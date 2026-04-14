@@ -43,25 +43,73 @@ class PolicyDecision:
 # ── Classification tables (mirrors SAFETY_SPECIFICATION.md) ──────
 
 GREEN_ACTIONS = frozenset({
+    # ── Phase 0-4 originals ──
     "open_application", "list_running_apps", "focus_window",
     "get_cpu_usage", "get_memory_info", "get_disk_space",
     "get_network_status", "get_battery_status", "get_clipboard",
     "read_file", "search_files", "web_search", "fetch_webpage",
     "get_weather", "get_time", "screenshot", "list_directory",
+    "deep_search",
+    # ── Phase 5: Internet ──
+    "rss_feed_read", "get_news", "ping_host", "dns_lookup",
+    "get_public_ip", "check_url_status", "http_request", "get_stock_price",
+    # ── Phase 6: Document (read-only) ──
+    "parse_pdf", "parse_docx", "parse_xlsx", "parse_csv",
+    "summarize_document", "list_watched_directories",
+    # ── Phase 7: OS (read-only) ──
+    "list_services", "find_large_files", "find_duplicate_files",
+    "calculate_dir_size", "get_environment_variable",
+    "list_environment_variables", "list_scheduled_tasks",
+    "search_package", "check_updates_available",
+    # ── Phase 8b: Snap/Flatpak (read-only) ──
+    "snap_list", "snap_search", "flatpak_list", "flatpak_search",
+    # ── Phase 9: Communication ──
+    "send_notification", "compose_email", "open_email_draft",
+    "get_clipboard", "clipboard_history", "schedule_reminder",
+    # ── Phase 10: Knowledge (read) ──
+    "recall_fact", "list_remembered", "search_knowledge",
+    "get_snippet", "list_snippets", "get_preference", "list_preferences",
+    # ── Phase 12: Plugins (read) ──
+    "list_plugins",
+    # ── Interaction (meta-tool, zero risk) ──
+    "ask_user",
 })
 
 YELLOW_ACTIONS = frozenset({
+    # ── Phase 0-4 originals ──
     "close_application", "kill_process", "set_volume", "set_brightness",
     "toggle_wifi", "set_power_plan", "write_file", "set_clipboard",
     "type_text", "install_package", "create_directory", "rename_file",
+    # ── Phase 5: Internet (write) ──
+    "download_file",
+    # ── Phase 6: Document (write) ──
+    "convert_document", "organize_files", "watch_directory",
+    "unwatch_directory",
+    # ── Phase 7: OS (limited write) ──
+    "lock_screen", "suspend_system", "create_scheduled_task",
+    "cancel_scheduled_task",
+    # ── Phase 9: Communication (write) ──
+    "set_clipboard",
+    # ── Phase 10: Knowledge (write) ──
+    "remember_fact", "ingest_document", "save_snippet", "delete_snippet",
+    "set_preference",
+    # ── Phase 12: Plugins ──
+    "load_plugin", "unload_plugin",
 })
 
 RED_ACTIONS = frozenset({
+    # ── Phase 0-4 originals ──
     "delete_file", "delete_directory", "move_file",
     "write_registry", "modify_service", "change_network_config",
     "execute_powershell", "execute_python", "execute_shell",
     "uninstall_package", "set_process_priority",
     "modify_scheduled_task", "change_environment_variable",
+    # ── Phase 7: OS (destructive) ──
+    "manage_service", "shutdown_system", "reboot_system",
+    # ── Phase 8: App lifecycle (destructive) ──
+    "install_application", "uninstall_application",
+    # ── Phase 8b: Snap/Flatpak (destructive) ──
+    "snap_install", "snap_remove", "flatpak_install", "flatpak_remove",
 })
 
 # Hardcoded — these patterns are NEVER permitted regardless of user approval
@@ -108,6 +156,23 @@ class PolicyEngine:
         self._protected = [re.compile(p, re.IGNORECASE) for p in _PROTECTED_PATH_PATTERNS]
         # Emergency mode: only GREEN allowed until manually cleared
         self._emergency: bool = settings.emergency_mode
+        # MCP tool risk levels (populated by MCPClientManager after discovery)
+        self._mcp_risk_levels: dict[str, RiskLevel] = {}
+
+    # ── MCP risk registration ─────────────────────────────────────
+
+    def register_mcp_risk_levels(self, tool_risk_map: dict[str, str]) -> None:
+        """
+        Register risk levels for MCP tools.
+
+        Called by MCPClientManager after discovering tools from each server.
+        Accepts {"mcp_server_tool": "RED", ...} — string values are
+        converted to RiskLevel enum.  Invalid values default to RED.
+        """
+        level_map = {"GREEN": RiskLevel.GREEN, "YELLOW": RiskLevel.YELLOW, "RED": RiskLevel.RED}
+        for name, level_str in tool_risk_map.items():
+            self._mcp_risk_levels[name] = level_map.get(level_str.upper(), RiskLevel.RED)
+        logger.info("Registered MCP risk levels for %d tools", len(tool_risk_map))
 
     # ── Public API ────────────────────────────────────────────────
 
@@ -146,6 +211,29 @@ class PolicyEngine:
                 reason="Action targets a protected system path.",
                 requires_approval=True,
                 requires_rollback=True,
+            )
+
+        # 3b. MCP tool risk lookup (set by MCPClientManager)
+        mcp_level = self._mcp_risk_levels.get(action)
+        if mcp_level is not None:
+            if mcp_level == RiskLevel.GREEN:
+                return PolicyDecision(
+                    risk_level=RiskLevel.GREEN,
+                    allowed=True,
+                    reason=f"MCP tool — configured as GREEN",
+                )
+            if mcp_level == RiskLevel.YELLOW:
+                return PolicyDecision(
+                    risk_level=RiskLevel.YELLOW,
+                    allowed=True,
+                    reason=f"MCP tool — configured as YELLOW",
+                )
+            return PolicyDecision(
+                risk_level=RiskLevel.RED,
+                allowed=False,
+                reason=f"MCP tool — configured as RED (requires approval)",
+                requires_approval=True,
+                requires_rollback=False,
             )
 
         # 4. Action table lookup

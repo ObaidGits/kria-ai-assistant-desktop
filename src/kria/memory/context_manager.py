@@ -15,6 +15,7 @@ from typing import Optional
 
 from kria.memory.conversation import conversation_memory
 from kria.memory.semantic import semantic_memory
+from kria.memory.mem0_memory import mem0_memory
 
 logger = logging.getLogger("kria.memory.context_manager")
 
@@ -79,6 +80,12 @@ class ContextManager:
             session_id=session_id,
         )
 
+        # 2b. Mem0 fact memory (non-blocking — returns [] if unavailable)
+        facts = await mem0_memory.search(
+            query=user_input,
+            limit=5,
+        )
+
         # 3. User preferences
         prefs = await self.get_all_preferences()
 
@@ -88,6 +95,7 @@ class ContextManager:
         return {
             "conversation_history": messages,
             "relevant_memories": memories,
+            "user_facts": facts,
             "user_preferences": prefs,
             "system_state": system_state,
         }
@@ -114,13 +122,20 @@ class ContextManager:
         assistant_response: str,
         tool_calls: Optional[list] = None,
     ) -> None:
-        """Persist a completed turn to conversation + semantic memories."""
+        """Persist a completed turn to conversation + semantic + Mem0 memories."""
         await conversation_memory.add_turn(session_id, "user", user_input)
         await conversation_memory.add_turn(session_id, "assistant", assistant_response)
 
         # Store a summarised chunk in semantic memory for long-term recall
         summary = f"User: {user_input}\nAssistant: {assistant_response}"
         await semantic_memory.store(summary, session_id=session_id, memory_type="conversation")
+
+        # Feed the turn to Mem0 for automatic fact extraction (fire-and-forget)
+        messages = [
+            {"role": "user", "content": user_input},
+            {"role": "assistant", "content": assistant_response},
+        ]
+        await mem0_memory.add(messages, metadata={"session_id": session_id})
 
 
 context_manager = ContextManager()

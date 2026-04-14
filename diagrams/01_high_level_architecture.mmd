@@ -14,7 +14,7 @@ graph TB
 
     subgraph BRAIN["🧠 Reasoning Brain — Local LLM"]
         ROUTER["Intent Router<br/>Lightweight Classifier"]
-        LLM["Qwen3-8B MoE<br/>via llama.cpp GGUF Q4_K_M"]
+        LLM["Phi-4-mini-instruct<br/>via llama.cpp GGUF Q4_K_M"]
         CTX["Context Manager<br/>Sliding Window + RAG"]
         PLAN["Agentic Planner<br/>ReAct Loop"]
     end

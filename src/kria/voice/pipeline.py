@@ -110,17 +110,29 @@ class VoicePipeline:
         Send a text message through router → agent loop → return text response.
         This is the shared path for voice input AND text-based API calls.
         """
+        result = await self.process_text_full(text, session_id=session_id)
+        return result["response"]
+
+    async def process_text_full(self, text: str, session_id: str = "voice") -> dict:
+        """
+        Send a text message through router → agent loop → return structured result.
+        Returns dict with: response, tool_calls, iterations, success.
+        """
         try:
             from kria.agent.router import intent_router, IntentType
             from kria.agent.loop import react_loop
 
-            intent = await intent_router.classify(text)
+            intent, tool_hint = await intent_router.classify(text)
+            logger.info(
+                "[pipeline] session=%s intent=%s tool_hint=%s message=%r",
+                session_id, intent.value, tool_hint, text[:100],
+            )
 
             if intent == IntentType.CONVERSATION:
                 # Pure conversational — skip tool loop, streamed LLM
                 from kria.agent.llm_client import llm_client
                 from kria.agent.prompts import build_system_prompt
-                system_content = build_system_prompt() + "\n/no_think"
+                system_content = build_system_prompt(think=False)
                 result = await llm_client.chat(
                     messages=[
                         {"role": "system", "content": system_content},
@@ -139,29 +151,58 @@ class VoicePipeline:
                         max_tokens=256,
                     )
                 if result is None:
-                    return "I'm having trouble reaching my reasoning engine right now."
+                    return {
+                        "response": "I'm having trouble reaching my reasoning engine right now.",
+                        "tool_calls": [], "iterations": 0, "success": False,
+                    }
                 msg = result.get("choices", [{}])[0].get("message", {})
-                return msg.get("content") or msg.get("reasoning_content") or ""
+                resp = msg.get("content") or msg.get("reasoning_content") or ""
+                logger.info("[pipeline] CONVERSATION response=%r", resp[:120])
+                return {
+                    "response": resp,
+                    "tool_calls": [], "iterations": 0, "success": True,
+                }
 
             # DIRECT_TOOL or AGENT_LOOP
             from kria.memory.conversation import conversation_memory
+            # DIRECT_TOOL: short history to save context window for tool schemas
+            # AGENT_LOOP: longer history for multi-step reasoning
+            history_limit = 4 if intent == IntentType.DIRECT_TOOL else 20
             history_rows = await conversation_memory.get_recent(
-                session_id, limit=20, roles=["user", "assistant"]
+                session_id, limit=history_limit, roles=["user", "assistant"]
             )
             conversation_history = [
                 {"role": t["role"], "content": t["content"]} for t in history_rows
             ]
+            logger.info(
+                "[pipeline] history_turns=%d session=%s",
+                len(conversation_history), session_id,
+            )
             response = await react_loop.run(
                 user_message=text,
                 conversation_history=conversation_history,
                 session_id=session_id,
                 intent=intent.value,
+                tool_hint=tool_hint,
             )
-            return response.text
+            logger.info(
+                "[pipeline] result: tools_called=%d iterations=%d success=%s response=%r",
+                len(response.tool_calls), response.iterations,
+                response.success, response.text[:120],
+            )
+            return {
+                "response": response.text,
+                "tool_calls": response.tool_calls,
+                "iterations": response.iterations,
+                "success": response.success,
+            }
 
         except Exception as exc:
-            logger.error("process_text failed: %s", exc)
-            return "I encountered an error processing your request."
+            logger.error("process_text failed: %s", exc, exc_info=True)
+            return {
+                "response": "I encountered an error processing your request.",
+                "tool_calls": [], "iterations": 0, "success": False,
+            }
 
     # ── Push-to-talk ──────────────────────────────────────────────
 

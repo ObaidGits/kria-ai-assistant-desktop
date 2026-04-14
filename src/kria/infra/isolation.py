@@ -19,13 +19,19 @@ Usage::
     else:
         handle_error(result.error)
 """
+import asyncio
 import logging
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import wraps
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger("kria.isolation")
+
+# Dedicated thread pool for tool execution so blocking I/O
+# (file ops, subprocess, psutil) never freezes the async event loop.
+_tool_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="kria-tool")
 
 
 @dataclass
@@ -40,16 +46,20 @@ class ToolResult:
 
 def isolated(func: Callable) -> Callable:
     """
-    Decorator that guarantees the wrapped *async* function never raises.
+    Decorator that guarantees the wrapped *async* function never raises
+    and offloads execution to a thread pool.
 
-    On any uncaught exception it logs the traceback at ERROR level and
-    returns ``ToolResult(success=False, error=<message>)``.
+    Most tool functions are ``async def`` but perform blocking I/O
+    (file system, subprocess, psutil).  Running them in a worker thread
+    keeps the main event loop responsive for health checks, WebSocket,
+    and other concurrent HTTP requests.
     """
     @wraps(func)
     async def wrapper(*args: Any, **kwargs: Any) -> ToolResult:
         try:
-            result = await func(*args, **kwargs)
-            # Functions may already return a ToolResult — pass it through.
+            loop = asyncio.get_running_loop()
+            coro = func(*args, **kwargs)
+            result = await loop.run_in_executor(_tool_pool, asyncio.run, coro)
             if isinstance(result, ToolResult):
                 return result
             return ToolResult(success=True, data=result)

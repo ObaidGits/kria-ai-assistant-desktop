@@ -1,7 +1,7 @@
 [project]
 name = "kria"
-version = "1.0.0"
-description = "K.R.I.A. — Kernel-Responsive Intelligent Agent"
+version = "2.0.0"
+description = "K.R.I.A. — Kernel-Responsive Intelligent Agent — Complete AI Assistant"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -17,6 +17,23 @@ dependencies = [
     "websockets>=13.0",
     "trafilatura>=1.12.0",
     "python-multipart>=0.0.18",
+    "PyMuPDF>=1.24.0",
+    "python-docx>=1.1.0",
+    "openpyxl>=3.1.0",
+    "pandas>=2.2.0",
+    "watchdog>=4.0.0",
+    "apscheduler>=3.10.0,<4",
+    "plyer>=2.1.0",
+    "pyyaml>=6.0",
+    "feedparser>=6.0",
+    "Pillow>=11.0.0",
+    "duckduckgo-search>=7.0.0",
+    "tiktoken>=0.7.0",
+    "markitdown>=0.1.0",
+    "opencv-python-headless>=4.9.0",
+    "mem0ai>=0.1.0",
+    "qdrant-client>=1.9.0",
+    "sentence-transformers>=3.0.0",
 ]
 
 [project.optional-dependencies]
@@ -37,6 +54,18 @@ windows = [
     "pywin32>=306",
     "pycaw>=20240210",
     "comtypes>=1.4.0",
+    "win10toast>=0.9",
+]
+ocr = [
+    "pytesseract>=0.3.10",
+]
+mcp = [
+    "mcp>=1.0.0",
+]
+preprocessing = [
+    "faster-whisper>=1.0.0",
+    "tree-sitter-languages>=1.10.0",
+    "crawl4ai>=0.3.0",
 ]
 
 [build-system]

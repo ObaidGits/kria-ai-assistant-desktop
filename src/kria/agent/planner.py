@@ -14,7 +14,7 @@ import json
 import logging
 import re
 
-from kria.agent.llm_client import llm_client
+from kria.agent.model_router import model_router
 
 logger = logging.getLogger("kria.planner")
 
@@ -33,7 +33,8 @@ Return ONLY the JSON array — no markdown fences, no explanations.\
 class Planner:
     async def create_plan(self, user_request: str) -> list[dict]:
         try:
-            result = await llm_client.chat(
+            _client = model_router.get_planning_client()
+            result = await _client.chat(
                 messages=[
                     {"role": "system", "content": _SYSTEM},
                     {"role": "user", "content": user_request},

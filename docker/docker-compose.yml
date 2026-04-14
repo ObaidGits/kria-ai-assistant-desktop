@@ -5,7 +5,7 @@
 
 services:
   # ============================================================
-  # kria-brain: LLM + STT inference (CPU by default)
+  # kria-brain: PRIMARY LLM + STT inference (Phi-4-mini-instruct 3.8B)
   # For GPU add: docker-compose.gpu.yml override
   # ============================================================
   kria-brain:
@@ -14,26 +14,54 @@ services:
       dockerfile: Dockerfile
     container_name: kria-brain
     environment:
-      # Default: 0.6B model (~2GB RAM). Set 8b for Qwen3-8B (~10GB RAM or GPU mode).
-      - LLAMA_MODEL_SIZE=0.6b
+      - LLAMA_BRAIN_ROLE=primary
+      - LLAMA_PORT=8080
       - LLAMA_GPU_LAYERS=0
     volumes:
-      - kria-models:/models:ro
-      # configs/ is baked into the image at build time (COPY configs/ /configs/)
-      # No bind-mount needed — avoids Docker Desktop NTFS path restrictions.
+      - ../models:/models:ro
+      - kria-data:/data:ro
     ports:
-      - "127.0.0.1:8080:8080"  # llama.cpp API
-      - "127.0.0.1:8081:8081"  # whisper.cpp API
+      - "127.0.0.1:8080:8080"  # llama.cpp PRIMARY API
+      - "127.0.0.1:8081:8081"  # whisper.cpp STT API
     networks:
       - kria-net
-    # No memory limit — Qwen3-8B needs ~10 GB (8 GB model + KV cache).
-    # Requires swap space to run on systems with < 12 GB free RAM.
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 30s
       timeout: 10s
       retries: 5
       start_period: 300s
+    restart: unless-stopped
+
+  # ============================================================
+  # kria-brain-secondary: SECONDARY LLM (Qwen2.5-VL-7B-Instruct)
+  # Used by Auto mode for complex AGENT_LOOP requests.
+  # Start only if VRAM allows:  docker compose up -d kria-brain-secondary
+  # ============================================================
+  kria-brain-secondary:
+    build:
+      context: ./brain
+      dockerfile: Dockerfile
+    container_name: kria-brain-secondary
+    environment:
+      - LLAMA_BRAIN_ROLE=secondary
+      - LLAMA_PORT=8085
+      - LLAMA_GPU_LAYERS=0
+    volumes:
+      - ../models:/models:ro
+      - kria-data:/data:ro
+    ports:
+      - "127.0.0.1:8085:8085"  # llama.cpp SECONDARY API
+    networks:
+      - kria-net
+    profiles:
+      - secondary  # opt-in: docker compose --profile secondary up -d
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8085/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 480s   # Qwen2.5-VL 7B needs more time to load
     restart: unless-stopped
 
   # ============================================================
@@ -48,7 +76,7 @@ services:
     environment:
       - PIPER_DEFAULT_VOICE=en_US-lessac-high
     volumes:
-      - kria-models:/models:ro
+      - ../models:/models:ro
     ports:
       - "127.0.0.1:8082:8082"  # Piper TTS API
     networks:
@@ -70,9 +98,12 @@ services:
       context: ..
       dockerfile: docker/core/Dockerfile
     container_name: kria-core
+    pid: "host"
+    privileged: true
     environment:
       - KRIA_ENV=production
       - KRIA_LLAMA_API_URL=http://kria-brain:8080
+      - KRIA_LLAMA_SECONDARY_API_URL=http://kria-brain-secondary:8085
       - KRIA_WHISPER_API_URL=http://kria-brain:8081
       - KRIA_PIPER_API_URL=http://kria-voice:8082
       - KRIA_REDIS_URL=redis://kria-data:6379/0
@@ -81,7 +112,9 @@ services:
       - KRIA_BRIDGE_SECRET_FILE=/run/secrets/bridge_secret
       - KRIA_SQLITE_PATH=/data/kria.db
       - KRIA_CHROMADB_HOST=kria-data
+      - KRIA_QDRANT_URL=http://kria-qdrant:6333
       - KRIA_VOICE_ENABLED=false
+      - KRIA_LLM_MODE=auto
       # TTS voice (must match a .onnx model in /models/piper/)
       - KRIA_TTS_VOICE=en_US-lessac-high
       # Set to a partial mic label to prefer a specific microphone in the web UI.
@@ -90,9 +123,16 @@ services:
       - KRIA_MIC_DEVICE_LABEL=
     volumes:
       - kria-data:/data
-      - kria-core-cache:/home/kria/.cache
+      - kria-core-cache:/root/.cache
+      - /var/run/docker.sock:/var/run/docker.sock:rw
+      # Host filesystem access (paths match host paths for tool compatibility)
+      - /home:/home:rw
+      - /media:/media:rw
+      - /tmp:/tmp:rw
+      - /etc:/host/etc:ro
+      - /var:/host/var:ro
     ports:
-      - "127.0.0.1:8000:8000"  # REST API + WebSocket
+      - "127.0.0.1:8088:8000"  # REST API + WebSocket
     networks:
       - kria-net
     extra_hosts:
@@ -107,6 +147,8 @@ services:
       kria-brain:
         condition: service_healthy
       kria-data:
+        condition: service_healthy
+      kria-qdrant:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -145,6 +187,31 @@ services:
     restart: unless-stopped
 
   # ============================================================
+  # kria-qdrant: Qdrant vector database (Mem0 backend)
+  # ============================================================
+  kria-qdrant:
+    image: qdrant/qdrant:latest
+    container_name: kria-qdrant
+    volumes:
+      - kria-qdrant-data:/qdrant/storage
+    ports:
+      - "127.0.0.1:6333:6333"   # Qdrant REST API
+      - "127.0.0.1:6334:6334"   # Qdrant gRPC
+    networks:
+      - kria-net
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/6333'"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+
+  # ============================================================
   # kria-dashboard: Web UI (static HTML served by Nginx)
   # ============================================================
   kria-dashboard:
@@ -174,7 +241,7 @@ services:
       dockerfile: docker/init/Dockerfile
     container_name: kria-init
     volumes:
-      - kria-models:/models
+      - ../models:/models
     environment:
       - HF_HUB_ENABLE_HF_TRANSFER=1
     profiles:
@@ -188,9 +255,7 @@ services:
 # Volumes
 # ================================================================
 volumes:
-  kria-models:
-    name: kria-models
-    driver: local
+  # kria-models is a direct bind mount (../models) — no named volume needed.
   kria-data:
     name: kria-data
     driver: local
@@ -202,6 +267,9 @@ volumes:
     driver: local
   kria-core-cache:
     name: kria-core-cache
+    driver: local
+  kria-qdrant-data:
+    name: kria-qdrant-data
     driver: local
 
 # ================================================================
