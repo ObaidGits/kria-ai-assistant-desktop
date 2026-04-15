@@ -74,7 +74,7 @@ pub fn register(reg: &mut ToolRegistry) {
         }, Arc::new(GetActiveConnections)),
         // RED
         (ToolDef {
-            name: "set_process_priority".into(), description: "Set process priority/niceness (requires approval)".into(),
+            name: "set_process_priority".into(), description: "Set process priority/niceness".into(),
             category: "process".into(), default_tier: RiskLevel::Red, min_tier: "standard",
             parameters: vec![
                 param("pid", "integer", "Process ID", true),
@@ -82,7 +82,7 @@ pub fn register(reg: &mut ToolRegistry) {
             ],
         }, Arc::new(SetProcessPriority)),
         (ToolDef {
-            name: "manage_service".into(), description: "Start/stop/restart a systemd service (requires approval)".into(),
+            name: "manage_service".into(), description: "Start, stop, or restart a systemd service".into(),
             category: "process".into(), default_tier: RiskLevel::Red, min_tier: "standard",
             parameters: vec![
                 param("name", "string", "Service name", true),

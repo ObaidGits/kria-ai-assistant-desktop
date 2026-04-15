@@ -101,7 +101,7 @@ struct ExecutePowershell;
 pub fn register(reg: &mut ToolRegistry) {
     let tools: Vec<(ToolDef, Arc<dyn ToolHandler>)> = vec![
         (ToolDef {
-            name: "execute_bash".into(), description: "Execute a bash command (requires approval)".into(),
+            name: "execute_bash".into(), description: "Execute a bash shell command".into(),
             category: "shell".into(), default_tier: RiskLevel::Red, min_tier: "lite",
             parameters: vec![
                 param("command", "string", "Bash command to execute", true),
@@ -109,7 +109,7 @@ pub fn register(reg: &mut ToolRegistry) {
             ],
         }, Arc::new(ExecuteBash)),
         (ToolDef {
-            name: "execute_python".into(), description: "Execute Python code (requires approval)".into(),
+            name: "execute_python".into(), description: "Execute Python code".into(),
             category: "shell".into(), default_tier: RiskLevel::Red, min_tier: "standard",
             parameters: vec![
                 param("code", "string", "Python code to execute", true),
@@ -117,7 +117,7 @@ pub fn register(reg: &mut ToolRegistry) {
             ],
         }, Arc::new(ExecutePython)),
         (ToolDef {
-            name: "execute_powershell".into(), description: "Execute a PowerShell command (requires approval)".into(),
+            name: "execute_powershell".into(), description: "Execute a PowerShell command".into(),
             category: "shell".into(), default_tier: RiskLevel::Red, min_tier: "lite",
             parameters: vec![
                 param("command", "string", "PowerShell command", true),

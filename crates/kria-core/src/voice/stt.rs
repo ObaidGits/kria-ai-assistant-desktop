@@ -24,7 +24,7 @@ impl SpeechToText {
         Self {
             model_path,
             binary_path,
-            language: "en".into(),
+            language: "auto".into(),
         }
     }
 
@@ -38,14 +38,21 @@ impl SpeechToText {
 
         if let Some(ref binary) = self.binary_path {
             // CLI mode: call whisper.cpp binary
+            let mut args = vec![
+                "-m".to_string(), self.model_path.to_string_lossy().to_string(),
+                "-f".to_string(), wav_path.to_string_lossy().to_string(),
+                "--no-timestamps".to_string(),
+                "-t".to_string(), "4".to_string(),
+            ];
+            // Only pass -l if a specific language is set (not "auto")
+            // whisper.cpp auto-detects language when -l is omitted
+            if self.language != "auto" {
+                args.push("-l".to_string());
+                args.push(self.language.clone());
+            }
+
             let output = tokio::process::Command::new(binary)
-                .args([
-                    "-m", &self.model_path.to_string_lossy(),
-                    "-l", &self.language,
-                    "-f", &wav_path.to_string_lossy(),
-                    "--no-timestamps",
-                    "-t", "4",
-                ])
+                .args(&args)
                 .output()
                 .await?;
 

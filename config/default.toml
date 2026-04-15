@@ -42,3 +42,11 @@ port = 3001
 [ui]
 theme = "dark"
 font_size = 14
+
+[search]
+engine = "duckduckgo"                       # "duckduckgo" | "searxng"
+# searxng_url = "http://localhost:8888"     # Only used when engine = "searxng"
+news_feeds = [
+    "https://feeds.arstechnica.com/arstechnica/index",
+    "https://hnrss.org/frontpage",
+]

@@ -165,3 +165,152 @@ fn load_config_returns_error_for_invalid_toml() {
     let result = load_config(f.path(), None);
     assert!(result.is_err());
 }
+
+// ── Phase 6: Config save / TOML roundtrip ───────────────────────────
+
+#[test]
+fn config_survives_toml_roundtrip() {
+    let original = KriaConfig::default();
+    let toml_str = toml::to_string_pretty(&original).unwrap();
+    let deserialized: KriaConfig = toml::from_str(&toml_str).unwrap();
+
+    assert_eq!(original.llm.active_model, deserialized.llm.active_model);
+    assert_eq!(original.llm.routing_mode, deserialized.llm.routing_mode);
+    assert_eq!(original.server.port, deserialized.server.port);
+    assert_eq!(original.ui.theme, deserialized.ui.theme);
+    assert_eq!(original.voice.tts_voice, deserialized.voice.tts_voice);
+    assert_eq!(original.safety.hitl_timeout_secs, deserialized.safety.hitl_timeout_secs);
+    assert_eq!(original.search.engine, deserialized.search.engine);
+}
+
+#[test]
+fn config_save_writes_valid_toml_to_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+
+    let mut cfg = KriaConfig::default();
+    cfg.llm.active_model = "test-model".into();
+    cfg.ui.theme = "light".into();
+    cfg.safety.emergency_mode = true;
+    cfg.voice.enabled = true;
+
+    // Write manually (since save() uses KriaPaths)
+    let toml_str = toml::to_string_pretty(&cfg).unwrap();
+    std::fs::write(&config_path, &toml_str).unwrap();
+
+    // Read back and verify
+    let loaded = load_config(&config_path, None).unwrap();
+    assert_eq!(loaded.llm.active_model, "test-model");
+    assert_eq!(loaded.ui.theme, "light");
+    assert!(loaded.safety.emergency_mode);
+    assert!(loaded.voice.enabled);
+}
+
+#[test]
+fn config_preserves_all_sections_through_toml() {
+    let mut cfg = KriaConfig::default();
+    cfg.llm.cloud_provider = "gemini".into();
+    cfg.llm.cloud_api_key = "sk-test-123".into();
+    cfg.llm.temperature = 0.8;
+    cfg.llm.max_tokens = 4096;
+    cfg.voice.mode = "continuous".into();
+    cfg.voice.vad_silence_ms = 500;
+    cfg.memory.max_context_turns = 50;
+    cfg.safety.tool_timeout_secs = 60;
+    cfg.search.engine = "searxng".into();
+    cfg.search.searxng_url = "http://my-instance:9090".into();
+
+    let toml_str = toml::to_string_pretty(&cfg).unwrap();
+    let loaded: KriaConfig = toml::from_str(&toml_str).unwrap();
+
+    assert_eq!(loaded.llm.cloud_provider, "gemini");
+    assert_eq!(loaded.llm.cloud_api_key, "sk-test-123");
+    assert!((loaded.llm.temperature - 0.8).abs() < f32::EPSILON);
+    assert_eq!(loaded.llm.max_tokens, 4096);
+    assert_eq!(loaded.voice.mode, "continuous");
+    assert_eq!(loaded.voice.vad_silence_ms, 500);
+    assert_eq!(loaded.memory.max_context_turns, 50);
+    assert_eq!(loaded.safety.tool_timeout_secs, 60);
+    assert_eq!(loaded.search.engine, "searxng");
+    assert_eq!(loaded.search.searxng_url, "http://my-instance:9090");
+}
+
+#[test]
+fn config_json_to_toml_and_back() {
+    // Simulates settings UI flow: frontend sends JSON → backend deserializes → saves as TOML → loads back
+    let original = KriaConfig::default();
+    let json = serde_json::to_string(&original).unwrap();
+    let from_json: KriaConfig = serde_json::from_str(&json).unwrap();
+    let toml_str = toml::to_string_pretty(&from_json).unwrap();
+    let from_toml: KriaConfig = toml::from_str(&toml_str).unwrap();
+
+    assert_eq!(from_toml.llm.active_model, original.llm.active_model);
+    assert_eq!(from_toml.ui.theme, original.ui.theme);
+    assert_eq!(from_toml.server.port, original.server.port);
+    assert_eq!(from_toml.voice.tts_voice, original.voice.tts_voice);
+}
+
+#[test]
+fn config_partial_toml_retains_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("partial.toml");
+    std::fs::write(
+        &path,
+        r#"
+[ui]
+theme = "light"
+"#,
+    )
+    .unwrap();
+
+    let cfg = load_config(&path, None).unwrap();
+    assert_eq!(cfg.ui.theme, "light");
+    // Everything else remains default
+    assert_eq!(cfg.llm.active_model, "phi-4-mini");
+    assert_eq!(cfg.voice.mode, "push_to_talk");
+    assert_eq!(cfg.safety.hitl_timeout_secs, 30);
+    assert_eq!(cfg.search.engine, "duckduckgo");
+}
+
+#[test]
+fn config_cloud_api_key_can_be_updated_and_saved() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("api_key_test.toml");
+
+    let mut cfg = KriaConfig::default();
+    assert!(cfg.llm.cloud_api_key.is_empty());
+
+    cfg.llm.cloud_api_key = "sk-new-key-1234".into();
+    let toml_str = toml::to_string_pretty(&cfg).unwrap();
+    std::fs::write(&path, &toml_str).unwrap();
+
+    let loaded = load_config(&path, None).unwrap();
+    assert_eq!(loaded.llm.cloud_api_key, "sk-new-key-1234");
+}
+
+#[test]
+fn theme_toggle_persists_through_save_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("theme_test.toml");
+
+    // Start dark
+    let mut cfg = KriaConfig::default();
+    assert_eq!(cfg.ui.theme, "dark");
+
+    // Toggle to light
+    cfg.ui.theme = "light".into();
+    let toml_str = toml::to_string_pretty(&cfg).unwrap();
+    std::fs::write(&path, &toml_str).unwrap();
+
+    let loaded = load_config(&path, None).unwrap();
+    assert_eq!(loaded.ui.theme, "light");
+
+    // Toggle back to dark
+    let mut cfg2 = loaded;
+    cfg2.ui.theme = "dark".into();
+    let toml_str2 = toml::to_string_pretty(&cfg2).unwrap();
+    std::fs::write(&path, &toml_str2).unwrap();
+
+    let loaded2 = load_config(&path, None).unwrap();
+    assert_eq!(loaded2.ui.theme, "dark");
+}

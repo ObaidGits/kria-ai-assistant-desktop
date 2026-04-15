@@ -146,6 +146,20 @@ impl ToolRegistry {
 
 /// Build the full tool registry with all built-in tools.
 pub fn build_default_registry() -> ToolRegistry {
+    build_registry_with_store(None)
+}
+
+/// Build with MemoryStore only (no RAG).
+pub fn build_registry_with_store(store: Option<std::sync::Arc<crate::memory::store::MemoryStore>>) -> ToolRegistry {
+    build_registry_full(store, None, None)
+}
+
+/// Build the full tool registry with a MemoryStore, optional RagEngine, and optional ProactiveEngine.
+pub fn build_registry_full(
+    store: Option<std::sync::Arc<crate::memory::store::MemoryStore>>,
+    rag: Option<std::sync::Arc<crate::memory::rag::RagEngine>>,
+    proactive: Option<std::sync::Arc<crate::automation::proactive::ProactiveEngine>>,
+) -> ToolRegistry {
     let mut reg = ToolRegistry::new();
 
     super::system_info::register(&mut reg);
@@ -153,7 +167,12 @@ pub fn build_default_registry() -> ToolRegistry {
     super::app_lifecycle::register(&mut reg);
     super::shell::register(&mut reg);
     super::internet::register(&mut reg);
-    super::knowledge::register(&mut reg);
+    if let Some(s) = store {
+        super::knowledge::register(&mut reg, s);
+    } else {
+        // Register without memory backing (stubs for testing)
+        super::knowledge::register_stubs(&mut reg);
+    }
     super::system_config::register(&mut reg);
     super::power::register(&mut reg);
     super::process::register(&mut reg);
@@ -162,6 +181,16 @@ pub fn build_default_registry() -> ToolRegistry {
     super::interaction::register(&mut reg);
     super::disk::register(&mut reg);
     super::scheduler::register(&mut reg);
+    super::vision::register(&mut reg, None);
+    super::desktop::register(&mut reg);
+    super::developer::register(&mut reg);
+    super::i18n::register(&mut reg);
+    if let Some(rag_engine) = rag {
+        super::rag::register(&mut reg, rag_engine);
+    }
+    if let Some(proactive_engine) = proactive {
+        super::proactive::register(&mut reg, proactive_engine);
+    }
 
     tracing::info!(count = reg.len(), "tool registry built");
     reg

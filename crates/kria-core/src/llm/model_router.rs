@@ -34,7 +34,10 @@ impl RoutingMode {
 pub struct ModelRouter {
     mode: RwLock<RoutingMode>,
     local: Option<Arc<dyn LlmBackend>>,
+    vision_local: Option<Arc<dyn LlmBackend>>,
     cloud_clients: RwLock<HashMap<String, Arc<dyn LlmBackend>>>,
+    /// Local API URL (stored for server probing).
+    local_api_url: String,
 }
 
 impl ModelRouter {
@@ -50,6 +53,33 @@ impl ModelRouter {
         } else {
             None
         };
+
+        // Create a vision-capable backend if a vision model is explicitly defined
+        let vision_local = config.llm.models.iter()
+            .find(|m| m.capabilities.contains(&"vision".to_string()) && m.mmproj_file.is_some())
+            .map(|vm| {
+                Arc::new(LocalBackend::new(
+                    config.llm.local_api_url.clone(),
+                    vm.name.clone(),
+                    vec!["text".into(), "vision".into()],
+                    vm.context_window,
+                )) as Arc<dyn LlmBackend>
+            })
+            // If no explicit vision model but local backend exists, treat local
+            // as vision-capable: the user may have loaded a vision model (e.g.
+            // Qwen2.5-VL with --mmproj) on their llama.cpp server.
+            .or_else(|| {
+                if !config.llm.local_api_url.is_empty() {
+                    Some(Arc::new(LocalBackend::new(
+                        config.llm.local_api_url.clone(),
+                        config.llm.active_model.clone(),
+                        vec!["text".into(), "vision".into()],
+                        config.llm.context_window,
+                    )) as Arc<dyn LlmBackend>)
+                } else {
+                    None
+                }
+            });
 
         let mut cloud_clients: HashMap<String, Arc<dyn LlmBackend>> = HashMap::new();
 
@@ -77,8 +107,32 @@ impl ModelRouter {
         Self {
             mode: RwLock::new(mode),
             local,
+            vision_local,
             cloud_clients: RwLock::new(cloud_clients),
+            local_api_url: config.llm.local_api_url.clone(),
         }
+    }
+
+    /// Query the local LLM server's `/v1/models` endpoint and return
+    /// the model ID if the server is reachable.
+    pub async fn detect_server_model(&self) -> Option<String> {
+        if self.local_api_url.is_empty() {
+            return None;
+        }
+        let url = format!("{}/models", self.local_api_url);
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .ok()?;
+        let resp = client.get(&url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let body: serde_json::Value = resp.json().await.ok()?;
+        body["data"].as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|m| m["id"].as_str())
+            .map(|s| s.to_string())
     }
 
     /// Get the current routing mode.
@@ -109,6 +163,26 @@ impl ModelRouter {
                     .or_else(|| self.local.clone())
             }
         }
+    }
+
+    /// Route a request with images to a vision-capable backend.
+    /// Falls back to regular routing if no vision backend is available.
+    pub async fn route_vision(&self) -> Option<Arc<dyn LlmBackend>> {
+        if let Some(ref v) = self.vision_local {
+            return Some(v.clone());
+        }
+        // Fall back to cloud if available (cloud models often support vision)
+        let clients = self.cloud_clients.read().await;
+        if let Some(client) = clients.values().next() {
+            return Some(client.clone());
+        }
+        // Last resort: use local text model (LLM will respond about image without seeing it)
+        self.local.clone()
+    }
+
+    /// Check if a vision-capable backend is available.
+    pub fn has_vision(&self) -> bool {
+        self.vision_local.is_some()
     }
 
     /// Always returns local client (for classification, planning).

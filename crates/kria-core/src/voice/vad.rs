@@ -1,36 +1,112 @@
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex as StdMutex};
+use ort::session::Session;
+use ort::value::Tensor;
+
 use crate::voice::capture::AudioChunk;
 
-/// Voice Activity Detection using energy-based detection.
+/// Voice Activity Detection with Silero VAD ONNX backend and energy-based fallback.
 ///
-/// A production implementation should use Silero VAD (ONNX via `ort` crate).
-/// This implementation uses simple energy thresholding as a starting point.
+/// When a `silero_vad.onnx` model is available, uses neural-network-based
+/// speech probability — far more accurate than energy thresholding alone.
+/// Falls back to energy-based detection if the model cannot be loaded.
 pub struct VoiceActivityDetector {
     energy_threshold: f32,
-    /// Minimum speech duration in chunks to trigger (debounce).
+    speech_threshold: f32,
     min_speech_chunks: usize,
-    /// Number of silent chunks before considering speech ended.
     silence_timeout_chunks: usize,
     speech_chunk_count: usize,
     silence_chunk_count: usize,
     is_speaking: bool,
+    /// Silero VAD ONNX session (None = energy-only fallback).
+    silero: Option<Arc<StdMutex<SileroState>>>,
+}
+
+/// Internal state for Silero VAD ONNX inference.
+struct SileroState {
+    session: Session,
+    /// LSTM hidden state — shape [2, 1, 64].
+    h: Vec<f32>,
+    /// LSTM cell state — shape [2, 1, 64].
+    c: Vec<f32>,
 }
 
 impl VoiceActivityDetector {
+    /// Create a new VAD with energy-based detection (no ONNX model).
     pub fn new(energy_threshold: f32) -> Self {
         Self {
             energy_threshold,
+            speech_threshold: 0.5,
             min_speech_chunks: 3,
             silence_timeout_chunks: 10,
             speech_chunk_count: 0,
             silence_chunk_count: 0,
             is_speaking: false,
+            silero: None,
         }
     }
 
-    /// Process an audio chunk and return whether speech is occurring.
-    pub fn process(&mut self, chunk: &AudioChunk) -> VadResult {
+    /// Create a VAD with Silero ONNX model loaded from the given path.
+    /// Falls back to energy-based detection if the model cannot be loaded.
+    pub fn with_silero(energy_threshold: f32, model_path: &PathBuf) -> Self {
+        let mut vad = Self::new(energy_threshold);
+
+        if model_path.exists() {
+            match Session::builder().and_then(|mut b| b.commit_from_file(model_path)) {
+                Ok(session) => {
+                    let state = SileroState {
+                        session,
+                        // Silero VAD v4/v5: state shape [2, 1, 64]
+                        h: vec![0.0f32; 2 * 1 * 64],
+                        c: vec![0.0f32; 2 * 1 * 64],
+                    };
+                    vad.silero = Some(Arc::new(StdMutex::new(state)));
+                    tracing::info!(path = %model_path.display(), "Silero VAD model loaded");
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %model_path.display(),
+                        error = %e,
+                        "failed to load Silero VAD, using energy-based fallback"
+                    );
+                }
+            }
+        } else {
+            tracing::info!(
+                path = %model_path.display(),
+                "Silero VAD model not found, using energy-based fallback"
+            );
+        }
+
+        vad
+    }
+
+    /// Returns true if using Silero ONNX model rather than energy fallback.
+    pub fn is_using_silero(&self) -> bool {
+        self.silero.is_some()
+    }
+
+    /// Compute speech probability for an audio chunk.
+    /// Returns a value between 0.0 (silence) and 1.0 (speech).
+    fn speech_probability(&self, chunk: &AudioChunk) -> f32 {
+        if let Some(silero) = &self.silero {
+            if let Ok(mut state) = silero.lock() {
+                return silero_infer(&mut state, &chunk.samples, chunk.sample_rate);
+            }
+        }
+        // Fallback: map energy to a 0..1 range using the threshold as midpoint
         let energy = rms_energy(&chunk.samples);
-        let is_active = energy > self.energy_threshold;
+        if energy > self.energy_threshold {
+            (0.5 + 0.5 * (energy - self.energy_threshold) / self.energy_threshold).min(1.0)
+        } else {
+            (0.5 * energy / self.energy_threshold).max(0.0)
+        }
+    }
+
+    /// Process an audio chunk and return the VAD decision.
+    pub fn process(&mut self, chunk: &AudioChunk) -> VadResult {
+        let prob = self.speech_probability(chunk);
+        let is_active = prob > self.speech_threshold;
 
         if is_active {
             self.speech_chunk_count += 1;
@@ -65,6 +141,13 @@ impl VoiceActivityDetector {
         self.speech_chunk_count = 0;
         self.silence_chunk_count = 0;
         self.is_speaking = false;
+        // Reset Silero LSTM state
+        if let Some(silero) = &self.silero {
+            if let Ok(mut state) = silero.lock() {
+                state.h.fill(0.0);
+                state.c.fill(0.0);
+            }
+        }
     }
 }
 
@@ -74,6 +157,118 @@ pub enum VadResult {
     SpeechStart,
     Speaking,
     SpeechEnd,
+}
+
+/// Run Silero VAD inference on a chunk of audio samples.
+///
+/// The model expects 512-sample windows at 16 kHz. We process in windows
+/// and return the maximum speech probability across all windows.
+fn silero_infer(state: &mut SileroState, samples: &[f32], sample_rate: u32) -> f32 {
+    let window_size = 512;
+    let mut max_prob = 0.0f32;
+
+    // Process each 512-sample window
+    let chunks: Vec<&[f32]> = samples.chunks(window_size).collect();
+    for window in chunks {
+        // Pad last window if needed
+        let padded: Vec<f32>;
+        let input_data = if window.len() < window_size {
+            padded = {
+                let mut v = window.to_vec();
+                v.resize(window_size, 0.0);
+                v
+            };
+            &padded
+        } else {
+            window
+        };
+
+        let prob = silero_infer_window(state, input_data, sample_rate);
+        if prob > max_prob {
+            max_prob = prob;
+        }
+    }
+
+    max_prob
+}
+
+/// Run Silero VAD inference on a single 512-sample window.
+fn silero_infer_window(state: &mut SileroState, samples: &[f32], sample_rate: u32) -> f32 {
+    // Input tensors for Silero VAD v4:
+    //   "input" : float32 [1, 512]
+    //   "sr"    : int64   [1]
+    //   "h"     : float32 [2, 1, 64]
+    //   "c"     : float32 [2, 1, 64]
+    let input = match Tensor::from_array(([1usize, samples.len()], samples.to_vec())) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::trace!(error = %e, "silero input tensor error");
+            return 0.0;
+        }
+    };
+
+    let sr = match Tensor::from_array(([1usize], vec![sample_rate as i64])) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::trace!(error = %e, "silero sr tensor error");
+            return 0.0;
+        }
+    };
+
+    let h = match Tensor::from_array(([2usize, 1, 64], state.h.clone())) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::trace!(error = %e, "silero h tensor error");
+            return 0.0;
+        }
+    };
+
+    let c = match Tensor::from_array(([2usize, 1, 64], state.c.clone())) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::trace!(error = %e, "silero c tensor error");
+            return 0.0;
+        }
+    };
+
+    let inputs = ort::inputs![
+        "input" => input,
+        "sr" => sr,
+        "h" => h,
+        "c" => c,
+    ];
+
+    match state.session.run(inputs) {
+        Ok(outputs) => {
+            // Output: "output" float32 [1,1], "hn" float32 [2,1,64], "cn" float32 [2,1,64]
+            let prob = outputs.get("output")
+                .and_then(|v| v.try_extract_tensor::<f32>().ok())
+                .map(|(_shape, data)| if data.is_empty() { 0.0 } else { data[0] })
+                .unwrap_or(0.0);
+
+            // Update LSTM hidden states
+            if let Some((_shape, data)) = outputs.get("hn")
+                .and_then(|v| v.try_extract_tensor::<f32>().ok())
+            {
+                if data.len() == state.h.len() {
+                    state.h.copy_from_slice(data);
+                }
+            }
+            if let Some((_shape, data)) = outputs.get("cn")
+                .and_then(|v| v.try_extract_tensor::<f32>().ok())
+            {
+                if data.len() == state.c.len() {
+                    state.c.copy_from_slice(data);
+                }
+            }
+
+            prob
+        }
+        Err(e) => {
+            tracing::trace!(error = %e, "silero inference error");
+            0.0
+        }
+    }
 }
 
 fn rms_energy(samples: &[f32]) -> f32 {

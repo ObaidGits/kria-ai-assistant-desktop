@@ -18,6 +18,52 @@ pub struct ChatMessage {
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Optional image attachments (base64-encoded) for vision models.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<ImageAttachment>>,
+}
+
+/// An image attachment for multimodal messages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageAttachment {
+    /// Base64-encoded image data.
+    pub data: String,
+    /// MIME type (e.g. "image/png", "image/jpeg").
+    pub mime_type: String,
+}
+
+impl ChatMessage {
+    /// Check if this message contains images.
+    pub fn has_images(&self) -> bool {
+        self.images.as_ref().map_or(false, |imgs| !imgs.is_empty())
+    }
+
+    /// Convert to OpenAI multimodal content format for vision APIs.
+    pub fn to_multimodal_content(&self) -> serde_json::Value {
+        if !self.has_images() {
+            return serde_json::json!(self.content);
+        }
+        let mut parts = Vec::new();
+        // Add text first
+        if !self.content.is_empty() {
+            parts.push(serde_json::json!({
+                "type": "text",
+                "text": self.content,
+            }));
+        }
+        // Add images
+        if let Some(ref images) = self.images {
+            for img in images {
+                parts.push(serde_json::json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": format!("data:{};base64,{}", img.mime_type, img.data),
+                    },
+                }));
+            }
+        }
+        serde_json::json!(parts)
+    }
 }
 
 /// Response from an LLM backend.

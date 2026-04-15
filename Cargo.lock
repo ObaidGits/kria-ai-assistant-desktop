@@ -2902,6 +2902,7 @@ dependencies = [
  "globset",
  "hmac",
  "image",
+ "ndarray",
  "notify",
  "notify-rust",
  "once_cell",
@@ -2933,7 +2934,9 @@ name = "kria-desktop"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "kria-core",
+ "rusqlite",
  "serde",
  "serde_json",
  "tauri",
@@ -2948,6 +2951,7 @@ dependencies = [
  "tauri-plugin-shell",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

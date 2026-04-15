@@ -57,6 +57,19 @@ pub struct AuditEntry {
     pub timestamp: DateTime<Utc>,
 }
 
+/// A chunk of an ingested document for RAG.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentChunk {
+    pub id: Option<i64>,
+    pub doc_id: String,
+    pub doc_name: String,
+    pub doc_type: String,
+    pub chunk_index: i32,
+    pub content: String,
+    pub char_offset: i64,
+    pub created_at: DateTime<Utc>,
+}
+
 impl MemoryStore {
     /// Open (or create) the SQLite database and run migrations.
     pub fn open(db_path: &Path) -> anyhow::Result<Self> {
@@ -140,6 +153,22 @@ impl MemoryStore {
 
             CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
                 text, content=memory_facts, content_rowid=id
+            );
+
+            CREATE TABLE IF NOT EXISTS document_chunks (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                doc_id      TEXT NOT NULL,
+                doc_name    TEXT NOT NULL,
+                doc_type    TEXT NOT NULL DEFAULT 'text',
+                chunk_index INTEGER NOT NULL DEFAULT 0,
+                content     TEXT NOT NULL,
+                char_offset INTEGER NOT NULL DEFAULT 0,
+                created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_chunks_doc ON document_chunks(doc_id);
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+                content, content=document_chunks, content_rowid=id
             );
             "
         )?;
@@ -489,6 +518,112 @@ impl MemoryStore {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM snippets WHERE name = ?1", params![name])?;
         Ok(())
+    }
+
+    // ── Document Chunks (RAG) ───────────────────────────────────────
+
+    pub fn store_chunk(&self, chunk: &DocumentChunk) -> anyhow::Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO document_chunks (doc_id, doc_name, doc_type, chunk_index, content, char_offset, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                chunk.doc_id, chunk.doc_name, chunk.doc_type,
+                chunk.chunk_index, chunk.content, chunk.char_offset,
+                chunk.created_at.to_rfc3339(),
+            ],
+        )?;
+        let id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO chunks_fts(rowid, content) VALUES (?1, ?2)",
+            params![id, chunk.content],
+        )?;
+        Ok(id)
+    }
+
+    pub fn search_chunks(&self, query: &str, limit: usize) -> anyhow::Result<Vec<DocumentChunk>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT c.id, c.doc_id, c.doc_name, c.doc_type, c.chunk_index, c.content, c.char_offset, c.created_at
+             FROM chunks_fts f JOIN document_chunks c ON f.rowid = c.id
+             WHERE chunks_fts MATCH ?1 ORDER BY rank LIMIT ?2"
+        )?;
+        let chunks = stmt.query_map(params![query, limit as i64], |row| {
+            Ok(DocumentChunk {
+                id: Some(row.get(0)?),
+                doc_id: row.get(1)?,
+                doc_name: row.get(2)?,
+                doc_type: row.get(3)?,
+                chunk_index: row.get(4)?,
+                content: row.get(5)?,
+                char_offset: row.get(6)?,
+                created_at: parse_dt(row.get::<_, String>(7)?),
+            })
+        })?.collect::<Result<Vec<_>, _>>()?;
+        Ok(chunks)
+    }
+
+    pub fn get_chunk(&self, id: i64) -> anyhow::Result<Option<DocumentChunk>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, doc_id, doc_name, doc_type, chunk_index, content, char_offset, created_at
+             FROM document_chunks WHERE id = ?1"
+        )?;
+        let mut rows = stmt.query_map(params![id], |row| {
+            Ok(DocumentChunk {
+                id: Some(row.get(0)?),
+                doc_id: row.get(1)?,
+                doc_name: row.get(2)?,
+                doc_type: row.get(3)?,
+                chunk_index: row.get(4)?,
+                content: row.get(5)?,
+                char_offset: row.get(6)?,
+                created_at: parse_dt(row.get::<_, String>(7)?),
+            })
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+
+    pub fn list_documents(&self) -> anyhow::Result<Vec<(String, String, String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT doc_id, doc_name, doc_type, COUNT(*) as chunks
+             FROM document_chunks GROUP BY doc_id ORDER BY doc_name"
+        )?;
+        let docs = stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?.collect::<Result<Vec<_>, _>>()?;
+        Ok(docs)
+    }
+
+    pub fn delete_document_chunks(&self, doc_id: &str) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let deleted = conn.execute(
+            "DELETE FROM document_chunks WHERE doc_id = ?1",
+            params![doc_id],
+        )?;
+        Ok(deleted)
+    }
+
+    pub fn get_chunks_by_doc(&self, doc_id: &str) -> anyhow::Result<Vec<DocumentChunk>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, doc_id, doc_name, doc_type, chunk_index, content, char_offset, created_at
+             FROM document_chunks WHERE doc_id = ?1 ORDER BY chunk_index"
+        )?;
+        let chunks = stmt.query_map(params![doc_id], |row| {
+            Ok(DocumentChunk {
+                id: Some(row.get(0)?),
+                doc_id: row.get(1)?,
+                doc_name: row.get(2)?,
+                doc_type: row.get(3)?,
+                chunk_index: row.get(4)?,
+                content: row.get(5)?,
+                char_offset: row.get(6)?,
+                created_at: parse_dt(row.get::<_, String>(7)?),
+            })
+        })?.collect::<Result<Vec<_>, _>>()?;
+        Ok(chunks)
     }
 }
 

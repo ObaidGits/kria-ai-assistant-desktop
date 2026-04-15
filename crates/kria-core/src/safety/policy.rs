@@ -51,11 +51,16 @@ static GREEN_ACTIONS: Lazy<HashSet<&str>> = Lazy::new(|| {
         "get_battery_status", "get_gpu_info", "get_system_uptime",
         // File Reading
         "read_file", "search_files", "list_directory", "get_file_info", "calculate_dir_size",
+        "search_file_contents", "find_files_by_pattern", "get_project_structure",
+        "count_lines_of_code", "diff_files", "find_todos", "analyze_code",
         // Document Parsing
         "parse_pdf", "parse_docx", "parse_xlsx", "parse_csv", "summarize_document",
+        "parse_document",
         // Internet (read-only)
         "web_search", "fetch_webpage", "get_weather", "get_news", "get_stock_price",
         "check_url_status", "rss_feed_read", "get_public_ip",
+        "searxng_search", "duckduckgo_search",
+        "get_current_time", "get_exchange_rate", "calculate",
         // Network Diagnostics
         "ping_host", "dns_lookup", "traceroute", "get_active_connections",
         "get_wifi_networks", "speed_test",
@@ -75,6 +80,27 @@ static GREEN_ACTIONS: Lazy<HashSet<&str>> = Lazy::new(|| {
         "remember_fact", "ingest_document", "save_snippet",
         // Environment (read)
         "get_environment_variable", "list_environment_variables", "get_power_plan",
+        // Developer (read-only)
+        "git_status", "git_log", "git_diff", "git_branch_list",
+        "analyze_project", "diff_files_unified",
+        // Database (read-only)
+        "query_sqlite", "describe_database",
+        // RAG (read)
+        "rag_query", "list_knowledge_base",
+        // Proactive (read)
+        "check_system_health", "get_alerts", "dismiss_alert",
+        "list_watched_dirs", "smart_suggest",
+        // i18n / Accessibility (read)
+        "list_languages", "detect_language", "get_accessibility_settings",
+        // Desktop (read)
+        "get_active_window", "list_windows",
+        // Vision (read-only analysis)
+        "ocr_image", "analyze_image", "screenshot_analyze",
+        // Precognitive (analysis only)
+        "image_analyze", "document_extract", "code_analyze_ast",
+        "web_extract_article", "embeddings_generate", "audio_preprocess",
+        // Misc
+        "open_url", "list_installed_packages",
     ].into_iter().collect()
 });
 
@@ -101,6 +127,14 @@ static YELLOW_ACTIONS: Lazy<HashSet<&str>> = Lazy::new(|| {
         "enable_plugin", "disable_plugin",
         // Automation
         "run_workflow", "record_macro", "replay_macro",
+        // Developer (non-destructive write)
+        "git_stash",
+        // RAG (ingest)
+        "ingest_document_rag",
+        // Proactive (monitoring)
+        "watch_directory",
+        // Desktop (window manipulation)
+        "move_window", "resize_window", "maximize_window", "minimize_window", "tile_windows",
     ].into_iter().collect()
 });
 
@@ -126,6 +160,10 @@ static RED_ACTIONS: Lazy<HashSet<&str>> = Lazy::new(|| {
         "install_plugin", "uninstall_plugin",
         // Dangerous
         "set_process_priority", "change_network_config",
+        // Developer (destructive)
+        "git_commit", "git_checkout",
+        // RAG (destructive)
+        "delete_knowledge_item",
     ].into_iter().collect()
 });
 

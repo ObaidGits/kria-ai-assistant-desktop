@@ -1,5 +1,6 @@
 /* @refresh reload */
 import { render } from "solid-js/web";
+import "highlight.js/styles/github-dark.css";
 import App from "./App";
 
 const root = document.getElementById("root");

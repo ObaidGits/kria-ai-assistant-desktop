@@ -34,7 +34,7 @@ pub enum PackageManager {
 }
 
 /// Snapshot of detected hardware capabilities.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HardwareInfo {
     pub os: Os,
     pub tier: HardwareTier,
@@ -44,6 +44,78 @@ pub struct HardwareInfo {
     pub gpu_name: Option<String>,
     pub package_manager: Option<PackageManager>,
     pub hostname: String,
+}
+
+impl HardwareTier {
+    /// Tier name as lowercase str.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Lite => "lite",
+            Self::Standard => "standard",
+            Self::Performance => "performance",
+            Self::High => "high",
+        }
+    }
+
+    /// Parse from string, defaulting to Standard.
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "lite" => Self::Lite,
+            "performance" => Self::Performance,
+            "high" => Self::High,
+            _ => Self::Standard,
+        }
+    }
+
+    /// Recommended context window tokens for this tier.
+    pub fn context_window(&self) -> usize {
+        match self {
+            Self::Lite => 1024,
+            Self::Standard => 2048,
+            Self::Performance => 4096,
+            Self::High => 8192,
+        }
+    }
+
+    /// Recommended thread count for inference.
+    pub fn thread_count(&self) -> usize {
+        match self {
+            Self::Lite => 4,
+            Self::Standard => 6,
+            Self::Performance | Self::High => 8,
+        }
+    }
+
+    /// Recommended GPU layers (0 = CPU only, 99 = all layers).
+    pub fn gpu_layers(&self) -> i32 {
+        match self {
+            Self::Lite | Self::Standard => 0,
+            Self::Performance | Self::High => 99,
+        }
+    }
+
+    /// Whether vision capabilities are available at this tier.
+    pub fn has_vision(&self) -> bool {
+        matches!(self, Self::Performance | Self::High)
+    }
+
+    /// Recommended STT model for this tier.
+    pub fn stt_model(&self) -> &'static str {
+        match self {
+            Self::Lite => "ggml-small-q5_1.bin",
+            Self::Standard => "ggml-medium-q5_0.bin",
+            Self::Performance | Self::High => "ggml-large-v3-turbo-q5_0.bin",
+        }
+    }
+
+    /// Recommended LLM model name for this tier.
+    pub fn recommended_model(&self) -> &'static str {
+        match self {
+            Self::Lite => "qwen2.5-3b-q4_k_m",
+            Self::Standard => "phi-4-mini-q4_k_m",
+            Self::Performance | Self::High => "qwen2.5-vl-7b-q4_k_m",
+        }
+    }
 }
 
 /// Detect the current operating system.

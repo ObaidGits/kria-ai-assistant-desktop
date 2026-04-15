@@ -55,16 +55,25 @@ impl HitlGateway {
         }
     }
 
-    /// Submit a RED action for approval. Blocks until the user responds or timeout.
-    pub async fn request_approval(
+    /// Generate a unique request ID for HITL approval.
+    /// Call this before `request_approval_with_id` so the ID can be sent to
+    /// the frontend before the gateway blocks.
+    pub fn generate_request_id() -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+
+    /// Submit a RED action for approval using a pre-generated request ID.
+    /// Blocks until the user responds or timeout.
+    pub async fn request_approval_with_id(
         &self,
+        request_id: &str,
         action: &str,
         parameters: serde_json::Value,
         risk_level: RiskLevel,
         description: &str,
         rollback_available: bool,
     ) -> ApprovalResponse {
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = request_id.to_string();
         let timeout = self.default_timeout;
 
         let request = ApprovalRequest {
@@ -100,6 +109,21 @@ impl HitlGateway {
                 ApprovalResponse::Timeout
             }
         }
+    }
+
+    /// Submit a RED action for approval. Blocks until the user responds or timeout.
+    /// Generates a new UUID internally — prefer `request_approval_with_id` when
+    /// you need the ID before calling (e.g. to send it to the frontend first).
+    pub async fn request_approval(
+        &self,
+        action: &str,
+        parameters: serde_json::Value,
+        risk_level: RiskLevel,
+        description: &str,
+        rollback_available: bool,
+    ) -> ApprovalResponse {
+        let id = Self::generate_request_id();
+        self.request_approval_with_id(&id, action, parameters, risk_level, description, rollback_available).await
     }
 
     /// Respond to a pending request (called by GUI/voice handler).

@@ -124,7 +124,7 @@ pub fn register(reg: &mut ToolRegistry) {
             parameters: vec![],
         }, Arc::new(ListScheduledTasks)),
         (ToolDef {
-            name: "create_scheduled_task".into(), description: "Create a cron job (requires approval)".into(),
+            name: "create_scheduled_task".into(), description: "Create a cron job or scheduled task".into(),
             category: "scheduler".into(), default_tier: RiskLevel::Red, min_tier: "standard",
             parameters: vec![
                 param("schedule", "string", "Cron schedule (e.g. '0 * * * *')", true),
@@ -132,7 +132,7 @@ pub fn register(reg: &mut ToolRegistry) {
             ],
         }, Arc::new(CreateScheduledTask)),
         (ToolDef {
-            name: "delete_scheduled_task".into(), description: "Delete a cron job by pattern (requires approval)".into(),
+            name: "delete_scheduled_task".into(), description: "Delete a cron job by pattern".into(),
             category: "scheduler".into(), default_tier: RiskLevel::Red, min_tier: "standard",
             parameters: vec![param("pattern", "string", "Text pattern to match in cron entry", true)],
         }, Arc::new(DeleteScheduledTask)),

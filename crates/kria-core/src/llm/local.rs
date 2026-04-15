@@ -42,6 +42,27 @@ impl LocalBackend {
         }
     }
 
+    /// Query the llama.cpp `/v1/models` endpoint to detect the actually loaded model.
+    /// Returns the model ID string if the server responds, or None.
+    pub async fn detect_server_model(&self) -> Option<String> {
+        let url = format!("{}/models", self.api_url);
+        let resp = self.client.get(&url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let body: serde_json::Value = resp.json().await.ok()?;
+        // llama.cpp returns { "data": [{ "id": "model-name", ... }] }
+        body["data"].as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|m| m["id"].as_str())
+            .map(|s| s.to_string())
+    }
+
+    /// Update the model label dynamically (e.g. after detecting from server).
+    pub fn set_model_label(&mut self, label: String) {
+        self.model_label = label;
+    }
+
     async fn chat_inner(
         &self,
         messages: &[ChatMessage],
@@ -49,9 +70,29 @@ impl LocalBackend {
         temperature: f32,
         max_tokens: u32,
     ) -> anyhow::Result<LlmResponse> {
+        // Convert messages to the OpenAI wire format, using multimodal content
+        // for any messages that contain images (required for vision models).
+        let wire_messages: Vec<serde_json::Value> = messages.iter().map(|m| {
+            if m.has_images() {
+                serde_json::json!({
+                    "role": m.role,
+                    "content": m.to_multimodal_content(),
+                })
+            } else {
+                let mut msg = serde_json::json!({
+                    "role": m.role,
+                    "content": m.content,
+                });
+                if let Some(ref name) = m.name {
+                    msg["name"] = serde_json::json!(name);
+                }
+                msg
+            }
+        }).collect();
+
         let mut payload = serde_json::json!({
             "model": self.model_label,
-            "messages": messages,
+            "messages": wire_messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
             "stream": false,

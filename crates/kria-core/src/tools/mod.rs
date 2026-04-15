@@ -13,5 +13,12 @@ pub mod communication;
 pub mod interaction;
 pub mod disk;
 pub mod scheduler;
+pub mod precognitive;
+pub mod vision;
+pub mod desktop;
+pub mod developer;
+pub mod rag;
+pub mod proactive;
+pub mod i18n;
 
 pub use registry::{ToolRegistry, ToolDef, ToolHandler};

@@ -1,11 +1,12 @@
 use std::sync::Arc;
+use std::collections::HashSet;
 use tokio::sync::mpsc;
 
 use crate::llm::{ChatMessage, ModelRouter, ToolSchema, TOOL_RESULT_MAX_CHARS};
 use crate::tools::registry::ToolRegistry;
-use crate::safety::{PolicyEngine, HitlGateway, AuditLogger, RollbackManager, RiskLevel};
+use crate::safety::{PolicyEngine, AuditLogger, RollbackManager, RiskLevel};
+use crate::safety::hitl::{HitlGateway, ApprovalResponse};
 use crate::safety::audit::{Decision, DecidedBy};
-use crate::safety::hitl::ApprovalResponse;
 use crate::agent::response_parser::{parse_tool_calls, extract_text_response};
 use crate::infra::isolation::run_isolated;
 
@@ -70,11 +71,25 @@ impl AgentLoop {
         messages: &mut Vec<ChatMessage>,
         event_tx: mpsc::UnboundedSender<StreamEvent>,
     ) {
-        let backend = match self.model_router.route("chat").await {
-            Some(b) => b,
-            None => {
-                let _ = event_tx.send(StreamEvent::Error("no LLM backend available".into()));
-                return;
+        // Check if the user message contains images and route accordingly
+        let has_images = messages.last()
+            .map_or(false, |m| m.has_images());
+
+        let backend = if has_images {
+            match self.model_router.route_vision().await {
+                Some(b) => b,
+                None => {
+                    let _ = event_tx.send(StreamEvent::Error("no vision backend available".into()));
+                    return;
+                }
+            }
+        } else {
+            match self.model_router.route("chat").await {
+                Some(b) => b,
+                None => {
+                    let _ = event_tx.send(StreamEvent::Error("no LLM backend available".into()));
+                    return;
+                }
             }
         };
 
@@ -86,6 +101,10 @@ impl AgentLoop {
                 parameters: d.to_function_schema()["function"]["parameters"].clone(),
             }
         }).collect();
+
+        // Track tools already approved in this user-turn to avoid re-asking.
+        // Key: "tool_name|args_json"
+        let mut approved_this_turn: HashSet<String> = HashSet::new();
 
         for _round in 0..self.max_tool_rounds {
             // Call LLM
@@ -122,6 +141,7 @@ impl AgentLoop {
                 role: "assistant".into(),
                 content: response.content.clone(),
                 name: None,
+                images: None,
             });
 
             // Execute each tool call
@@ -149,19 +169,35 @@ impl AgentLoop {
                         role: "tool".into(),
                         content: format!("Tool '{}' blocked by safety policy: {}", call.name, decision.reason),
                         name: Some(call.name.clone()),
+                        images: None,
                     });
                     continue;
                 }
 
                 if decision.requires_approval {
-                    // RED tier — needs HITL approval
+                    // RED tier — needs HITL approval (but skip if same tool+args already approved this turn)
+                    let dedup_key = format!("{}|{}", call.name, call.arguments);
+                    let already_approved = approved_this_turn.contains(&dedup_key);
+
+                    if already_approved {
+                        // Already approved earlier in this turn — auto-proceed, log it
+                        self.audit_logger.log(
+                            session_id, &call.name, &call.arguments,
+                            decision.risk_level, Decision::Approved, DecidedBy::Policy,
+                        );
+                    } else {
+                    // Generate the request ID up front so the frontend receives the
+                    // same ID that the HITL gateway stores in its pending map.
+                    let request_id = HitlGateway::generate_request_id();
+
                     let _ = event_tx.send(StreamEvent::ApprovalRequired {
-                        request_id: "pending".into(),
+                        request_id: request_id.clone(),
                         action: call.name.clone(),
                         risk_level: decision.risk_level.as_str().into(),
                     });
 
-                    let approval = self.hitl_gateway.request_approval(
+                    let approval = self.hitl_gateway.request_approval_with_id(
+                        &request_id,
                         &call.name,
                         call.arguments.clone(),
                         decision.risk_level,
@@ -190,21 +226,33 @@ impl AgentLoop {
                             role: "tool".into(),
                             content: format!("Tool '{}' denied by user", call.name),
                             name: Some(call.name.clone()),
+                            images: None,
                         });
                         continue;
                     }
 
+                    // Remember this approval for the rest of this turn
+                    approved_this_turn.insert(dedup_key);
+
                     // Create rollback snapshot for RED actions
                     // (actual file backup happens inside specific tool handlers)
+                    }
                 }
 
                 // Execute the tool
                 let tool_result = if let Some(handler) = self.tool_registry.get_handler(&call.name) {
                     let handler = handler.clone();
                     let args = call.arguments.clone();
+                    // Long-running tools get extended timeouts
+                    let timeout_secs = match call.name.as_str() {
+                        "install_application" | "uninstall_application" | "update_all_packages" => 300,
+                        "execute_bash" | "execute_python" | "execute_powershell" => 120,
+                        "download_file" => 120,
+                        _ => 30,
+                    };
                     run_isolated(
                         &format!("tool:{}", call.name),
-                        std::time::Duration::from_secs(30),
+                        std::time::Duration::from_secs(timeout_secs),
                         move || async move { handler.execute(args).await },
                     ).await
                 } else {
@@ -232,16 +280,27 @@ impl AgentLoop {
                     result_str
                 };
 
+                // Auto-route: if tool result contains a file path, check if a
+                // precognitive tool should process it automatically
+                let auto_enrichment = self.auto_route_file_result(&call.name, &tool_result.data).await;
+
                 let _ = event_tx.send(StreamEvent::ToolEnd {
                     name: call.name.clone(),
                     result: tool_result.data.clone(),
                     success: tool_result.success,
                 });
 
+                let tool_msg = if let Some(enrichment) = auto_enrichment {
+                    format!("{}\n\n[Auto-enriched via sidecar]\n{}", truncated, enrichment)
+                } else {
+                    truncated
+                };
+
                 messages.push(ChatMessage {
                     role: "tool".into(),
-                    content: truncated,
+                    content: tool_msg,
                     name: Some(call.name.clone()),
+                    images: None,
                 });
             }
         }
@@ -249,5 +308,59 @@ impl AgentLoop {
         let _ = event_tx.send(StreamEvent::Error(
             format!("max tool rounds ({}) reached", self.max_tool_rounds)
         ));
+    }
+
+    /// Check if a tool result contains a file path that should be auto-routed
+    /// to a precognitive processor for enrichment.
+    async fn auto_route_file_result(
+        &self,
+        tool_name: &str,
+        result: &serde_json::Value,
+    ) -> Option<String> {
+        // Only auto-route results from file-related tools, not from precognitive tools themselves
+        if tool_name.starts_with("image_") || tool_name.starts_with("document_")
+            || tool_name.starts_with("code_") || tool_name.starts_with("audio_")
+            || tool_name.starts_with("web_") || tool_name.starts_with("embeddings_")
+        {
+            return None;
+        }
+
+        // Look for a file path in the result
+        let path = result.get("path")
+            .or_else(|| result.get("file_path"))
+            .or_else(|| result.get("output_path"))
+            .and_then(|v| v.as_str())?;
+
+        // Determine the target precognitive tool based on extension
+        let ext = path.rsplit('.').next()?.to_lowercase();
+        let target_tool = match ext.as_str() {
+            "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "tiff" | "svg" => "image_analyze",
+            "pdf" | "docx" | "doc" | "csv" | "tsv" | "xlsx" => "document_extract",
+            "py" | "rs" | "js" | "ts" | "jsx" | "tsx" | "go" | "java" | "c" | "cpp" | "h" | "rb" | "cs" => "code_analyze_ast",
+            "wav" | "mp3" | "ogg" | "flac" | "m4a" => "audio_preprocess",
+            _ => return None,
+        };
+
+        // Execute the precognitive tool
+        if let Some(handler) = self.tool_registry.get_handler(target_tool) {
+            let params = serde_json::json!({"file_path": path});
+            let handler = handler.clone();
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                handler.execute(params),
+            ).await {
+                Ok(result) if result.success => {
+                    // Return summary only to save tokens
+                    if let Some(summary) = result.data.get("summary").and_then(|s| s.as_str()) {
+                        Some(format!("[{}] {}", target_tool, summary))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        }
     }
 }

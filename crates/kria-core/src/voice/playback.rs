@@ -1,17 +1,11 @@
 use rodio::{Sink, OutputStream};
-use std::sync::Arc;
-use tokio::sync::Mutex;
 
 /// Audio player using rodio for TTS output playback.
-pub struct AudioPlayer {
-    sink: Arc<Mutex<Option<(OutputStream, Sink)>>>,
-}
+pub struct AudioPlayer;
 
 impl AudioPlayer {
     pub fn new() -> Self {
-        Self {
-            sink: Arc::new(Mutex::new(None)),
-        }
+        Self
     }
 
     /// Play WAV file.
@@ -41,11 +35,5 @@ impl AudioPlayer {
             Ok::<_, anyhow::Error>(())
         }).await??;
         Ok(())
-    }
-
-    /// Stop any current playback.
-    pub async fn stop(&self) {
-        let mut lock = self.sink.lock().await;
-        *lock = None;
     }
 }

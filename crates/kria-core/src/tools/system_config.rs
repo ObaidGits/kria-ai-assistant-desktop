@@ -230,7 +230,7 @@ pub fn register(reg: &mut ToolRegistry) {
         }, Arc::new(ConnectWifi)),
         // RED
         (ToolDef {
-            name: "set_environment_variable".into(), description: "Set an environment variable (requires approval)".into(),
+            name: "set_environment_variable".into(), description: "Set an environment variable".into(),
             category: "system_config".into(), default_tier: RiskLevel::Red, min_tier: "lite",
             parameters: vec![
                 param("name", "string", "Variable name", true),

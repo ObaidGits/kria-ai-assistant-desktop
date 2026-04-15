@@ -107,12 +107,12 @@ pub fn register(reg: &mut ToolRegistry) {
         }, Arc::new(Hibernate)),
         // RED
         (ToolDef {
-            name: "shutdown_system".into(), description: "Shutdown the system (requires approval)".into(),
+            name: "shutdown_system".into(), description: "Shutdown the system".into(),
             category: "power".into(), default_tier: RiskLevel::Red, min_tier: "lite",
             parameters: vec![param("delay_minutes", "integer", "Delay in minutes (default 0)", false)],
         }, Arc::new(ShutdownSystem)),
         (ToolDef {
-            name: "reboot_system".into(), description: "Reboot the system (requires approval)".into(),
+            name: "reboot_system".into(), description: "Reboot the system".into(),
             category: "power".into(), default_tier: RiskLevel::Red, min_tier: "lite",
             parameters: vec![],
         }, Arc::new(RebootSystem)),

@@ -10,3 +10,5 @@ pub mod voice;
 pub mod preprocessing;
 pub mod automation;
 pub mod plugin;
+pub mod sidecar;
+pub mod mcp;

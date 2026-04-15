@@ -12,6 +12,9 @@ pub struct KriaConfig {
     pub safety: SafetyConfig,
     pub server: ServerConfig,
     pub ui: UiConfig,
+    pub search: SearchConfig,
+    pub mcp: McpConfig,
+    pub hardware: HardwareConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +98,78 @@ pub struct UiConfig {
     pub theme: String,
     pub window_width: u32,
     pub window_height: u32,
+    pub language: String,
+    pub high_contrast: bool,
+    pub reduce_motion: bool,
+    pub font_scale: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearchConfig {
+    /// Search engine backend: "duckduckgo" or "searxng"
+    pub engine: String,
+    /// SearXNG instance URL (when engine = "searxng")
+    pub searxng_url: String,
+    /// News RSS feeds (comma-separated or Vec)
+    pub news_feeds: Vec<String>,
+}
+
+/// MCP (Model Context Protocol) configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpConfig {
+    pub servers: Vec<McpServerConfig>,
+}
+
+/// Configuration for a single MCP server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerConfig {
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_trust_level")]
+    pub trust_level: String,
+    #[serde(default)]
+    pub tool_overrides: std::collections::HashMap<String, String>,
+}
+
+/// Hardware tier configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HardwareConfig {
+    /// Manual tier override: "lite", "standard", "performance", "high". Empty = auto-detect.
+    pub tier: String,
+    /// Maximum context tokens (0 = auto based on tier).
+    pub max_context_tokens: usize,
+    /// GPU layers for llama.cpp (-1 = auto based on tier).
+    pub gpu_layers: i32,
+    /// Thread count for inference (0 = auto based on tier).
+    pub threads: usize,
+}
+
+impl Default for HardwareConfig {
+    fn default() -> Self {
+        Self {
+            tier: String::new(),
+            max_context_tokens: 0,
+            gpu_layers: -1,
+            threads: 0,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_trust_level() -> String {
+    "YELLOW".into()
 }
 
 // ── Defaults ────────────────────────────────────────────────────────
@@ -108,6 +183,17 @@ impl Default for KriaConfig {
             safety: SafetyConfig::default(),
             server: ServerConfig::default(),
             ui: UiConfig::default(),
+            search: SearchConfig::default(),
+            mcp: McpConfig::default(),
+            hardware: HardwareConfig::default(),
+        }
+    }
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            servers: Vec::new(),
         }
     }
 }
@@ -190,6 +276,23 @@ impl Default for UiConfig {
             theme: "dark".into(),
             window_width: 1200,
             window_height: 800,
+            language: "en".into(),
+            high_contrast: false,
+            reduce_motion: false,
+            font_scale: 1.0,
+        }
+    }
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            engine: "duckduckgo".into(),
+            searxng_url: "http://localhost:8888".into(),
+            news_feeds: vec![
+                "https://feeds.arstechnica.com/arstechnica/index".into(),
+                "https://hnrss.org/frontpage".into(),
+            ],
         }
     }
 }
@@ -207,6 +310,19 @@ impl KriaConfig {
     /// Resolve standard data paths.
     pub fn resolve_paths(&self) -> anyhow::Result<crate::platform::paths::KriaPaths> {
         Ok(crate::platform::paths::KriaPaths::resolve())
+    }
+
+    /// Save the current config to the user override file (`~/.kria/config.toml`).
+    pub fn save(&self) -> anyhow::Result<()> {
+        let paths = crate::platform::paths::KriaPaths::resolve();
+        let user_config_path = paths.user_config();
+        if let Some(parent) = user_config_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let toml_str = toml::to_string_pretty(self)?;
+        std::fs::write(&user_config_path, toml_str)?;
+        tracing::info!(path = %user_config_path.display(), "config saved");
+        Ok(())
     }
 }
 

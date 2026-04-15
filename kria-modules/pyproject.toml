@@ -1,0 +1,58 @@
+[project]
+name = "kria-modules"
+version = "0.1.0"
+description = "K.R.I.A. Pre-Cognitive Processing Sidecar — image, document, code, web, and embedding processors"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+
+dependencies = [
+    # Image processing
+    "pillow>=10.0",
+    "opencv-python-headless>=4.8",
+
+    # OCR (standard tier)
+    "pytesseract>=0.3.10",
+
+    # Document extraction
+    "pymupdf>=1.24",
+    "python-docx>=1.1",
+    "pandas>=2.1",
+    "openpyxl>=3.1",
+
+    # Code analysis
+    "tree-sitter>=0.23",
+
+    # Web extraction
+    "trafilatura>=1.8",
+    "readability-lxml>=0.8",
+
+    # Embeddings
+    "sentence-transformers>=3.0",
+
+    # Audio preprocessing
+    "librosa>=0.10",
+    "noisereduce>=3.0",
+]
+
+[project.optional-dependencies]
+# Heavy deps for Performance/High tier only
+gpu = [
+    "easyocr>=1.7",
+    "torch>=2.1",
+]
+
+[project.scripts]
+kria-sidecar = "kria_modules.bridge:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.backends.core"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kria_modules"]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]

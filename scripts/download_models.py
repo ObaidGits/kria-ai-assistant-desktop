@@ -130,6 +130,11 @@ COMMON_DOWNLOADS: list[dict] = [
         "dest": MODELS_DIR / "piper" / "en_US-ryan-high.onnx.json",
         "desc": "Piper TTS voice config",
     },
+    {
+        "url": f"{HF_BASE}/snakers4/silero-vad/resolve/master/src/silero_vad/data/silero_vad.onnx",
+        "dest": MODELS_DIR / "vad" / "silero_vad.onnx",
+        "desc": "Silero VAD model (~2 MB)",
+    },
 ]
 
 # ── Old files that may need cleanup ───────────────────────────────
