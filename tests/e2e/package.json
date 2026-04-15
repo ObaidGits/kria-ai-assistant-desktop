@@ -1,0 +1,16 @@
+{
+  "name": "kria-e2e",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "test:ui": "playwright test --ui",
+    "test:report": "playwright show-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.48.0",
+    "ws": "^8.18.0",
+    "@types/ws": "^8.5.13"
+  }
+}

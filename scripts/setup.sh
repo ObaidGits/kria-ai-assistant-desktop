@@ -1,202 +1,171 @@
 #!/usr/bin/env bash
-# K.R.I.A. Setup Script for Linux / macOS
+# ============================================================
+# K.R.I.A. — Setup Script (Linux / macOS)
+# Idempotent: safe to re-run at any time.
+# ============================================================
 set -euo pipefail
 
-KRIA_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-VENV_PATH="$KRIA_ROOT/.venv"
-ENV_FILE="$KRIA_ROOT/.env"
-ENV_EXAMPLE="$KRIA_ROOT/.env.example"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-BOLD="\033[1m"
-GREEN="\033[32m"
-YELLOW="\033[33m"
-CYAN="\033[36m"
-RED="\033[31m"
-RESET="\033[0m"
+# ── Colours ──────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
+info()  { printf "${CYAN}[INFO]${NC}  %s\n" "$*"; }
+ok()    { printf "${GREEN}[OK]${NC}    %s\n" "$*"; }
+warn()  { printf "${YELLOW}[WARN]${NC}  %s\n" "$*"; }
+fail()  { printf "${RED}[FAIL]${NC}  %s\n" "$*"; exit 1; }
 
-header() { echo -e "\n${CYAN}${BOLD}  $1${RESET}"; }
-ok()     { echo -e "  ${GREEN}✓${RESET} $1"; }
-warn()   { echo -e "  ${YELLOW}!${RESET} $1"; }
-fail()   { echo -e "  ${RED}✗${RESET} $1"; }
-# ── Progress helpers ─────────────────────────────────────────────
-_SPIN=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
-_SPIN_PID=""
+# ── Detect platform ─────────────────────────────────────────
+OS="$(uname -s)"
+ARCH="$(uname -m)"
+info "Detected platform: $OS $ARCH"
 
-_spin_loop() {
-    local msg="$1"; local i=0; local t=0
-    while true; do
-        printf "\r  \033[36m%s\033[0m %s  (%ds)" "${_SPIN[$((i%10))]}" "$msg" "$t"
-        sleep 1; i=$((i+1)); t=$((t+1))
-    done
-}
-start_spinner() { _spin_loop "$1" & _SPIN_PID=$!; }
-stop_spinner()  {
-    if [[ -n "$_SPIN_PID" ]]; then
-        kill "$_SPIN_PID" 2>/dev/null || true
-        wait "$_SPIN_PID" 2>/dev/null || true
-        _SPIN_PID=""
+case "$OS" in
+  Linux)  PKG_MGR="apt" ;;
+  Darwin) PKG_MGR="brew" ;;
+  *)      fail "Unsupported OS: $OS. Use setup.ps1 on Windows." ;;
+esac
+
+# ── Helper: check if a command exists ────────────────────────
+has() { command -v "$1" &>/dev/null; }
+
+# ── 1. System dependencies ──────────────────────────────────
+info "Step 1/6 — Installing system dependencies…"
+
+if [[ "$PKG_MGR" == "apt" ]]; then
+  PKGS=(
+    build-essential pkg-config curl git
+    libssl-dev
+    libasound2-dev
+    libwebkit2gtk-4.1-dev
+    libgtk-3-dev
+    librsvg2-dev
+    patchelf
+  )
+  MISSING=()
+  for pkg in "${PKGS[@]}"; do
+    if ! dpkg -s "$pkg" &>/dev/null; then
+      MISSING+=("$pkg")
     fi
-    printf "\r\033[K"
-}
-trap 'stop_spinner' EXIT
-echo ""
-echo -e "${CYAN}${BOLD}  K.R.I.A. Linux/macOS Setup Script${RESET}"
-echo -e "${YELLOW}  =====================================${RESET}"
-echo ""
+  done
+  if [[ ${#MISSING[@]} -gt 0 ]]; then
+    info "Installing: ${MISSING[*]}"
+    sudo apt-get update -qq
+    sudo apt-get install -y -qq "${MISSING[@]}"
+  fi
+  ok "System packages ready (apt)"
 
-# ── Prerequisites ─────────────────────────────────────────────────
-header "Checking prerequisites..."
+elif [[ "$PKG_MGR" == "brew" ]]; then
+  if ! has brew; then
+    fail "Homebrew not found. Install from https://brew.sh"
+  fi
+  # macOS: Xcode CLI tools usually provide build essentials
+  BREW_PKGS=(pkg-config openssl@3)
+  for pkg in "${BREW_PKGS[@]}"; do
+    if ! brew list "$pkg" &>/dev/null; then
+      brew install "$pkg"
+    fi
+  done
+  ok "System packages ready (brew)"
+fi
 
-check() {
-    if "$@" &>/dev/null; then ok "$1 found"; return 0
-    else fail "$1 NOT found"; return 1; fi
-}
+# ── 2. Rust toolchain ───────────────────────────────────────
+info "Step 2/6 — Checking Rust toolchain…"
 
-MISSING=0
-check python3 --version || MISSING=$((MISSING+1))
-python3 -c "import sys; sys.exit(0 if sys.version_info >= (3,12) else 1)" \
-    && ok "Python 3.12+" || { fail "Python 3.12+ required"; MISSING=$((MISSING+1)); }
-check docker version     || MISSING=$((MISSING+1))
-
-HAS_GPU=false
-if nvidia-smi &>/dev/null; then
-    ok "nvidia-smi found — GPU acceleration available"
-    HAS_GPU=true
+if has rustup; then
+  ok "rustup already installed ($(rustup --version 2>/dev/null | head -1))"
 else
-    warn "nvidia-smi not found — GPU features unavailable (CPU mode only)"
+  info "Installing Rust via rustup…"
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
 fi
 
-[ "$MISSING" -gt 0 ] && { fail "Missing prerequisites — install them first"; exit 1; }
+# Ensure cargo is on PATH for the rest of this script
+export PATH="$HOME/.cargo/bin:$PATH"
 
-# ── Virtual environment ────────────────────────────────────────────
-header "Setting up Python virtualenv..."
-
-# If a broken/Windows-format venv exists (Scripts/ instead of bin/), remove it
-if [ -d "$VENV_PATH" ] && [ ! -f "$VENV_PATH/bin/activate" ]; then
-    warn "Removing broken/incompatible .venv (missing bin/activate)..."
-    rm -rf "$VENV_PATH"
+if ! has cargo; then
+  fail "cargo not found after Rust install. Try: source \$HOME/.cargo/env"
 fi
 
-if [ ! -d "$VENV_PATH" ]; then
-    # --copies is required on NTFS/exFAT mounts where symlinks are unreliable
-    python3 -m venv --copies "$VENV_PATH"
-fi
+# Make sure we're on stable and up to date
+rustup default stable
+rustup update stable --no-self-update 2>/dev/null || true
+ok "Rust $(rustc --version | awk '{print $2}') ready"
 
-source "$VENV_PATH/bin/activate"
-start_spinner "Upgrading pip..."
-pip install --quiet --upgrade pip
-stop_spinner
-start_spinner "Installing build tools (setuptools, wheel)..."
-pip install --quiet setuptools wheel
-stop_spinner
-start_spinner "Installing KRIA package and dependencies (this may take a minute)..."
-pip install --quiet -e "$KRIA_ROOT[dev]"
-stop_spinner
-start_spinner "Installing extra tools (httpx, tqdm)..."
-pip install --quiet httpx tqdm  # required by download_models.py
-stop_spinner
-ok "Virtualenv ready at $VENV_PATH"
+# ── 3. Install Tauri CLI ────────────────────────────────────
+info "Step 3/6 — Checking Tauri CLI…"
 
-# ── .env ──────────────────────────────────────────────────────────
-header "Configuring .env..."
-
-if [ ! -f "$ENV_FILE" ]; then
-    if [ -f "$ENV_EXAMPLE" ]; then
-        cp "$ENV_EXAMPLE" "$ENV_FILE"
-        ok "Created .env from .env.example"
-        warn "Review $ENV_FILE and adjust values if needed"
-    else
-        warn ".env.example not found — skipping .env creation"
-    fi
+if has cargo-tauri; then
+  ok "cargo-tauri already installed"
 else
-    ok ".env already exists — skipping"
+  info "Installing cargo-tauri (this may take a few minutes)…"
+  cargo install tauri-cli --version "^2" --locked
+  ok "cargo-tauri installed"
 fi
 
-# ── Directories ────────────────────────────────────────────────────
-header "Creating data directories..."
+# ── 4. Node.js ──────────────────────────────────────────────
+info "Step 4/6 — Checking Node.js…"
 
-mkdir -p \
-    "$HOME/.kria/rollback" \
-    "$HOME/.kria/logs" \
-    "$KRIA_ROOT/models/llm" \
-    "$KRIA_ROOT/models/stt" \
-    "$KRIA_ROOT/models/piper"
-ok "Directories ready"
-
-# ── Bridge secret ─────────────────────────────────────────────────
-header "Configuring bridge secret..."
-
-SECRET_FILE="$HOME/.kria/bridge_secret.txt"
-if [ ! -f "$SECRET_FILE" ]; then
-    python3 -c "import secrets; print(secrets.token_hex(32))" > "$SECRET_FILE"
-    chmod 600 "$SECRET_FILE"
-    ok "Generated new bridge secret → $SECRET_FILE"
+MIN_NODE=18
+if has node; then
+  NODE_VER="$(node -v | sed 's/v//' | cut -d. -f1)"
+  if [[ "$NODE_VER" -ge "$MIN_NODE" ]]; then
+    ok "Node.js $(node -v) ready"
+  else
+    warn "Node.js $(node -v) is below v$MIN_NODE — please upgrade"
+  fi
 else
-    ok "Bridge secret already exists — skipping"
+  info "Node.js not found. Attempting install…"
+  if [[ "$PKG_MGR" == "apt" ]]; then
+    # Use NodeSource for a modern version
+    if [[ ! -f /etc/apt/sources.list.d/nodesource.list ]]; then
+      curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+    fi
+    sudo apt-get install -y -qq nodejs
+  elif [[ "$PKG_MGR" == "brew" ]]; then
+    brew install node
+  fi
+  ok "Node.js $(node -v) installed"
 fi
 
-# Update docker-compose.yml with the correct secret path
-sed -i "s|file: .*bridge_secret.txt|file: ${SECRET_FILE}|" \
-    "$KRIA_ROOT/docker/docker-compose.yml"
-ok "docker-compose.yml updated with secret path: $SECRET_FILE"
-
-# Make sure KRIA_BRIDGE_SECRET in .env matches
-if [ -f "$ENV_FILE" ]; then
-    BRIDGE_SECRET="$(cat "$SECRET_FILE")"
-    if grep -q "^KRIA_BRIDGE_SECRET=" "$ENV_FILE" 2>/dev/null; then
-        sed -i "s|^KRIA_BRIDGE_SECRET=.*|KRIA_BRIDGE_SECRET=${BRIDGE_SECRET}|" "$ENV_FILE"
-    else
-        echo "KRIA_BRIDGE_SECRET=${BRIDGE_SECRET}" >> "$ENV_FILE"
-    fi
-    ok "KRIA_BRIDGE_SECRET written to .env"
+if ! has npm; then
+  fail "npm not found. Please install Node.js manually."
 fi
 
-# ── Make app scripts executable ───────────────────────────────────
-header "Setting script permissions..."
+# ── 5. Frontend dependencies ────────────────────────────────
+info "Step 5/6 — Installing frontend dependencies…"
 
-chmod +x "$KRIA_ROOT/scripts/app-start.sh" \
-         "$KRIA_ROOT/scripts/app-stop.sh" \
-         "$KRIA_ROOT/scripts/app-restart.sh" 2>/dev/null || true
-ok "App scripts are executable"
+cd "$PROJECT_ROOT/ui"
+if [[ -d node_modules ]]; then
+  ok "node_modules exists — running npm install to sync"
+fi
+npm install --no-audit --no-fund
+ok "Frontend dependencies ready"
 
-# ── Docker images ─────────────────────────────────────────────────
-if [ "${SKIP_DOCKER:-0}" != "1" ]; then
-    header "Building Docker images..."
-    cd "$KRIA_ROOT/docker"
+# ── 6. Build workspace ──────────────────────────────────────
+info "Step 6/6 — Building Rust workspace…"
 
-    COMPOSE_FILES="-f docker-compose.yml"
-    if [ -f "docker-compose.override.yml" ]; then
-        COMPOSE_FILES="$COMPOSE_FILES -f docker-compose.override.yml"
-    fi
-    if $HAS_GPU && [ -f "docker-compose.gpu.yml" ]; then
-        COMPOSE_FILES="$COMPOSE_FILES -f docker-compose.gpu.yml"
-        ok "GPU detected — building with GPU support"
-    fi
+cd "$PROJECT_ROOT"
+cargo build --workspace
+ok "Workspace built successfully"
 
-    docker compose $COMPOSE_FILES build
-    ok "Docker images built"
-    cd "$KRIA_ROOT"
+# ── 7. Config ────────────────────────────────────────────────
+KRIA_HOME="$HOME/.kria"
+if [[ ! -f "$KRIA_HOME/config.toml" ]]; then
+  mkdir -p "$KRIA_HOME"
+  cp "$PROJECT_ROOT/config/default.toml" "$KRIA_HOME/config.toml"
+  ok "Default config copied to $KRIA_HOME/config.toml"
+else
+  ok "Config already exists at $KRIA_HOME/config.toml"
 fi
 
-# ── Summary ───────────────────────────────────────────────────────
+# ── Done ─────────────────────────────────────────────────────
 echo ""
-echo -e "${GREEN}${BOLD}  Setup complete!${RESET}"
+printf "${GREEN}════════════════════════════════════════════${NC}\n"
+printf "${GREEN}  K.R.I.A. setup complete!${NC}\n"
+printf "${GREEN}════════════════════════════════════════════${NC}\n"
 echo ""
-echo "  Next steps:"
-echo "    1. Download models (first time only):"
-echo "       python3 scripts/download_models.py"
-echo ""
-echo "    2. Start KRIA:"
-echo "       bash scripts/app-start.sh"
-echo ""
-echo "    3. Open Dashboard:"
-echo "       http://localhost:3000"
-echo ""
-echo "    4. (Optional) Start host bridge for mic/speaker access:"
-echo "       python3 scripts/kria_bridge.py"
-echo ""
-echo "  Other commands:"
-echo "    bash scripts/app-stop.sh        Stop all services"
-echo "    bash scripts/app-restart.sh     Restart with latest changes"
-echo "    bash scripts/app-restart.sh --quick   Restart without rebuilding"
+echo "Quick start:"
+echo "  Desktop app :  cd crates/kria-desktop && cargo tauri dev"
+echo "  Server only :  cargo run -p kria-server"
+echo "  Run tests   :  cargo test --workspace"
 echo ""

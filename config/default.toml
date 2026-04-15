@@ -1,0 +1,44 @@
+# ==========================================
+# K.R.I.A. Default Configuration
+# ==========================================
+# Copy to ~/.kria/config.toml and customize.
+
+[llm]
+mode = "local"                              # "local" | "gemini" | "external"
+# cloud_api_key = ""                        # Set via KRIA_CLOUD_API_KEY env var
+local_host = "127.0.0.1"
+local_port = 8080
+max_context_tokens = 4096
+
+[[llm.local_models]]
+name = "phi-4-mini"
+filename = "microsoft_Phi-4-mini-instruct-Q4_K_M.gguf"
+context_size = 4096
+gpu_layers = 99
+tier = "low"
+
+[voice]
+enabled = false
+stt_model = "ggml-base.en.bin"
+tts_voice = "en_US-lessac-high"
+sample_rate = 16000
+vad_threshold = 0.01
+
+[memory]
+max_facts = 10000
+decay_half_life_days = 7
+prune_threshold = 0.01
+
+[safety]
+require_approval_for_red = true
+audit_enabled = true
+max_rollback_snapshots = 50
+rollback_max_age_days = 30
+
+[server]
+host = "127.0.0.1"
+port = 3001
+
+[ui]
+theme = "dark"
+font_size = 14

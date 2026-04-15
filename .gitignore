@@ -1,33 +1,36 @@
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
-.venv/
-dist/
-build/
-*.egg-info/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-htmlcov/
-.coverage
-.coverage.*
+# Build artifacts
+/target/
+/ui/dist/
+/ui/node_modules/
 
-# Environment & secrets
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
 .env
-docker/secrets/*.txt
-docker/secrets/*.key
+.env.local
 
-# Data & models
-data/
+# Models (large binary files)
+/models/llm/*.gguf
+/models/stt/*.bin
+/models/piper/*.onnx
+
+# Logs
+*.log
+/logs/
+
+# Databases (local)
 *.db
-*.db-shm
+*.db-journal
 *.db-wal
-
-# Large model files (download via scripts/download_models.py)
-*.gguf
-*.onnx
-*.onnx.json
+*.db-shm
 *.bin
 *.pt
 *.safetensors

@@ -1,0 +1,27 @@
+[package]
+name = "kria-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "K.R.I.A. Server — Axum HTTP/WebSocket server for remote access"
+
+[dependencies]
+kria-core = { path = "../kria-core" }
+axum = { version = "0.8", features = ["ws", "json"] }
+axum-extra = { version = "0.10", features = ["typed-header"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
+jsonwebtoken = "9"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+tokio-tungstenite = "0.24"

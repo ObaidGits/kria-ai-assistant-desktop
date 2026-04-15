@@ -1,0 +1,16 @@
+{
+  "servers": [
+    {
+      "name": "fs",
+      "transport": "stdio",
+      "command": ["mcp-server-filesystem", "/home", "/media", "/tmp"],
+      "enabled": true,
+      "trust_level": "YELLOW",
+      "tool_overrides": {
+        "move_file": "RED",
+        "write_file": "YELLOW",
+        "edit_file": "YELLOW"
+      }
+    }
+  ]
+}

@@ -1,26 +1,22 @@
 #!/usr/bin/env python3
 """
-Model Downloader
-================
-Downloads quantized GGUF models and Piper TTS voice data.
+Model Downloader — Tier-Aware
+==============================
+Downloads quantized GGUF models and Piper TTS voice data based on the
+detected hardware tier.
 
 Default destination: <project-root>/models/  (no sudo needed)
 Override with:       MODELS_DIR=/your/path python scripts/download_models.py
 
-Models downloaded:
-  Primary LLM:   microsoft_Phi-4-mini-instruct-Q4_K_M.gguf  (~2.5 GB)  — fast / lightweight
-  Secondary LLM: Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf         (~4.68 GB) — smart / vision  [Unsloth]
-  Vision Proj:   mmproj-F16.gguf                             (~1.35 GB) — mmproj encoder  [Unsloth]
-  STT:           ggml-large-v3-turbo.bin                     (~1.6 GB)
-  TTS:           en_US-ryan-high.onnx + .json                (~65 MB)
+Tier selection (set by detect_hardware.sh → ~/.kria/hardware_tier.env):
+  lite        : Qwen2.5-3B Q4_K_M + Whisper small-q5_1
+  standard    : Phi-4-mini Q4_K_M + Whisper medium-q5_0
+  performance : Qwen2.5-VL-7B Q4_K_M + mmproj-F16 + Whisper turbo-q5_0
+  high        : (same as performance — higher ctx at runtime only)
 
-Only downloads if the target file does not already exist.
-Set DRY_RUN=1 to print URLs without downloading.
-
-On first run the script will offer to delete the old bartowski/second-state
-Qwen files (if present) before downloading the improved Unsloth versions.
+Override tier:  KRIA_TIER=lite python scripts/download_models.py
+Dry run:        DRY_RUN=1 python scripts/download_models.py
 """
-import hashlib
 import os
 import sys
 from pathlib import Path
@@ -52,47 +48,95 @@ HF_TOKEN = os.getenv("HF_TOKEN", "")
 # HuggingFace download base
 HF_BASE = "https://huggingface.co"
 
-# ── Old files that were replaced by the Unsloth versions ──────────
-# These were downloaded from bartowski / second-state repos.
-# The Unsloth release has better vision calibration.
-OLD_QWEN_FILES: list[Path] = [
-    MODELS_DIR / "llm" / "Qwen_Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf",   # bartowski (~4.7 GB)
-    MODELS_DIR / "llm" / "Qwen2.5-VL-7B-Instruct-vision.gguf",          # second-state mmproj (~1.3 GB)
-]
+# ── Tier detection ────────────────────────────────────────────────
+# Priority: KRIA_TIER env var > ~/.kria/hardware_tier.env > default "standard"
+def _detect_tier() -> str:
+    tier = os.getenv("KRIA_TIER", "")
+    if tier:
+        return tier.lower()
+    cache = Path.home() / ".kria" / "hardware_tier.env"
+    if cache.exists():
+        for line in cache.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("KRIA_TIER="):
+                val = line.split("=", 1)[1].strip().strip('"')
+                if val:
+                    return val.lower()
+    return "standard"
 
-DOWNLOADS = [
+TIER = _detect_tier()
+VALID_TIERS = {"lite", "standard", "performance", "high"}
+if TIER not in VALID_TIERS:
+    print(f"ERROR: Unknown tier '{TIER}'. Valid: {', '.join(sorted(VALID_TIERS))}", file=sys.stderr)
+    sys.exit(1)
+
+# ── Tier → Model Downloads ───────────────────────────────────────
+# "high" uses the same models as "performance" (only ctx/VRAM differs at runtime)
+_effective_tier = "performance" if TIER == "high" else TIER
+
+TIER_MODELS: dict[str, list[dict]] = {
+    "lite": [
+        {
+            "url": f"{HF_BASE}/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf",
+            "dest": MODELS_DIR / "llm" / "Qwen2.5-3B-Instruct-Q4_K_M.gguf",
+            "desc": "Qwen2.5-3B-Instruct Q4_K_M (~1.93 GB)",
+        },
+        {
+            "url": f"{HF_BASE}/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin",
+            "dest": MODELS_DIR / "stt" / "ggml-small-q5_1.bin",
+            "desc": "Whisper small Q5_1 (~181 MB)",
+        },
+    ],
+    "standard": [
+        {
+            "url": f"{HF_BASE}/bartowski/microsoft_Phi-4-mini-instruct-GGUF/resolve/main/microsoft_Phi-4-mini-instruct-Q4_K_M.gguf",
+            "dest": MODELS_DIR / "llm" / "microsoft_Phi-4-mini-instruct-Q4_K_M.gguf",
+            "desc": "Phi-4-mini-instruct Q4_K_M (~2.5 GB)",
+        },
+        {
+            "url": f"{HF_BASE}/ggerganov/whisper.cpp/resolve/main/ggml-medium-q5_0.bin",
+            "dest": MODELS_DIR / "stt" / "ggml-medium-q5_0.bin",
+            "desc": "Whisper medium Q5_0 (~514 MB)",
+        },
+    ],
+    "performance": [
+        {
+            "url": f"{HF_BASE}/unsloth/Qwen2.5-VL-7B-Instruct-GGUF/resolve/main/Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf",
+            "dest": MODELS_DIR / "llm" / "Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf",
+            "desc": "Qwen2.5-VL-7B-Instruct Q4_K_M (~4.68 GB)",
+        },
+        {
+            "url": f"{HF_BASE}/unsloth/Qwen2.5-VL-7B-Instruct-GGUF/resolve/main/mmproj-F16.gguf",
+            "dest": MODELS_DIR / "llm" / "mmproj-F16.gguf",
+            "desc": "Qwen2.5-VL Vision Encoder mmproj-F16 (~1.35 GB)",
+        },
+        {
+            "url": f"{HF_BASE}/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin",
+            "dest": MODELS_DIR / "stt" / "ggml-large-v3-turbo-q5_0.bin",
+            "desc": "Whisper large-v3-turbo Q5_0 (~547 MB)",
+        },
+    ],
+}
+
+# Piper TTS — same for all tiers
+COMMON_DOWNLOADS: list[dict] = [
     {
-        "url": f"{HF_BASE}/bartowski/microsoft_Phi-4-mini-instruct-GGUF/resolve/main/microsoft_Phi-4-mini-instruct-Q4_K_M.gguf",
-        "dest": MODELS_DIR / "llm" / "microsoft_Phi-4-mini-instruct-Q4_K_M.gguf",
-        "desc": "Phi-4-mini-instruct Primary LLM (~2.5 GB)",
-    },
-    {
-        # Unsloth — better vision quality than bartowski build
-        "url": f"{HF_BASE}/unsloth/Qwen2.5-VL-7B-Instruct-GGUF/resolve/main/Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf",
-        "dest": MODELS_DIR / "llm" / "Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf",
-        "desc": "Qwen2.5-VL-7B-Instruct Secondary LLM — Unsloth Q4_K_M (~4.68 GB)",
-    },
-    {
-        # Unsloth mmproj (F16 precision, matched to above weights)
-        "url": f"{HF_BASE}/unsloth/Qwen2.5-VL-7B-Instruct-GGUF/resolve/main/mmproj-F16.gguf",
-        "dest": MODELS_DIR / "llm" / "mmproj-F16.gguf",
-        "desc": "Qwen2.5-VL Vision Encoder — Unsloth mmproj-F16 (~1.35 GB)",
-    },
-    {
-        "url": f"{HF_BASE}/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin",
-        "dest": MODELS_DIR / "stt" / "ggml-large-v3-turbo.bin",
-        "desc": "Whisper large-v3-turbo (1.5 GB)",
-    },
-    {
-        "url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/high/en_US-ryan-high.onnx",
+        "url": f"{HF_BASE}/rhasspy/piper-voices/resolve/main/en/en_US/ryan/high/en_US-ryan-high.onnx",
         "dest": MODELS_DIR / "piper" / "en_US-ryan-high.onnx",
         "desc": "Piper TTS voice model (~65 MB)",
     },
     {
-        "url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/high/en_US-ryan-high.onnx.json",
+        "url": f"{HF_BASE}/rhasspy/piper-voices/resolve/main/en/en_US/ryan/high/en_US-ryan-high.onnx.json",
         "dest": MODELS_DIR / "piper" / "en_US-ryan-high.onnx.json",
         "desc": "Piper TTS voice config",
     },
+]
+
+# ── Old files that may need cleanup ───────────────────────────────
+OLD_FILES: list[Path] = [
+    MODELS_DIR / "llm" / "Qwen_Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf",
+    MODELS_DIR / "llm" / "Qwen2.5-VL-7B-Instruct-vision.gguf",
+    MODELS_DIR / "stt" / "ggml-large-v3-turbo.bin",  # replaced by q5_0 variant
 ]
 
 
@@ -174,12 +218,9 @@ def download_file(url: str, dest: Path, desc: str) -> None:
     raise RuntimeError(f"Failed after {MAX_RETRIES} attempts")
 
 
-def delete_old_qwen_models() -> None:
-    """
-    Offer to delete the old bartowski / second-state Qwen files that were
-    replaced by the Unsloth versions.  Skips silently if none are found.
-    """
-    present = [p for p in OLD_QWEN_FILES if p.exists()]
+def cleanup_old_files() -> None:
+    """Offer to delete old model files that have been superseded."""
+    present = [p for p in OLD_FILES if p.exists()]
     if not present:
         return
 
@@ -187,22 +228,19 @@ def delete_old_qwen_models() -> None:
     total_gb = total_bytes / (1024 ** 3)
 
     print()
-    print("  [INFO] Old Qwen model files found (bartowski / second-state builds):")
+    print("  [INFO] Superseded model files found:")
     for p in present:
         size_gb = p.stat().st_size / (1024 ** 3)
         print(f"         {p.name}  ({size_gb:.2f} GB)")
     print(f"         Total: {total_gb:.2f} GB")
     print()
-    print("  These have been replaced by improved Unsloth builds.")
-    print("  Delete them to reclaim disk space? (new files will be downloaded)")
-    print()
 
     if DRY_RUN:
-        print("  [DRY]  Would prompt to delete old Qwen files (DRY_RUN=1 — skipping)")
+        print("  [DRY]  Would prompt to delete old files (DRY_RUN=1 — skipping)")
         return
 
     try:
-        answer = input("  Delete old files? [Y/N]: ").strip().upper()
+        answer = input("  Delete old files to reclaim disk space? [Y/N]: ").strip().upper()
     except (EOFError, KeyboardInterrupt):
         print("\n  Skipping deletion.")
         return
@@ -223,15 +261,25 @@ def delete_old_qwen_models() -> None:
 def main() -> None:
     print("K.R.I.A. Model Downloader")
     print("=" * 50)
-    print(f"Models directory: {MODELS_DIR}")
+    print(f"Hardware tier : {TIER}")
+    print(f"Models dir    : {MODELS_DIR}")
     if DRY_RUN:
-        print("DRY_RUN=1 — no files will be downloaded\n")
+        print("DRY_RUN=1 — no files will be downloaded")
+    print()
 
-    # Offer to clean up old Qwen files before starting
-    delete_old_qwen_models()
+    # Build download list for this tier
+    downloads = TIER_MODELS[_effective_tier] + COMMON_DOWNLOADS
+
+    print(f"Models for tier '{TIER}':")
+    for item in downloads:
+        print(f"  • {item['desc']}")
+    print()
+
+    # Offer to clean up old files
+    cleanup_old_files()
 
     errors = []
-    for item in DOWNLOADS:
+    for item in downloads:
         try:
             download_file(item["url"], item["dest"], item["desc"])
         except Exception as exc:
@@ -245,7 +293,7 @@ def main() -> None:
             print(f"  - {e}")
         sys.exit(1)
     else:
-        print("All models downloaded successfully.")
+        print(f"All models for tier '{TIER}' downloaded successfully.")
 
 
 if __name__ == "__main__":

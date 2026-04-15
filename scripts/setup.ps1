@@ -1,208 +1,148 @@
-#!/usr/bin/env pwsh
-<#
-.SYNOPSIS
-    K.R.I.A. Setup Script for Windows
-.DESCRIPTION
-    Checks prerequisites, installs Python dependencies,
-    creates required directories, generates .env file,
-    and builds Docker images.
-.PARAMETER SkipDocker
-    Skip Docker image build
-.PARAMETER DownloadModels
-    Download AI models after setup
-#>
-param(
-    [switch]$SkipDocker,
-    [switch]$DownloadModels
-)
-
-Set-StrictMode -Version Latest
+# ============================================================
+# K.R.I.A. — Setup Script (Windows PowerShell)
+# Idempotent: safe to re-run at any time.
+# Run as:  powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
+# ============================================================
 $ErrorActionPreference = "Stop"
 
-$KRIA_ROOT = $PSScriptRoot | Split-Path -Parent
-$VENV_PATH  = Join-Path $KRIA_ROOT ".venv"
-$ENV_FILE   = Join-Path $KRIA_ROOT ".env"
-$ENV_EXAMPLE= Join-Path $KRIA_ROOT ".env.example"
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+$ProjectRoot = (Resolve-Path "$ScriptDir\..").Path
+
+function Write-Step  { param($msg) Write-Host "[INFO]  $msg" -ForegroundColor Cyan }
+function Write-Ok    { param($msg) Write-Host "[OK]    $msg" -ForegroundColor Green }
+function Write-Warn  { param($msg) Write-Host "[WARN]  $msg" -ForegroundColor Yellow }
+function Write-Fail  { param($msg) Write-Host "[FAIL]  $msg" -ForegroundColor Red; exit 1 }
+function Has-Command { param($cmd) return [bool](Get-Command $cmd -ErrorAction SilentlyContinue) }
 
 Write-Host ""
-Write-Host "  ██╗  ██╗██████╗ ██╗ █████╗ " -ForegroundColor Cyan
-Write-Host "  ██║ ██╔╝██╔══██╗██║██╔══██╗" -ForegroundColor Cyan
-Write-Host "  █████╔╝ ██████╔╝██║███████║" -ForegroundColor Cyan
-Write-Host "  ██╔═██╗ ██╔══██╗██║██╔══██║" -ForegroundColor Cyan
-Write-Host "  ██║  ██╗██║  ██║██║██║  ██║" -ForegroundColor Cyan
-Write-Host "  ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝╚═╝  ╚═╝" -ForegroundColor Cyan
-Write-Host ""
-Write-Host "  K.R.I.A. Windows Setup Script" -ForegroundColor Yellow
-Write-Host "  =================================" -ForegroundColor Yellow
+Write-Host "K.R.I.A. Setup — Windows" -ForegroundColor Cyan
+Write-Host "========================" -ForegroundColor Cyan
 Write-Host ""
 
-# ── Check prerequisites ────────────────────────────────────────────
-function Test-Prerequisite([string]$Name, [scriptblock]$Test) {
-    Write-Host "  Checking $Name... " -NoNewline
-    try {
-        & $Test | Out-Null
-        Write-Host "OK" -ForegroundColor Green
-        return $true
-    } catch {
-        Write-Host "MISSING" -ForegroundColor Red
-        return $false
+# ── 1. System dependencies (via winget) ─────────────────────
+Write-Step "Step 1/6 — Checking system package manager…"
+
+$hasWinget = Has-Command "winget"
+if (-not $hasWinget) {
+    Write-Warn "winget not found. Install App Installer from the Microsoft Store, then re-run."
+    Write-Warn "Continuing — will check for Rust and Node.js manually."
+}
+
+# ── 2. Rust toolchain ───────────────────────────────────────
+Write-Step "Step 2/6 — Checking Rust toolchain…"
+
+if (Has-Command "rustup") {
+    Write-Ok "rustup already installed"
+} else {
+    Write-Step "Installing Rust via rustup…"
+    if ($hasWinget) {
+        winget install --id Rustlang.Rustup -e --accept-package-agreements --accept-source-agreements
+    } else {
+        Write-Step "Downloading rustup-init.exe…"
+        $rustupUrl = "https://win.rustup.rs/x86_64"
+        $rustupExe = "$env:TEMP\rustup-init.exe"
+        Invoke-WebRequest -Uri $rustupUrl -OutFile $rustupExe -UseBasicParsing
+        & $rustupExe -y --default-toolchain stable
+        Remove-Item $rustupExe -ErrorAction SilentlyContinue
     }
 }
 
-$ok = $true
-$ok = $ok -and (Test-Prerequisite "Python 3.12+" { python --version | Where-Object { $_ -match "3\.(1[2-9]|[2-9]\d)" } })
-if (-not $SkipDocker) {
-    $ok = $ok -and (Test-Prerequisite "Docker Desktop" { docker info })
+# Refresh PATH to pick up cargo
+$cargoDir = "$env:USERPROFILE\.cargo\bin"
+if (Test-Path $cargoDir) {
+    $env:PATH = "$cargoDir;$env:PATH"
 }
 
-$hasGpu = $false
+if (-not (Has-Command "cargo")) {
+    Write-Fail "cargo not found after Rust install. Please restart your terminal and re-run."
+}
+
+rustup default stable
+Write-Ok "Rust $(rustc --version) ready"
+
+# ── 3. Install Tauri CLI ────────────────────────────────────
+Write-Step "Step 3/6 — Checking Tauri CLI…"
+
+$tauriInstalled = $false
 try {
-    nvidia-smi --query-gpu=name --format=csv,noheader | Out-Null
-    Write-Host "  GPU detected — NVIDIA acceleration available" -ForegroundColor Green
-    $hasGpu = $true
-} catch {
-    Write-Host "  [!] nvidia-smi not found — GPU features unavailable (CPU mode)" -ForegroundColor Yellow
+    cargo tauri --version 2>$null | Out-Null
+    $tauriInstalled = $true
+} catch {}
+
+if ($tauriInstalled) {
+    Write-Ok "cargo-tauri already installed"
+} else {
+    Write-Step "Installing cargo-tauri (this may take a few minutes)…"
+    cargo install tauri-cli --version "^2" --locked
+    Write-Ok "cargo-tauri installed"
 }
 
-if (-not $ok) {
-    Write-Host ""
-    Write-Host "  [!] One or more prerequisites are missing." -ForegroundColor Red
-    Write-Host "      Install them and re-run this script." -ForegroundColor Red
-    exit 1
-}
+# ── 4. Node.js ──────────────────────────────────────────────
+Write-Step "Step 4/6 — Checking Node.js…"
 
-# ── Python virtual environment ─────────────────────────────────────
-Write-Host ""
-Write-Host "  [1/5] Setting up Python virtualenv..." -ForegroundColor Yellow
-
-if (-not (Test-Path $VENV_PATH)) {
-    python -m venv $VENV_PATH
-}
-
-$pip = Join-Path $VENV_PATH "Scripts\pip.exe"
-$python = Join-Path $VENV_PATH "Scripts\python.exe"
-
-Write-Progress -Activity "Installing Python packages" -Status "Upgrading pip..." -PercentComplete 0
-& $pip install --quiet --upgrade pip
-Write-Progress -Activity "Installing Python packages" -Status "Installing setuptools, wheel..." -PercentComplete 25
-& $pip install --quiet setuptools wheel
-Write-Progress -Activity "Installing Python packages" -Status "Installing KRIA package and dependencies..." -PercentComplete 50
-& $pip install --quiet -e "$KRIA_ROOT[dev,windows]"
-Write-Progress -Activity "Installing Python packages" -Status "Installing httpx, tqdm..." -PercentComplete 85
-& $pip install --quiet httpx tqdm
-Write-Progress -Activity "Installing Python packages" -Completed
-
-Write-Host "        Done." -ForegroundColor Green
-
-# ── Environment file ───────────────────────────────────────────────
-Write-Host "  [2/5] Configuring .env..." -ForegroundColor Yellow
-
-if (-not (Test-Path $ENV_FILE)) {
-    if (Test-Path $ENV_EXAMPLE) {
-        Copy-Item $ENV_EXAMPLE $ENV_FILE
-        Write-Host "        Created .env from .env.example" -ForegroundColor Green
-        Write-Host "        [!] Review $ENV_FILE and adjust values if needed" -ForegroundColor Yellow
+$MinNode = 18
+if (Has-Command "node") {
+    $nodeVer = (node -v) -replace 'v','' -split '\.' | Select-Object -First 1
+    if ([int]$nodeVer -ge $MinNode) {
+        Write-Ok "Node.js $(node -v) ready"
     } else {
-        Write-Host "        [!] .env.example not found — skipping" -ForegroundColor Yellow
+        Write-Warn "Node.js $(node -v) is below v$MinNode — please upgrade"
     }
 } else {
-    Write-Host "        .env already exists — skipping" -ForegroundColor Cyan
-}
-
-# ── Directories ────────────────────────────────────────────────────
-Write-Host "  [3/5] Creating data directories..." -ForegroundColor Yellow
-$dirs = @(
-    "$env:USERPROFILE\.kria",
-    "$env:USERPROFILE\.kria\rollback",
-    "$env:USERPROFILE\.kria\logs",
-    "$KRIA_ROOT\models\llm",
-    "$KRIA_ROOT\models\stt",
-    "$KRIA_ROOT\models\piper"
-)
-foreach ($d in $dirs) {
-    New-Item -ItemType Directory -Force -Path $d | Out-Null
-}
-Write-Host "        Done." -ForegroundColor Green
-
-# ── Bridge secret ──────────────────────────────────────────────────
-Write-Host "  [4/5] Configuring bridge secret..." -ForegroundColor Yellow
-
-$secretFile = "$env:USERPROFILE\.kria\bridge_secret.txt"
-if (-not (Test-Path $secretFile)) {
-    $bridgeSecret = [System.Convert]::ToHexString([System.Security.Cryptography.RandomNumberGenerator]::GetBytes(32)).ToLower()
-    Set-Content -Path $secretFile -Value $bridgeSecret -NoNewline
-    Write-Host "        Generated bridge secret → $secretFile" -ForegroundColor Green
-} else {
-    $bridgeSecret = Get-Content $secretFile
-    Write-Host "        Bridge secret already exists" -ForegroundColor Cyan
-}
-
-# Write/update KRIA_BRIDGE_SECRET in .env
-if (Test-Path $ENV_FILE) {
-    $envContent = Get-Content $ENV_FILE -Raw
-    if ($envContent -match "KRIA_BRIDGE_SECRET=") {
-        $envContent = $envContent -replace "KRIA_BRIDGE_SECRET=.*", "KRIA_BRIDGE_SECRET=$bridgeSecret"
+    Write-Step "Installing Node.js…"
+    if ($hasWinget) {
+        winget install --id OpenJS.NodeJS.LTS -e --accept-package-agreements --accept-source-agreements
     } else {
-        $envContent += "`nKRIA_BRIDGE_SECRET=$bridgeSecret"
+        Write-Fail "Node.js not found and winget unavailable. Install Node.js from https://nodejs.org"
     }
-    Set-Content -Path $ENV_FILE -Value $envContent -NoNewline
-    Write-Host "        KRIA_BRIDGE_SECRET written to .env" -ForegroundColor Green
+    # Refresh PATH
+    $env:PATH = [Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [Environment]::GetEnvironmentVariable("PATH", "User")
+    if (-not (Has-Command "node")) {
+        Write-Fail "Node.js not found after install. Restart your terminal and re-run."
+    }
+    Write-Ok "Node.js $(node -v) installed"
 }
 
-# Copy bridge secret into docker/secrets/ for Docker secret mount
-$dockerSecretDir  = Join-Path $KRIA_ROOT "docker\secrets"
-$dockerSecretFile = Join-Path $dockerSecretDir "bridge_secret.txt"
-New-Item -ItemType Directory -Force -Path $dockerSecretDir | Out-Null
-Copy-Item -Path $secretFile -Destination $dockerSecretFile -Force
-Write-Host "        Bridge secret copied to docker\secrets\bridge_secret.txt" -ForegroundColor Green
+if (-not (Has-Command "npm")) {
+    Write-Fail "npm not found. Please install Node.js from https://nodejs.org"
+}
 
-# ── Docker build ───────────────────────────────────────────────────
-if (-not $SkipDocker) {
-    Write-Host "  [5/5] Building Docker images..." -ForegroundColor Yellow
-    Push-Location (Join-Path $KRIA_ROOT "docker")
+# ── 5. Frontend dependencies ────────────────────────────────
+Write-Step "Step 5/6 — Installing frontend dependencies…"
 
-    $composeFiles = @("-f", "docker-compose.yml")
-    if (Test-Path "docker-compose.override.yml") {
-        $composeFiles += @("-f", "docker-compose.override.yml")
-    }
-    if ($hasGpu -and (Test-Path "docker-compose.gpu.yml")) {
-        $composeFiles += @("-f", "docker-compose.gpu.yml")
-        Write-Host "        GPU detected — building with GPU support" -ForegroundColor Green
-    }
+Push-Location "$ProjectRoot\ui"
+npm install --no-audit --no-fund
+Pop-Location
+Write-Ok "Frontend dependencies ready"
 
-    Write-Host "        Building images (live output below)..." -ForegroundColor Cyan
-    docker compose @composeFiles build
-    Pop-Location
-    Write-Host "        Done." -ForegroundColor Green
+# ── 6. Build workspace ──────────────────────────────────────
+Write-Step "Step 6/6 — Building Rust workspace…"
+
+Push-Location $ProjectRoot
+cargo build --workspace
+Pop-Location
+Write-Ok "Workspace built successfully"
+
+# ── 7. Config ────────────────────────────────────────────────
+$KriaHome = "$env:USERPROFILE\.kria"
+$configDest = "$KriaHome\config.toml"
+
+if (-not (Test-Path $configDest)) {
+    New-Item -ItemType Directory -Path $KriaHome -Force | Out-Null
+    Copy-Item "$ProjectRoot\config\default.toml" $configDest
+    Write-Ok "Default config copied to $configDest"
 } else {
-    Write-Host "  [5/5] Skipping Docker build (-SkipDocker)" -ForegroundColor Cyan
+    Write-Ok "Config already exists at $configDest"
 }
 
-if ($DownloadModels) {
-    Write-Host ""
-    Write-Host "  Downloading AI models (this may take a while)..." -ForegroundColor Yellow
-    & $python (Join-Path $KRIA_ROOT "scripts\download_models.py")
-}
-
+# ── Done ─────────────────────────────────────────────────────
 Write-Host ""
-Write-Host "  =============================================" -ForegroundColor Green
+Write-Host "========================================" -ForegroundColor Green
 Write-Host "  K.R.I.A. setup complete!" -ForegroundColor Green
+Write-Host "========================================" -ForegroundColor Green
 Write-Host ""
-Write-Host "  Next steps:" -ForegroundColor White
-Write-Host "    1. Download models (first time only):"
-Write-Host "       python scripts\download_models.py"
-Write-Host ""
-Write-Host "    2. Start KRIA (Linux/macOS/WSL):"
-Write-Host "       bash scripts/app-start.sh"
-Write-Host ""
-Write-Host "    3. Open Dashboard:"
-Write-Host "       http://localhost:3000"
-Write-Host ""
-Write-Host "    4. (Optional) Start host bridge for mic/speaker:"
-Write-Host "       python scripts\kria_bridge.py"
-Write-Host ""
-Write-Host "  Other commands:" -ForegroundColor White
-Write-Host "    bash scripts/app-stop.sh           Stop all services"
-Write-Host "    bash scripts/app-restart.sh        Restart with latest changes"
-Write-Host "    bash scripts/app-restart.sh --quick Restart without rebuilding"
+Write-Host "Quick start:"
+Write-Host "  Desktop app :  cd crates\kria-desktop; cargo tauri dev"
+Write-Host "  Server only :  cargo run -p kria-server"
+Write-Host "  Run tests   :  cargo test --workspace"
 Write-Host ""

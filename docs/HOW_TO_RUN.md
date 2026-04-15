@@ -1,403 +1,470 @@
-# How to Run K.R.I.A.
+# K.R.I.A. — How to Run
 
-This guide covers every way to run the project — with and without Docker, on both Linux and Windows.
-
-K.R.I.A. v2.0 is a **complete AI Assistant** with internet connectivity, document intelligence, OS management, app lifecycle control, automation, and more. The setup is the same as before — just more Python dependencies.
+> Rust / Tauri v2 / SolidJS desktop application with an optional standalone server mode.
 
 ---
 
-## What is K.R.I.A. made of?
+## Table of Contents
 
-Before starting, understand the pieces that get launched:
-
-| Service | What it does | Port |
-|---|---|---|
-| **kria-brain** | Runs the LLM (Qwen3) and speech-to-text (Whisper) | 8080, 8081 |
-| **kria-voice** | Text-to-speech (Piper TTS) | 8082 |
-| **kria-core** | Main brain of the app — FastAPI + agent loop | 8000 |
-| **kria-data** | Database layer — Redis + ChromaDB | 6379, 8083 |
-| **kria-dashboard** | Web UI | 3000 |
-| **kria_bridge.py** | Runs **on your host machine** (not in Docker) for OS-level access | 9000 |
-
-> **Important:** `kria_bridge.py` always runs directly on your machine, even when everything else runs in Docker. It gives the AI access to your audio, apps, and OS.
+- [Prerequisites](#prerequisites)
+- [Quick Start (One Command)](#quick-start)
+- [Running — Desktop App (Tauri)](#desktop-app)
+- [Running — Standalone Server](#standalone-server)
+- [LLM Backend Setup](#llm-backend)
+- [Configuration](#configuration)
+- [Production Build](#production-build)
+- [FAQ](#faq)
 
 ---
 
-## Requirements (all methods)
+## Prerequisites
 
-### Linux
-- Python 3.12 or newer — check with `python3 --version`
-- Git — `sudo apt install git`
-- At least 16 GB RAM
-- (Optional) NVIDIA GPU with drivers installed
-
-### Windows
-- Python 3.12 or newer from [python.org](https://python.org) — check with `python --version`
-- Git from [git-scm.com](https://git-scm.com)
-- At least 16 GB RAM
-- (Optional) NVIDIA GPU with drivers
-
----
-
-## Step 0 — Clone and get the code
+### System dependencies (Linux)
 
 ```bash
-git clone <your-repo-url> KRIA
-cd KRIA
+sudo apt update && sudo apt install -y \
+  build-essential pkg-config \
+  libssl-dev \
+  libasound2-dev \
+  libwebkit2gtk-4.1-dev \
+  libgtk-3-dev \
+  librsvg2-dev \
+  patchelf
 ```
 
----
-
-## Method 1 — Docker (Recommended)
-
-Docker handles all services automatically. This is the easiest way.
-
-### Extra requirements for Docker
-- **Linux:** Docker Engine 27+ and Docker Compose v2
-  ```bash
-  sudo apt install docker.io docker-compose-plugin
-  sudo usermod -aG docker $USER   # then log out and back in
-  ```
-- **Windows:** [Docker Desktop](https://www.docker.com/products/docker-desktop/) — install and start it, then open a terminal
-
-- **(GPU only):** NVIDIA Container Toolkit
-  - Linux: `sudo apt install nvidia-container-toolkit && sudo systemctl restart docker`
-  - Windows: Docker Desktop handles this automatically if your GPU drivers are installed
-
----
-
-### Linux — Docker
-
-**Step 1 — Run the setup script**
-
-This creates the `.env` file, virtualenv, directories, and pulls Docker images.
+### Rust toolchain
 
 ```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+```
+
+### Node.js (for the UI)
+
+```bash
+# Using nvm (recommended)
+curl -fsSL https://fnm.vercel.app/install | bash
+
+# Or via your package manager
+sudo apt install nodejs npm
+```
+
+### Tauri CLI
+
+```bash
+cargo install tauri-cli --version "^2" --locked
+```
+
+> **Tip:** Run `bash scripts/setup.sh` to install _all_ prerequisites automatically (Linux/macOS). On Windows use `powershell -ExecutionPolicy Bypass -File scripts/setup.ps1`.
+
+---
+
+## Quick Start
+
+From the project root:
+
+```bash
+# Install everything + build + run
 bash scripts/setup.sh
+
+# Or manually:
+cd ui && npm install && cd ..
+cd crates/kria-desktop && cargo tauri dev
 ```
 
-**Step 2 — Download AI models** (~7 GB total, runs once)
-
-```bash
-python3 scripts/download_models.py
-```
-
-**Step 3 — Start all containers**
-
-CPU only:
-```bash
-cd docker
-docker compose up -d
-```
-
-With GPU (NVIDIA):
-```bash
-cd docker
-docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
-```
-
-**Step 4 — Start the bridge on your host** (in a separate terminal)
-
-```bash
-source .venv/bin/activate
-python scripts/kria_bridge.py
-```
-
-**Step 5 — Open the app**
-
-- Dashboard: http://localhost:3000
-- API docs: http://localhost:8000/docs
+That single `cargo tauri dev` command starts **both** the Vite frontend dev server (port 1420) **and** the Rust backend in one process. No separate terminals needed.
 
 ---
 
-### Windows — Docker
+## Desktop App
 
-**Step 1 — Open PowerShell as Administrator and run the setup script**
-
-```powershell
-Set-ExecutionPolicy RemoteSigned -Scope CurrentUser   # only needed once
-.\scripts\setup.ps1
-```
-
-To also download models during setup:
-```powershell
-.\scripts\setup.ps1 -DownloadModels
-```
-
-**Step 2 — Download AI models** (if you skipped `-DownloadModels` above)
-
-```powershell
-.\.venv\Scripts\python scripts\download_models.py
-```
-
-**Step 3 — Start all containers**
-
-CPU only:
-```powershell
-cd docker
-docker compose up -d
-```
-
-With GPU (NVIDIA):
-```powershell
-cd docker
-docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
-```
-
-**Step 4 — Start the bridge on your host** (in a separate PowerShell window)
-
-```powershell
-.\.venv\Scripts\python scripts\kria_bridge.py
-```
-
-**Step 5 — Open the app**
-
-- Dashboard: http://localhost:3000
-- API docs: http://localhost:8000/docs
-
----
-
-### Checking Docker status
+### Development mode
 
 ```bash
-# See if all containers are running
-docker compose ps
+cd crates/kria-desktop
+cargo tauri dev
+```
 
-# Watch live logs from all services
-docker compose logs -f
+This will:
+1. Start the **Vite dev server** on `http://localhost:1420` (via `beforeDevCommand`)
+2. Compile the **Rust backend** (`kria-desktop` crate)
+3. Open the **Tauri window** pointing at the Vite dev server
 
-# Watch logs from one service (e.g. the core)
-docker compose logs -f kria-core
+### What happens under the hood
 
-# Stop everything
-docker compose down
+```
+┌──────────────────────────────────────────────────────┐
+│  cargo tauri dev                                     │
+│                                                      │
+│  ┌───────────────┐        ┌───────────────────────┐  │
+│  │  Vite (1420)  │◄──────►│  Tauri WebView        │  │
+│  │  SolidJS UI   │  HMR   │  renders the frontend  │  │
+│  └───────────────┘        └──────────┬────────────┘  │
+│                                      │ IPC            │
+│                           ┌──────────▼────────────┐  │
+│                           │  Rust Backend          │  │
+│                           │  (commands.rs)         │  │
+│                           │  ├─ ModelRouter → LLM  │  │
+│                           │  ├─ MemoryStore        │  │
+│                           │  └─ SafetyGateway      │  │
+│                           └───────────────────────┘  │
+└──────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Method 2 — Without Docker (Manual Setup)
+## Standalone Server
 
-Use this if you can't or don't want to use Docker. You will install each dependency yourself.
+Headless / API-only mode — no GUI, useful for remote access or integrations:
 
-### Extra requirements (no Docker)
-
-You need Redis and ChromaDB running locally:
-
-**Linux:**
 ```bash
-# Redis
-sudo apt install redis-server
-sudo systemctl start redis
-
-# ChromaDB (runs as a Python server)
-pip install chromadb
-chroma run --path ~/.kria/chroma --port 8083
+cargo run -p kria-server
+# Listens on 127.0.0.1:3001 (configured in config/default.toml → [server])
 ```
 
-**Windows:**
-```powershell
-# Redis — install via Scoop
-winget install Memurai.Memurai    # or download Redis for Windows from GitHub
+Test it:
 
-# ChromaDB
-pip install chromadb
-chroma run --path "$env:USERPROFILE\.kria\chroma" --port 8083
+```bash
+curl http://127.0.0.1:3001/api/health
 ```
-
-You also need **llama.cpp** and **whisper.cpp** running locally — see their respective GitHub pages to build or download binaries, then start them on ports `8080` and `8081`.
 
 ---
 
-### Linux — No Docker
+## LLM Backend
 
-**Step 1 — Run the setup script with Docker skipped**
-
-```bash
-SKIP_DOCKER=1 bash scripts/setup.sh
-```
-
-**Step 2 — Activate the virtualenv**
+The app expects a local **llama.cpp** server on port `8080` (configurable in `config/default.toml` → `[llm]`).
 
 ```bash
-source .venv/bin/activate
+# Download & build llama.cpp, then run:
+./llama-server \
+  -m models/llm/microsoft_Phi-4-mini-instruct-Q4_K_M.gguf \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --ctx-size 4096
 ```
 
-**Step 3 — Download AI models**
+Without it, the app still starts — chat messages will return a helpful error telling you to start the server or set a cloud API key.
+
+### Using a cloud LLM instead
+
+Edit `~/.kria/config.toml`:
+
+```toml
+[llm]
+mode = "gemini"          # or "external"
+cloud_api_key = "YOUR_KEY_HERE"
+```
+
+Or set the environment variable:
 
 ```bash
-python3 scripts/download_models.py
+export KRIA_CLOUD_API_KEY="YOUR_KEY_HERE"
 ```
-
-**Step 4 — Edit `.env`** to point at your local services
-
-Open `.env` and set:
-
-```env
-KRIA_LLAMA_API_URL=http://localhost:8080
-KRIA_WHISPER_API_URL=http://localhost:8081
-KRIA_PIPER_API_URL=http://localhost:8082
-KRIA_REDIS_URL=redis://localhost:6379/0
-KRIA_CHROMA_URL=http://localhost:8083
-KRIA_BRIDGE_URL=http://localhost:9000
-```
-
-**Step 5 — Start each service in its own terminal**
-
-Terminal 1 — Redis (if not running as a system service):
-```bash
-redis-server
-```
-
-Terminal 2 — ChromaDB:
-```bash
-chroma run --path ~/.kria/chroma --port 8083
-```
-
-Terminal 3 — Start llama.cpp (example):
-```bash
-./llama-server -m models/llm/microsoft_Phi-4-mini-instruct-Q4_K_M.gguf --port 8080
-```
-
-Terminal 4 — K.R.I.A. core:
-```bash
-source .venv/bin/activate
-python -m kria.main
-```
-
-Terminal 5 — Bridge:
-```bash
-source .venv/bin/activate
-python scripts/kria_bridge.py
-```
-
-**Step 6 — Open the app**
-
-- API docs: http://localhost:8000/docs
 
 ---
 
-### Windows — No Docker
+## Configuration
 
-**Step 1 — Run setup without Docker**
+```bash
+# Create user config directory
+mkdir -p ~/.kria
 
-```powershell
-.\scripts\setup.ps1 -SkipDocker
+# Copy the default config
+cp config/default.toml ~/.kria/config.toml
+
+# Edit to your needs
+nano ~/.kria/config.toml
 ```
 
-**Step 2 — Activate the virtualenv**
+Key sections in `config/default.toml`:
 
-```powershell
-.\.venv\Scripts\Activate.ps1
-```
-
-**Step 3 — Download AI models**
-
-```powershell
-.venv\Scripts\python scripts\download_models.py
-```
-
-**Step 4 — Edit `.env`** (same values as Linux above)
-
-**Step 5 — Start each service in its own terminal**
-
-Same pattern as Linux — run Redis, ChromaDB, llama.cpp, then:
-
-PowerShell window 1 — K.R.I.A. core:
-```powershell
-.\.venv\Scripts\python -m kria.main
-```
-
-PowerShell window 2 — Bridge:
-```powershell
-.\.venv\Scripts\python scripts\kria_bridge.py
-```
-
-**Step 6 — Open the app**
-
-- API docs: http://localhost:8000/docs
+| Section      | What it controls                                        |
+| ------------ | ------------------------------------------------------- |
+| `[llm]`      | Model mode (`local`/`gemini`/`external`), port, context |
+| `[voice]`    | STT/TTS models, sample rate, VAD threshold              |
+| `[memory]`   | Max facts, decay settings                               |
+| `[safety]`   | HITL approval requirements, audit, rollback              |
+| `[server]`   | Host & port for the standalone server (default 3001)     |
+| `[ui]`       | Theme, font size                                        |
 
 ---
 
-## Environment Variables Reference
+## Production Build
 
-The `.env` file controls everything. Here are the most important ones:
+### Using the script (recommended)
 
-| Variable | Default | Description |
-|---|---|---|
-| **Service URLs** | | |
-| `KRIA_LLAMA_API_URL` | `http://localhost:8080` | Where llama.cpp is running |
-| `KRIA_WHISPER_API_URL` | `http://localhost:8081` | Where whisper.cpp is running |
-| `KRIA_PIPER_API_URL` | `http://localhost:8082` | Where Piper TTS is running |
-| `KRIA_REDIS_URL` | `redis://localhost:6379/0` | Redis connection |
-| `KRIA_CHROMA_URL` | `http://localhost:8083` | ChromaDB connection |
-| `KRIA_BRIDGE_URL` | `http://localhost:9000` | Bridge server address |
-| `KRIA_BRIDGE_SECRET` | *(auto-generated)* | Shared secret between core and bridge |
-| **Features** | | |
-| `KRIA_VOICE_ENABLED` | `false` | Set to `true` to enable voice I/O |
-| `KRIA_INTERNET_ENABLED` | `true` | Enable internet tools (web search, downloads, etc.) |
-| `KRIA_INTERNET_HTTPS_ONLY` | `true` | Reject plain HTTP requests |
-| `KRIA_AUTOMATION_ENABLED` | `true` | Enable workflow/scheduler engine |
-| `KRIA_PLUGINS_ENABLED` | `true` | Enable plugin system |
-| `KRIA_NOTIFICATIONS_ENABLED` | `true` | Enable desktop notifications |
-| **Limits** | | |
-| `KRIA_MAX_DOWNLOAD_SIZE_MB` | `500` | Max file download size in MB |
-| `KRIA_INTERNET_RATE_LIMIT_PER_MIN` | `60` | Max HTTP requests per minute per domain |
-| `KRIA_MAX_SCHEDULED_TASKS` | `50` | Max scheduler jobs |
-| **Paths** | | |
-| `KRIA_DOWNLOADS_DIR` | `~/Downloads/kria` | Where downloaded files go |
-| `KRIA_PLUGINS_DIR` | `~/.kria/plugins` | Plugin installation directory |
-| `KRIA_WORKFLOWS_DIR` | `~/.kria/workflows` | Workflow YAML files |
+```bash
+bash scripts/build-release.sh
+```
+
+This builds the frontend, compiles the Rust backend in release mode, and produces platform-native bundles:
+
+- **Linux:** `.deb` and `.AppImage` in `target/release/bundle/`
+- **macOS:** `.dmg` in `target/release/bundle/`
+- **Windows:** `powershell -File scripts/build-release.ps1` → `.msi` / `.exe`
+
+### Manually
+
+```bash
+cd ui && npm run build && cd ..
+cd crates/kria-desktop && cargo tauri build
+```
+
+The output binary is a **single self-contained executable** — the frontend is bundled inside. No separate web server needed in production.
 
 ---
 
-## Disk and Memory Usage
+## FAQ
 
-| Component | Disk | RAM |
-|---|---|---|
-| Phi-4-mini-instruct LLM (primary) | ~2.5 GB | ~3–4 GB |
-| Qwen2.5-VL-7B LLM (secondary, opt-in) | ~4.7 GB | ~6–8 GB |
-| mmproj-F16.gguf (vision projector) | ~1.35 GB | — |
-| Whisper large-v3-turbo | ~1.5 GB | ~2 GB |
-| Piper TTS voice | ~65 MB | ~200 MB |
-| Core + services + tools | — | ~2–3 GB |
+### 1. In production, do I need to run the frontend and backend separately?
 
-Total models: **~10 GB** download (primary only: ~4 GB). Minimum 16 GB RAM recommended.
+**No.** The production build bundles everything into a **single binary**. When you run `cargo tauri build`, it:
+1. Compiles the SolidJS frontend into static files (`ui/dist/`)
+2. Embeds those files directly into the Rust binary
+3. Produces a native app (`.AppImage`, `.deb`, `.dmg`, `.msi`)
 
-> **Note:** Document parsing (PyMuPDF, openpyxl, pandas) and web tools (httpx, trafilatura) add ~200 MB to Python dependencies. These are installed automatically by `pip install .` or the setup script.
+The resulting executable contains both the UI and the Rust backend — no Node.js, no Vite, no separate processes. Just double-click and run.
+
+The **only** external process you may need is the **llama.cpp server** (if you're using a local LLM). You can script that alongside:
+
+```bash
+# Example: start both in one script
+./llama-server -m models/llm/microsoft_Phi-4-mini-instruct-Q4_K_M.gguf \
+  --host 127.0.0.1 --port 8080 --ctx-size 4096 &
+
+./KRIA   # the built binary
+
+# Or use cloud LLM mode and you need nothing else
+```
+
+If you use a cloud LLM (Gemini, etc.), the single binary is truly all you need.
 
 ---
 
-## Troubleshooting
+### 2. Does it pick up code changes automatically during development?
 
-**Containers keep restarting**
+**Partially — it depends on what you changed:**
+
+| What changed         | Hot-reloaded? | What to do                            |
+| -------------------- | ------------- | ------------------------------------- |
+| **Frontend** (SolidJS/CSS in `ui/src/`) | ✅ Yes | Vite HMR updates instantly in the window |
+| **Rust backend** (`crates/*/src/`)      | ✅ Yes (recompile) | Tauri CLI detects the change, recompiles, and restarts the app automatically |
+| **Tauri config** (`tauri.conf.json`)    | ❌ No  | Stop `cargo tauri dev` (Ctrl+C) and re-run it |
+| **Config files** (`config/default.toml`, `~/.kria/config.toml`) | ❌ No | Restart the app — config is read once at startup |
+| **Cargo.toml** (dependency changes)     | ❌ No  | Stop, run `cargo update` if needed, then `cargo tauri dev` again |
+
+**In short:** For day-to-day frontend and Rust code changes, just save the file — the running `cargo tauri dev` process handles it. For config/dependency changes, restart.
+
+---
+
+### 3. Where can I see logs?
+
+Logs are written to **two places**:
+
+#### Terminal (stdout)
+The terminal where you ran `cargo tauri dev` shows live compact logs:
+
+```
+INFO kria_desktop::commands: KRIA runtime initialized
+INFO kria_desktop::commands: User message: hello
+INFO kria_desktop::commands: Routing to backend: phi-4-mini
+INFO kria_desktop::commands: LLM response received (142 chars)
+```
+
+#### Log files (JSON, daily rotation)
+
+```
+~/.kria/logs/kria.log.YYYY-MM-DD
+```
+
+These are JSON-formatted and rotated daily. Use `jq` to browse:
+
 ```bash
-docker compose logs kria-brain
+# Latest logs
+cat ~/.kria/logs/kria.log.$(date +%F) | jq .
+
+# Filter by level
+cat ~/.kria/logs/kria.log.$(date +%F) | jq 'select(.level == "ERROR")'
+
+# Follow live
+tail -f ~/.kria/logs/kria.log.$(date +%F) | jq .
 ```
-Usually means the model file is missing. Run `download_models.py` again.
 
-**`kria-core` unhealthy but `kria-brain` is still starting**
-Normal — `kria-brain` can take up to 90 seconds to load the model. Wait for it.
+#### Controlling log verbosity
 
-**Bridge says "secret mismatch"**
-The secret in `.env` (`KRIA_BRIDGE_SECRET`) must match what `kria_bridge.py` loaded. Re-run the setup script to regenerate them together, or copy `~/.kria/bridge_secret.txt` into `.env` manually.
+Set the `RUST_LOG` environment variable:
 
-**`No module named kria`**
-You are not in the virtualenv. Run `source .venv/bin/activate` (Linux) or `.\.venv\Scripts\Activate.ps1` (Windows).
-
-**Project is on an NTFS drive (e.g. a shared Windows/Linux disk) — `.venv/bin/activate: No such file or directory`**
-NTFS doesn't support Linux symlinks, so a plain `python3 -m venv` creates a broken environment. The setup script handles this automatically with `--copies`. If you already have a broken `.venv`, delete it first then re-run:
 ```bash
-rm -rf .venv
-bash scripts/setup.sh
+# Verbose — show everything
+RUST_LOG=debug cargo tauri dev
+
+# Quiet — errors only
+RUST_LOG=error cargo tauri dev
+
+# Fine-grained
+RUST_LOG="kria_core=debug,kria_desktop=info" cargo tauri dev
 ```
 
-**Permission denied running `setup.sh`**
+Default levels (when `RUST_LOG` is not set): `info` globally, `debug` for `kria_core`, `kria_desktop`, and `kria_server`.
+
+#### Browser DevTools (frontend)
+
+Right-click in the Tauri window → **Inspect Element** → **Console** tab for frontend `console.log` output (SolidJS, Tauri IPC events, etc.).
+
+---
+
+### 4. How do I run the tests?
+
 ```bash
-chmod +x scripts/setup.sh
-bash scripts/setup.sh
+# All tests across the workspace
+cargo test --workspace
+
+# Tests for a specific crate
+cargo test -p kria-core
+cargo test -p kria-desktop
+cargo test -p kria-server
+
+# A specific test by name
+cargo test test_memory_store
 ```
 
-**PowerShell says "running scripts is disabled"**
-```powershell
-Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
+---
+
+### 5. How do I add a new Tauri command (IPC endpoint)?
+
+1. **Define the command** in `crates/kria-desktop/src/commands.rs`:
+   ```rust
+   #[tauri::command]
+   pub async fn my_command(
+       input: String,
+       state: State<'_, AppState>,
+   ) -> Result<serde_json::Value, String> {
+       // your logic
+       Ok(serde_json::json!({"result": "ok"}))
+   }
+   ```
+
+2. **Register it** in `crates/kria-desktop/src/main.rs` inside `invoke_handler`:
+   ```rust
+   .invoke_handler(tauri::generate_handler![
+       commands::send_message,
+       commands::my_command,  // add here
+       // ...
+   ])
+   ```
+
+3. **Call from the frontend** in `ui/src/`:
+   ```ts
+   import { invoke } from "@tauri-apps/api/core";
+   const result = await invoke("my_command", { input: "hello" });
+   ```
+
+---
+
+### 6. How is the project structured?
+
 ```
+KRIA/
+├── crates/
+│   ├── kria-core/       # Shared library — LLM, memory, safety, tools, config
+│   ├── kria-desktop/    # Tauri v2 desktop app (depends on kria-core)
+│   └── kria-server/     # Axum HTTP/WS server (depends on kria-core)
+├── ui/                  # SolidJS + Vite frontend
+├── config/              # Default configuration files
+├── models/              # LLM/STT/TTS model files (gitignored)
+├── scripts/             # Setup, build, and utility scripts
+└── docs/                # Documentation
+```
+
+The three Rust crates form a dependency tree: both `kria-desktop` and `kria-server` depend on `kria-core`. Shared logic (LLM routing, memory, safety) lives in `kria-core`.
+
+---
+
+### 7. How do I check for compiler errors without running the app?
+
+```bash
+# Type-check the whole workspace (fast, no codegen)
+cargo check --workspace
+
+# With all warnings shown
+cargo check --workspace 2>&1 | head -50
+
+# Full build (compiles but doesn't run)
+cargo build --workspace
+```
+
+---
+
+### 8. How do I reset the app state / data?
+
+```bash
+# Remove all user data (config, logs, database)
+rm -rf ~/.kria/
+
+# The app will recreate defaults on next launch
+
+# To only clear logs:
+rm -rf ~/.kria/logs/
+
+# To only reset config:
+rm ~/.kria/config.toml
+```
+
+Or use the uninstall script for a thorough cleanup:
+
+```bash
+bash scripts/uninstall.sh --config   # remove config + data only
+bash scripts/uninstall.sh --all      # remove everything including toolchains
+```
+
+---
+
+### 9. How do I switch between local and cloud LLM?
+
+Edit `~/.kria/config.toml`:
+
+```toml
+# Local (llama.cpp required)
+[llm]
+mode = "local"
+local_port = 8080
+
+# Cloud (no local server needed)
+[llm]
+mode = "gemini"
+# Set key via env: export KRIA_CLOUD_API_KEY="..."
+```
+
+Then restart the app. The model router in `kria-core` will automatically route chat requests to the configured backend.
+
+---
+
+### 10. How do I debug Rust backend code?
+
+1. **Add `tracing` calls** to any function:
+   ```rust
+   tracing::debug!("processing request: {:?}", input);
+   ```
+
+2. **Run with verbose logging:**
+   ```bash
+   RUST_LOG=debug cargo tauri dev
+   ```
+
+3. **Use a debugger** (VS Code + CodeLLDB extension):
+   - Set a breakpoint in `commands.rs`
+   - Run the "Debug Tauri" launch config (or `cargo build -p kria-desktop && ./target/debug/kria-desktop`)
+
+4. **Inspect Tauri IPC events** in the browser DevTools console — all `app.emit()` events appear there.
+
+---
+
+### 11. Port conflicts — what ports does KRIA use?
+
+| Port   | Used by                     | Configurable in              |
+| ------ | --------------------------- | ---------------------------- |
+| `1420` | Vite dev server (dev only)  | `ui/vite.config.ts`          |
+| `3001` | Standalone HTTP server      | `config/default.toml` → `[server]` |
+| `8080` | llama.cpp LLM server        | `config/default.toml` → `[llm]`    |
+
+In production builds, ports 1420 and 3001 are **not used** — the Tauri app is self-contained.

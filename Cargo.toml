@@ -1,0 +1,86 @@
+[workspace]
+members = ["crates/kria-core", "crates/kria-desktop", "crates/kria-server"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["KRIA Contributors"]
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+tracing-appender = "0.2"
+
+# HTTP
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled", "vtab"] }
+
+# Concurrent data structures
+dashmap = "6"
+
+# System info
+sysinfo = "0.32"
+
+# Filesystem
+walkdir = "2"
+globset = "0.4"
+notify = "7"
+
+# Regex
+regex = "1"
+once_cell = "1"
+
+# Time & IDs
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+
+# Clipboard
+arboard = "3"
+
+# Notifications
+notify-rust = "4"
+
+# Audio
+cpal = "0.15"
+rodio = "0.19"
+
+# ONNX Runtime (for VAD, TTS)
+ort = "2.0.0-rc.12"
+
+# Image processing
+image = "0.25"
+
+# Crypto
+sha2 = "0.10"
+hmac = "0.12"
+rand = "0.8"
+
+# Web scraping
+scraper = "0.21"
+
+# Async channels
+async-trait = "0.1"
+futures = "0.3"
+
+# Config
+dirs = "5"
+
+# Open URLs/files in default app
+open = "5"
