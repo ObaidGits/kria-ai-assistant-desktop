@@ -132,7 +132,7 @@ struct SmartSuggest;
 
 use chrono::Timelike;
 
-pub fn register(reg: &mut ToolRegistry, engine: Arc<ProactiveEngine>) {
+pub fn register(reg: &ToolRegistry, engine: Arc<ProactiveEngine>) {
     let tools: Vec<(ToolDef, Arc<dyn ToolHandler>)> = vec![
         (ToolDef {
             name: "check_system_health".into(), description: "Run system health checks (RAM, disk) and return any alerts".into(),

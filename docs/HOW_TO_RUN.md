@@ -141,6 +141,11 @@ The app expects a local **llama.cpp** server on port `8080` (configurable in `co
   --host 127.0.0.1 \
   --port 8080 \
   --ctx-size 4096
+
+obaid@obaid-ubuntu:~/Downloads/llama.cpp$ ./build/bin/llama-server   -m models/Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf   --mmproj models/mmproj-F16.gguf   -ngl 0
+
+obaid@obaid-ubuntu:~/Downloads/llama.cpp$ ./build/bin/llama-server -m models/microsoft_Phi-4-mini-instruct-Q4_K_M.gguf -c 8192 -ngl 0
+
 ```
 
 Without it, the app still starts — chat messages will return a helpful error telling you to start the server or set a cloud API key.
@@ -468,3 +473,31 @@ Then restart the app. The model router in `kria-core` will automatically route c
 | `8080` | llama.cpp LLM server        | `config/default.toml` → `[llm]`    |
 
 In production builds, ports 1420 and 3001 are **not used** — the Tauri app is self-contained.
+
+```bash
+# 1. Kill any running instance
+pkill kria-desktop 2>/dev/null; sleep 1
+
+# 2. Clear Rust build cache (forces full recompile)
+cd /media/obaid/SSD/KRIA
+cargo clean
+
+# 3. Clear UI build cache
+rm -rf ui/dist ui/node_modules/.vite
+
+# 4. Rebuild everything
+cd crates/kria-desktop && cargo tauri dev
+```
+
+Or if you just want a **quick restart** without cleaning (usually enough):
+```bash
+# Stop current dev server (Ctrl+C in the terminal running cargo tauri dev), then:
+cd /media/obaid/SSD/KRIA/crates/kria-desktop && cargo tauri dev
+```
+
+`cargo clean` is only needed when:
+- Icons/assets changed and the binary isn't picking them up
+- Build is in a broken state
+- Rust code changes aren't being detected
+
+It takes ~2–3 min to recompile everything from scratch after `cargo clean`.

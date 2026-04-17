@@ -116,7 +116,7 @@ struct DeleteScheduledTask;
     }
 }
 
-pub fn register(reg: &mut ToolRegistry) {
+pub fn register(reg: &ToolRegistry) {
     let tools: Vec<(ToolDef, Arc<dyn ToolHandler>)> = vec![
         (ToolDef {
             name: "list_scheduled_tasks".into(), description: "List cron jobs and systemd timers".into(),

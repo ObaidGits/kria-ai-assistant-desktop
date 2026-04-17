@@ -32,6 +32,9 @@ dependencies = [
     # Audio preprocessing
     "librosa>=0.10",
     "noisereduce>=3.0",
+
+    # Telegram MCP server
+    "httpx>=0.27",
 ]
 
 [project.optional-dependencies]
@@ -43,13 +46,14 @@ gpu = [
 
 [project.scripts]
 kria-sidecar = "kria_modules.bridge:main"
+kria-telegram-mcp = "kria_modules.telegram_mcp.server:entry"
 
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.backends.core"
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/kria_modules"]
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.uv]
 dev-dependencies = [

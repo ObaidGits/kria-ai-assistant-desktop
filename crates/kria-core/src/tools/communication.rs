@@ -70,7 +70,7 @@ fn urlencoding(s: &str) -> String {
     s.replace(' ', "%20").replace('\n', "%0A").replace('&', "%26")
 }
 
-pub fn register(reg: &mut ToolRegistry) {
+pub fn register(reg: &ToolRegistry) {
     let tools: Vec<(ToolDef, Arc<dyn ToolHandler>)> = vec![
         (ToolDef {
             name: "send_notification".into(), description: "Send a desktop notification".into(),

@@ -4,8 +4,9 @@
 # Jobs:
 #   1. rust-check   — cargo fmt, clippy, and workspace build
 #   2. rust-test    — integration + feature tests (kria-core, kria-server)
-#   3. e2e-api      — Playwright API integration tests
-#   4. e2e-browser  — Playwright browser E2E tests (requires UI build)
+#   3. ui-unit-test — Vitest unit/snapshot tests for UI
+#   4. e2e-api      — Playwright API integration tests
+#   5. e2e-browser  — Playwright browser E2E tests (requires UI build)
 # ──────────────────────────────────────────────────────────────────────
 
 name: CI
@@ -76,11 +77,45 @@ jobs:
       - name: Run all Rust tests
         run: cargo test --workspace -- --nocapture
 
+      - name: Run desktop metadata payload tests
+        run: cargo test -p kria-desktop tool_result_payload_ -- --nocapture
+
+  # ── UI unit tests (Vitest) ───────────────────────────────────
+  ui-unit-test:
+    name: "UI — Unit Tests (Vitest)"
+    runs-on: ubuntu-latest
+    needs: rust-check
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install UI dependencies
+        working-directory: ui
+        run: npm ci
+
+      - name: Run UI unit tests
+        working-directory: ui
+        run: |
+          set -o pipefail
+          npm run test:run 2>&1 | tee vitest-output.txt
+
+      - name: Upload UI unit test artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vitest-ui-artifacts
+          path: |
+            ui/vitest-output.txt
+            ui/src/components/__snapshots__/**
+
   # ── Playwright API tests ─────────────────────────────────────────
   e2e-api:
     name: "E2E — API Integration (Playwright)"
     runs-on: ubuntu-latest
-    needs: rust-test
+    needs: [rust-test, ui-unit-test]
     steps:
       - uses: actions/checkout@v4
 
@@ -135,7 +170,7 @@ jobs:
   e2e-browser:
     name: "E2E — Browser (Playwright)"
     runs-on: ubuntu-latest
-    needs: rust-test
+    needs: [rust-test, ui-unit-test]
     steps:
       - uses: actions/checkout@v4
 

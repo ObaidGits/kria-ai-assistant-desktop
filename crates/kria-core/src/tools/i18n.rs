@@ -93,7 +93,7 @@ impl ToolHandler for GetAccessibilitySettings {
 
 // ─── Registration ───
 
-pub fn register(reg: &mut ToolRegistry) {
+pub fn register(reg: &ToolRegistry) {
     reg.register(
         ToolDef {
             name: "list_languages".into(),

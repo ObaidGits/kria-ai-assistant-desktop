@@ -1,5 +1,6 @@
 import { Component, For, Show, createSignal } from "solid-js";
 import { appStore } from "../stores/app";
+import logo from "../assets/kria-logo.png";
 
 const SessionSidebar: Component = () => {
   const { sessions, currentSession, setShowSettings, createSession, switchSession, deleteSession } = appStore;
@@ -9,9 +10,15 @@ const SessionSidebar: Component = () => {
     <aside class={`sidebar ${collapsed() ? "collapsed" : ""}`}>
       <div class="sidebar-header">
         <Show when={!collapsed()}>
-          <h1 class="logo">K.R.I.A.</h1>
+          <div class="logo">
+            <img src={logo} alt="KRIA" class="logo-img" />
+            <span class="logo-text">K.R.I.A.</span>
+          </div>
         </Show>
-        <div style={{ display: "flex", gap: "4px" }}>
+        <Show when={collapsed()}>
+          <img src={logo} alt="KRIA" class="logo-collapsed" />
+        </Show>
+        <div class="sidebar-header-actions" style={{ display: "flex", gap: "4px" }}>
           <button class="sidebar-toggle" title={collapsed() ? "Expand sidebar" : "Collapse sidebar"} onClick={() => setCollapsed((v) => !v)}>
             {collapsed() ? "▶" : "◀"}
           </button>
@@ -22,6 +29,20 @@ const SessionSidebar: Component = () => {
       </div>
 
       <Show when={!collapsed()}>
+        <div class="sidebar-intro-card">
+          <div class="sidebar-intro-title">Assistant Mode</div>
+          <div class="sidebar-intro-copy">Context-aware planning with adaptive tool access.</div>
+        </div>
+
+        <div class="sidebar-quick-actions">
+          <button class="settings-btn primary" onClick={() => createSession()}>
+            + New Mission
+          </button>
+          <button class="settings-btn" onClick={() => setShowSettings(true)}>
+            Configure Assistant
+          </button>
+        </div>
+
         <div class="session-list">
           <Show when={sessions().length === 0}>
             <div class="session-empty">No conversations yet</div>
@@ -47,9 +68,9 @@ const SessionSidebar: Component = () => {
         </div>
 
         <div class="sidebar-footer">
-          <button class="settings-btn" onClick={() => setShowSettings(true)}>
-            ⚙ Settings
-          </button>
+          <div class="sidebar-meta">
+            {sessions().length} active session{sessions().length === 1 ? "" : "s"}
+          </div>
         </div>
       </Show>
     </aside>

@@ -27,3 +27,4 @@ anyhow = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 rusqlite = { workspace = true }
+reqwest = { workspace = true }

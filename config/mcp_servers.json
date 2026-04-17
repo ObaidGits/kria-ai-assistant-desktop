@@ -3,13 +3,33 @@
     {
       "name": "fs",
       "transport": "stdio",
-      "command": ["mcp-server-filesystem", "/home", "/media", "/tmp"],
+      "command": "mcp-server-filesystem",
+      "args": ["/home", "/media", "/tmp"],
       "enabled": true,
       "trust_level": "YELLOW",
       "tool_overrides": {
         "move_file": "RED",
         "write_file": "YELLOW",
         "edit_file": "YELLOW"
+      }
+    },
+    {
+      "name": "gworkspace",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "google-workspace-mcp", "serve"],
+      "env": {
+        "GOOGLE_MCP_CONFIG_DIR": "/home/obaid/.google-mcp"
+      },
+      "enabled": true,
+      "trust_level": "YELLOW",
+      "tool_overrides": {
+        "createGmailDraft": "YELLOW",
+        "sendGmailDraft": "RED",
+        "deleteGmailMessage": "RED",
+        "deleteFile": "RED",
+        "createCalendarEvent": "YELLOW",
+        "deleteCalendarEvent": "RED"
       }
     }
   ]

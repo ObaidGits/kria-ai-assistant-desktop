@@ -213,8 +213,27 @@ fn config_has_search_defaults() {
 #[test]
 fn system_prompt_includes_datetime() {
     let prompt = kria_core::agent::prompts::build_system_prompt(
-        "tools here", "TestUser", "linux", "standard", ""
+        "tools here", "TestUser", "linux", "standard", "apt", ""
     );
     assert!(prompt.contains("Current Date/Time:"), "prompt should include datetime");
     assert!(prompt.contains("TestUser"), "prompt should include user name");
+}
+
+#[test]
+fn system_prompt_news_rules_include_freshness_and_region_controls() {
+    let prompt = kria_core::agent::prompts::build_system_prompt(
+        "tools here", "TestUser", "linux", "standard", "apt", ""
+    );
+    assert!(
+        prompt.contains("freshness_mode=live"),
+        "prompt should guide live freshness mode for breaking updates"
+    );
+    assert!(
+        prompt.contains("source_profile=authentic") && prompt.contains("india_authentic"),
+        "prompt should include authenticity and India-specific profile guidance"
+    );
+    assert!(
+        prompt.contains("country") && prompt.contains("region"),
+        "prompt should guide regional targeting for news queries"
+    );
 }

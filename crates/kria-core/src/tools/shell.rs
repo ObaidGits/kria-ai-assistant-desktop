@@ -98,7 +98,7 @@ struct ExecutePowershell;
     }
 }
 
-pub fn register(reg: &mut ToolRegistry) {
+pub fn register(reg: &ToolRegistry) {
     let tools: Vec<(ToolDef, Arc<dyn ToolHandler>)> = vec![
         (ToolDef {
             name: "execute_bash".into(), description: "Execute a bash shell command".into(),

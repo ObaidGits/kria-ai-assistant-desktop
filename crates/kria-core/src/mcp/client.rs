@@ -38,6 +38,8 @@ pub struct McpClient {
     tools: Arc<Mutex<Vec<McpToolDef>>>,
     server_info: Arc<Mutex<Option<ServerInfo>>>,
     error_msg: Arc<Mutex<Option<String>>>,
+    /// Consecutive restart count for exponential backoff (1s → 2s → 4s → … max 30s).
+    restart_count: AtomicU64,
 }
 
 impl McpClient {
@@ -53,6 +55,7 @@ impl McpClient {
             tools: Arc::new(Mutex::new(Vec::new())),
             server_info: Arc::new(Mutex::new(None)),
             error_msg: Arc::new(Mutex::new(None)),
+            restart_count: AtomicU64::new(0),
         }
     }
 
@@ -95,7 +98,11 @@ impl McpClient {
         args: &[String],
         env: &HashMap<String, String>,
     ) -> anyhow::Result<()> {
-        tracing::info!(server = %self.name, command = %command, "starting MCP server");
+        tracing::info!("[MCP:{}] do_start — spawning: {} {:?}", self.name, command, args);
+        if !env.is_empty() {
+            let keys: Vec<&str> = env.keys().map(|s| s.as_str()).collect();
+            tracing::debug!("[MCP:{}] env vars: {:?}", self.name, keys);
+        }
 
         let mut cmd = Command::new(command);
         cmd.args(args)
@@ -108,7 +115,11 @@ impl McpClient {
             cmd.env(k, v);
         }
 
-        let mut child = cmd.spawn()?;
+        let mut child = cmd.spawn().map_err(|e| {
+            tracing::error!("[MCP:{}] failed to spawn process '{}': {}", self.name, command, e);
+            e
+        })?;
+        tracing::info!("[MCP:{}] process spawned (pid={:?})", self.name, child.id());
 
         let stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("no stdout"))?;
         let stderr = child.stderr.take().ok_or_else(|| anyhow::anyhow!("no stderr"))?;
@@ -139,13 +150,17 @@ impl McpClient {
 
         // Spawn stdout response reader
         let pending = self.pending.clone();
+        let reader_name = self.name.clone();
         let reader_handle = tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
             let mut line = String::new();
             loop {
                 line.clear();
                 match reader.read_line(&mut line).await {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        tracing::info!("[MCP:{}] stdout EOF — server process exited", reader_name);
+                        break;
+                    }
                     Ok(_) => {
                         let trimmed = line.trim();
                         if trimmed.is_empty() {
@@ -161,12 +176,12 @@ impl McpClient {
                                 }
                             }
                             Err(e) => {
-                                tracing::warn!("failed to parse MCP response: {}: {}", e, &trimmed[..trimmed.len().min(200)]);
+                                tracing::warn!("[MCP:{}] parse error: {}: {}", reader_name, e, &trimmed[..trimmed.len().min(200)]);
                             }
                         }
                     }
                     Err(e) => {
-                        tracing::error!("MCP stdout read error: {}", e);
+                        tracing::error!("[MCP:{}] stdout read error: {}", reader_name, e);
                         break;
                     }
                 }
@@ -176,6 +191,7 @@ impl McpClient {
         *self.reader_task.lock().await = Some(reader_handle);
 
         // MCP initialize handshake
+        tracing::info!("[MCP:{}] sending initialize request (protocol 2024-11-05)", self.name);
         let init_params = InitializeParams {
             protocol_version: "2024-11-05".into(),
             capabilities: ClientCapabilities::default(),
@@ -187,34 +203,52 @@ impl McpClient {
 
         let result = self
             .request("initialize", Some(serde_json::to_value(&init_params)?))
-            .await?;
+            .await
+            .map_err(|e| {
+                tracing::error!("[MCP:{}] initialize request failed: {}", self.name, e);
+                e
+            })?;
 
-        let init_result: InitializeResult = serde_json::from_value(result)?;
+        let init_result: InitializeResult = serde_json::from_value(result).map_err(|e| {
+            tracing::error!("[MCP:{}] failed to parse initialize response: {}", self.name, e);
+            e
+        })?;
         *self.server_info.lock().await = init_result.server_info.clone();
 
         tracing::info!(
-            server = %self.name,
-            protocol = %init_result.protocol_version,
-            server_name = ?init_result.server_info.as_ref().map(|s| &s.name),
-            "MCP initialize complete"
+            "[MCP:{}] initialize OK — server_name={:?} protocol={}",
+            self.name,
+            init_result.server_info.as_ref().map(|s| &s.name),
+            init_result.protocol_version
         );
 
         // Send initialized notification (no id — it's a notification)
+        tracing::debug!("[MCP:{}] sending notifications/initialized", self.name);
         self.notify("notifications/initialized", None).await?;
 
         // Discover tools if the server supports them
         if init_result.capabilities.tools.is_some() {
-            let tools_result = self.request("tools/list", None).await?;
-            let tools_list: ToolsListResult = serde_json::from_value(tools_result)?;
-            tracing::info!(
-                server = %self.name,
-                count = tools_list.tools.len(),
-                "discovered MCP tools"
-            );
+            tracing::info!("[MCP:{}] server supports tools — requesting tools/list", self.name);
+            let tools_result = self.request("tools/list", None).await.map_err(|e| {
+                tracing::error!("[MCP:{}] tools/list request failed: {}", self.name, e);
+                e
+            })?;
+            let tools_list: ToolsListResult = serde_json::from_value(tools_result).map_err(|e| {
+                tracing::error!("[MCP:{}] failed to parse tools/list response: {}", self.name, e);
+                e
+            })?;
+            tracing::info!("[MCP:{}] discovered {} tool(s):", self.name, tools_list.tools.len());
+            for t in &tools_list.tools {
+                tracing::info!("[MCP:{}]   - {}", self.name, t.name);
+            }
             *self.tools.lock().await = tools_list.tools;
+        } else {
+            tracing::warn!("[MCP:{}] server does NOT advertise tools capability", self.name);
         }
 
         *self.state.lock().await = McpServerState::Running;
+        self.restart_count.store(0, Ordering::Relaxed);
+        tracing::info!("[MCP:{}] state = Running", self.name);
         Ok(())
     }
 
@@ -320,6 +354,41 @@ impl McpClient {
         *self.tools.lock().await = Vec::new();
         *self.state.lock().await = McpServerState::Stopped;
         Ok(())
+    }
+
+    /// Lightweight health ping — sends a `ping` request and expects `pong`.
+    /// Returns true if the server responded within 5 seconds.
+    pub async fn ping(&self) -> bool {
+        if *self.state.lock().await != McpServerState::Running {
+            return false;
+        }
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            self.request("ping", None),
+        )
+        .await
+        {
+            Ok(Ok(_)) => true,
+            // Some MCP servers don't implement ping — treat "method not found" as alive
+            Ok(Err(e)) if e.to_string().contains("Method not found") || e.to_string().contains("-32601") => true,
+            _ => false,
+        }
+    }
+
+    /// Get and reset the restart count (for exponential backoff).
+    pub fn restart_count(&self) -> u64 {
+        self.restart_count.load(Ordering::Relaxed)
+    }
+
+    /// Increment restart count, returns the backoff delay in seconds (1, 2, 4, 8 … max 30).
+    pub fn increment_restart(&self) -> u64 {
+        let count = self.restart_count.fetch_add(1, Ordering::Relaxed);
+        (1u64 << count).min(30)
+    }
+
+    /// Reset restart count (called after a successful start).
+    pub fn reset_restart_count(&self) {
+        self.restart_count.store(0, Ordering::Relaxed);
     }
 }
 

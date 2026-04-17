@@ -1,0 +1,7 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`MessageBubble structured tool rendering > renders structured news cards with quick actions and metadata 1`] = `
+"<div class="tool-call tool-call-done"><div class="tool-call-header" style="cursor:pointer;user-select:none"><span class="tool-status-icon">✅</span><span class="tool-name">search_news</span><span class="tool-call-args-preview">(query)</span><span class="tool-metric-badge">3 sources</span><span class="tool-metric-badge">88% confidence</span><span class="tool-metric-badge">2h old</span><span class="tool-metric-badge">region match</span><span class="tool-expand">▼</span></div><div class="tool-call-details"><div class="tool-call-params"><strong>Parameters:</strong><pre>{
+  "query": "ai chips"
+}</pre></div><div class="tool-structured-list"><strong>News Results:</strong><article class="tool-result-card"><div class="tool-result-card-title">AI Chip Supply Tightens</div><div class="tool-result-card-meta"><span>Reuters</span><span>2h ago</span><span>High</span><span>2 corroborating reports</span></div><p class="tool-result-card-snippet">Suppliers report growing demand.</p><div class="tool-result-card-actions"><button class="tool-quick-action">Open</button><button class="tool-quick-action">Extract</button><button class="tool-quick-action">Verify</button><button class="tool-quick-action">Refresh</button></div></article></div></div></div>"
+`;

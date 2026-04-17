@@ -64,7 +64,7 @@ struct GetActiveConnections;
     }
 }
 
-pub fn register(reg: &mut ToolRegistry) {
+pub fn register(reg: &ToolRegistry) {
     let tools: Vec<(ToolDef, Arc<dyn ToolHandler>)> = vec![
         // GREEN
         (ToolDef {

@@ -83,6 +83,20 @@ def _load_processors() -> None:
     except ImportError as e:
         logger.warning("Audio processor unavailable: %s", e)
 
+    try:
+        from kria_modules.processors import news as news_proc
+        _processors["news"] = news_proc
+        logger.info("Loaded news processor")
+    except ImportError as e:
+        logger.warning("News processor unavailable: %s", e)
+
+    try:
+        from kria_modules.processors import google as google_proc
+        _processors["google"] = google_proc
+        logger.info("Loaded google processor")
+    except ImportError as e:
+        logger.warning("Google processor unavailable: %s", e)
+
 
 # ── JSON-RPC helpers ────────────────────────────────────────────
 

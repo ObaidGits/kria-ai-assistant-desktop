@@ -129,7 +129,7 @@ struct DeleteKnowledgeItem { rag: Arc<RagEngine> }
     }
 }
 
-pub fn register(reg: &mut ToolRegistry, rag: Arc<RagEngine>) {
+pub fn register(reg: &ToolRegistry, rag: Arc<RagEngine>) {
     let tools: Vec<(ToolDef, Arc<dyn ToolHandler>)> = vec![
         (ToolDef {
             name: "ingest_document_rag".into(), description: "Ingest a document into the knowledge base with chunking and vector embedding for RAG".into(),

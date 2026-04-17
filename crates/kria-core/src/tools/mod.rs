@@ -1,4 +1,5 @@
 pub mod registry;
+pub mod mount_manager;
 pub mod system_info;
 pub mod file_ops;
 pub mod app_lifecycle;
@@ -12,6 +13,9 @@ pub mod documents;
 pub mod communication;
 pub mod interaction;
 pub mod disk;
+pub mod packages;
+pub mod news;
+pub mod google_workspace;
 pub mod scheduler;
 pub mod precognitive;
 pub mod vision;
@@ -22,3 +26,4 @@ pub mod proactive;
 pub mod i18n;
 
 pub use registry::{ToolRegistry, ToolDef, ToolHandler};
+pub use mount_manager::ToolMountManager;

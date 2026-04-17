@@ -108,7 +108,7 @@ struct KillProcess;
     }
 }
 
-pub fn register(reg: &mut ToolRegistry) {
+pub fn register(reg: &ToolRegistry) {
     let tools: Vec<(ToolDef, Arc<dyn ToolHandler>)> = vec![
         (ToolDef {
             name: "open_application".into(), description: "Open/launch an application".into(),

@@ -1,4 +1,4 @@
-import { Component, Show, For, createSignal, onMount, onCleanup } from "solid-js";
+import { Component, Show, For, createSignal, createMemo, onMount, onCleanup } from "solid-js";
 import { appStore } from "./stores/app";
 import ChatView from "./components/ChatView";
 import SessionSidebar from "./components/SessionSidebar";
@@ -15,9 +15,10 @@ interface Toast {
 let toastId = 0;
 
 export function addToast(message: string, type: Toast["type"] = "info") {
-  setToasts((prev) => [...prev, { id: ++toastId, message, type }]);
+  const id = ++toastId;
+  setToasts((prev) => [...prev, { id, message, type }]);
   setTimeout(() => {
-    setToasts((prev) => prev.filter((t) => t.id !== toastId));
+    setToasts((prev) => prev.filter((t) => t.id !== id));
   }, 4000);
 }
 
@@ -26,6 +27,21 @@ const [toasts, setToasts] = createSignal<Toast[]>([]);
 const App: Component = () => {
   const { showSettings, showHitl, voiceActive, setShowSettings } = appStore;
   const [showShortcuts, setShowShortcuts] = createSignal(false);
+
+  const assistantStatus = createMemo(() => appStore.assistantStatus());
+  const connectedMcpServers = createMemo(
+    () => appStore.mcpServers().filter((server) => server.enabled).length
+  );
+  const statusDotClass = createMemo(() => {
+    const state = assistantStatus().state;
+    return state === "ready"
+      ? "status-dot"
+      : state === "warming"
+      ? "status-dot warming"
+      : state === "degraded"
+      ? "status-dot degraded"
+      : "status-dot disconnected";
+  });
 
   const shortcuts: { key: string; desc: string }[] = [
     { key: "Ctrl+,", desc: "Open settings" },
@@ -66,6 +82,9 @@ const App: Component = () => {
 
   onMount(() => {
     document.addEventListener("keydown", handleGlobalKeydown);
+    appStore.loadHealth();
+    appStore.loadMcpServers();
+    appStore.loadAlerts();
   });
 
   onCleanup(() => {
@@ -77,11 +96,32 @@ const App: Component = () => {
       <div class="app-layout">
         <SessionSidebar />
         <main class="main-content">
+          <div class="assistant-header">
+            <div>
+              <div class="assistant-header-kicker">Adaptive Workspace Assistant</div>
+              <h1>KRIA Command Center</h1>
+              <p>{assistantStatus().detail}</p>
+            </div>
+            <div class="assistant-header-chips">
+              <div class="status-pill">
+                <span class={statusDotClass()} />
+                <span>{assistantStatus().label}</span>
+              </div>
+              <div class="status-pill subtle">{connectedMcpServers()} MCP online</div>
+              <div class="status-pill subtle">{appStore.alerts().length} active alerts</div>
+            </div>
+          </div>
           <ChatView />
           <div class="status-bar">
             <div class="status-item">
-              <span class="status-dot" />
-              <span>LLM Ready</span>
+              <span class={statusDotClass()} />
+              <span>{assistantStatus().label}</span>
+            </div>
+            <div class="status-item">
+              <span>Core: {assistantStatus().detail}</span>
+            </div>
+            <div class="status-item">
+              <span>MCP: {connectedMcpServers()} online</span>
             </div>
             <div class="status-item">
               <span>{appStore.theme() === "dark" ? "🌙" : "☀️"}</span>

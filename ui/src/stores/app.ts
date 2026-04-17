@@ -1,6 +1,8 @@
 import { createSignal } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import hljsDarkThemeUrl from "highlight.js/styles/github-dark.css?url";
+import hljsLightThemeUrl from "highlight.js/styles/github.css?url";
 
 // --- Signals ---
 const [messages, setMessages] = createSignal<Message[]>([]);
@@ -16,7 +18,13 @@ const [voiceLiveTranscript, setVoiceLiveTranscript] = createSignal("");
 const [inputText, setInputText] = createSignal("");
 const [settings, setSettings] = createSignal<Record<string, any> | null>(null);
 const [models, setModels] = createSignal<any[]>([]);
-const [theme, setTheme] = createSignal<"dark" | "light">("dark");
+const resolveInitialTheme = (): "dark" | "light" => {
+  if (typeof window === "undefined") return "dark";
+  const saved = window.localStorage.getItem("kria_theme");
+  return saved === "light" ? "light" : "dark";
+};
+
+const [theme, setTheme] = createSignal<"dark" | "light">(resolveInitialTheme());
 const [mcpServers, setMcpServers] = createSignal<McpServer[]>([]);
 const [healthInfo, setHealthInfo] = createSignal<Record<string, any> | null>(null);
 const [scheduledTasks, setScheduledTasks] = createSignal<ScheduledTask[]>([]);
@@ -25,6 +33,24 @@ const [workflows, setWorkflows] = createSignal<WorkflowInfo[]>([]);
 const [hardwareInfo, setHardwareInfo] = createSignal<HardwareInfoData | null>(null);
 const [knowledgeBase, setKnowledgeBase] = createSignal<KnowledgeDoc[]>([]);
 const [alerts, setAlerts] = createSignal<ProactiveAlert[]>([]);
+
+// Telegram integration
+export interface TelegramConfig {
+  enabled: boolean;
+  bot_token: string;
+  allowed_chat_ids: string;
+  auto_start: boolean;
+}
+
+export interface TelegramBotInfo {
+  valid: boolean;
+  bot_name: string;
+  bot_username: string;
+  bot_id: number;
+}
+
+const [telegramConfig, setTelegramConfig] = createSignal<TelegramConfig | null>(null);
+const [telegramBotInfo, setTelegramBotInfo] = createSignal<TelegramBotInfo | null>(null);
 
 // --- Types ---
 export interface Message {
@@ -40,8 +66,16 @@ export interface Message {
 export interface ToolCall {
   name: string;
   args: Record<string, unknown>;
-  result?: string;
+  result?: unknown;
+  metadata?: ToolResultMetadata;
   status: "pending" | "running" | "done" | "error" | "denied";
+}
+
+export interface ToolResultMetadata {
+  confidence?: number;
+  sourceCount?: number;
+  freshnessAgeHours?: number | null;
+  regionMatch?: boolean | null;
 }
 
 export interface Session {
@@ -122,6 +156,12 @@ export interface ProactiveAlert {
   timestamp: string;
 }
 
+export interface AssistantStatus {
+  state: "ready" | "warming" | "degraded" | "offline";
+  label: string;
+  detail: string;
+}
+
 // --- Actions ---
 async function sendMessage(text: string) {
   if (!text.trim()) return;
@@ -154,8 +194,18 @@ async function sendMessage(text: string) {
   }
 }
 
+function uint8ToBase64(bytes: Uint8Array): string {
+  const chunkSize = 0x8000;
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
+}
+
 async function sendImageMessage(imageData: Uint8Array, mimeType: string, text?: string) {
-  const b64 = btoa(String.fromCharCode(...imageData));
+  const b64 = uint8ToBase64(imageData);
   const dataUrl = `data:${mimeType};base64,${b64}`;
 
   const userMsg: Message = {
@@ -275,6 +325,52 @@ async function loadHealth() {
   }
 }
 
+function assistantStatus(): AssistantStatus {
+  const info = healthInfo();
+  if (!info) {
+    return {
+      state: "warming",
+      label: "Booting assistant",
+      detail: "Running initial health checks",
+    };
+  }
+
+  const services = Array.isArray(info.services) ? info.services : [];
+  const modelRouter = services.find((svc: any) => svc?.name === "model_router");
+  const statusRaw = String(modelRouter?.status ?? info.status ?? "unknown").toLowerCase();
+  const message = String(modelRouter?.message ?? "").trim();
+
+  if (statusRaw === "healthy") {
+    return {
+      state: "ready",
+      label: "Assistant ready",
+      detail: message || "Model routing online",
+    };
+  }
+
+  if (statusRaw === "starting" || statusRaw === "unknown") {
+    return {
+      state: "warming",
+      label: "Assistant warming up",
+      detail: message || "Loading model runtime",
+    };
+  }
+
+  if (statusRaw === "degraded") {
+    return {
+      state: "degraded",
+      label: "Limited availability",
+      detail: message || "Model service degraded",
+    };
+  }
+
+  return {
+    state: "offline",
+    label: "Assistant unavailable",
+    detail: message || "Model service is offline",
+  };
+}
+
 async function loadScheduledTasks() {
   try {
     const result = await invoke<ScheduledTask[]>("list_scheduled_tasks");
@@ -369,6 +465,90 @@ async function loadAlerts() {
   }
 }
 
+// --- Telegram management ---
+async function loadTelegramConfig() {
+  try {
+    const result = await invoke<TelegramConfig>("get_telegram_config");
+    setTelegramConfig(result);
+  } catch (e) {
+    console.error("Failed to load telegram config:", e);
+  }
+}
+
+async function saveTelegramConfig(config: TelegramConfig) {
+  try {
+    await invoke("update_telegram_config", {
+      enabled: config.enabled,
+      botToken: config.bot_token,
+      allowedChatIds: config.allowed_chat_ids,
+      autoStart: config.auto_start,
+    });
+    setTelegramConfig(config);
+  } catch (e) {
+    console.error("Failed to save telegram config:", e);
+    throw e;
+  }
+}
+
+async function testTelegramConnection(botToken: string): Promise<TelegramBotInfo> {
+  const result = await invoke<TelegramBotInfo>("test_telegram_connection", { botToken });
+  setTelegramBotInfo(result);
+  return result;
+}
+
+async function startTelegramMcp() {
+  try {
+    const result = await invoke<{ status: string; message: string }>("start_telegram_mcp");
+    await loadMcpServers();
+    return result;
+  } catch (e) {
+    console.error("Failed to start telegram MCP:", e);
+    throw e;
+  }
+}
+
+async function stopTelegramMcp() {
+  try {
+    await invoke("stop_telegram_mcp");
+    await loadMcpServers();
+    await loadTelegramConfig();
+  } catch (e) {
+    console.error("Failed to stop telegram MCP:", e);
+    throw e;
+  }
+}
+
+// --- Google Workspace ---
+export interface GoogleWorkspaceStatus {
+  connected: boolean;
+  account: string;
+  credentials_configured: boolean;
+}
+
+const [googleStatus, setGoogleStatus] = createSignal<GoogleWorkspaceStatus | null>(null);
+
+async function loadGoogleStatus(account?: string) {
+  try {
+    const result = await invoke<GoogleWorkspaceStatus>("get_google_workspace_status", { account: account ?? null });
+    setGoogleStatus(result);
+  } catch (e) {
+    console.error("Failed to load Google status:", e);
+  }
+}
+
+async function connectGoogle(account?: string): Promise<{ status: string; message: string; account: string }> {
+  const result = await invoke<{ status: string; message: string; account: string }>(
+    "connect_google_workspace",
+    { account: account ?? null }
+  );
+  return result;
+}
+
+async function disconnectGoogle(account?: string) {
+  await invoke("disconnect_google_workspace", { account: account ?? null });
+  await loadGoogleStatus(account);
+}
+
 // --- Settings management ---
 async function loadSettings() {
   try {
@@ -408,7 +588,32 @@ async function loadModels() {
 
 function applyTheme(t: "dark" | "light") {
   setTheme(t);
-  document.documentElement.setAttribute("data-theme", t);
+  if (typeof window !== "undefined") {
+    window.localStorage.setItem("kria_theme", t);
+  }
+  if (typeof document !== "undefined") {
+    document.documentElement.setAttribute("data-theme", t);
+  }
+  setHighlightThemeStylesheet(t);
+}
+
+function setHighlightThemeStylesheet(t: "dark" | "light") {
+  if (typeof document === "undefined") return;
+
+  const linkId = "kria-hljs-theme";
+  const href = t === "light" ? hljsLightThemeUrl : hljsDarkThemeUrl;
+  const existing = document.getElementById(linkId) as HTMLLinkElement | null;
+
+  if (existing) {
+    existing.href = href;
+    return;
+  }
+
+  const link = document.createElement("link");
+  link.id = linkId;
+  link.rel = "stylesheet";
+  link.href = href;
+  document.head.appendChild(link);
 }
 
 // --- Session management ---
@@ -504,10 +709,14 @@ function initListeners() {
     });
   });
 
-  listen("agent:thinking", () => setIsThinking(true));
+  listen<{ status?: string; plan?: string }>("agent:thinking", (event) => {
+    setIsThinking(true);
+  });
+
   listen("agent:done", () => {
     setIsThinking(false);
     loadSessions(); // Refresh sidebar after response completes
+    loadHealth();
   });
 
   listen<HitlRequest>("agent:approval_required", (event) => {
@@ -542,14 +751,36 @@ function initListeners() {
   });
 
   // Tool result — update the matching tool call status and result
-  listen<{ name: string; result: string; success: boolean }>("agent:tool_result", (event) => {
-    const { name, result, success } = event.payload;
+  listen<{
+    name: string;
+    result: unknown;
+    success: boolean;
+    metadata?: {
+      confidence?: number;
+      source_count?: number;
+      freshness_age_hours?: number | null;
+      region_match?: boolean | null;
+    } | null;
+  }>("agent:tool_result", (event) => {
+    const { name, result, success, metadata } = event.payload;
     setMessages((prev) => {
       const last = prev[prev.length - 1];
       if (last?.role === "assistant" && last.toolCalls?.length) {
         const updated = last.toolCalls.map((tc) => {
           if (tc.name === name && tc.status === "running") {
-            return { ...tc, status: (success ? "done" : "error") as ToolCall["status"], result };
+            return {
+              ...tc,
+              status: (success ? "done" : "error") as ToolCall["status"],
+              result,
+              metadata: metadata
+                ? {
+                    confidence: metadata.confidence,
+                    sourceCount: metadata.source_count,
+                    freshnessAgeHours: metadata.freshness_age_hours,
+                    regionMatch: metadata.region_match,
+                  }
+                : tc.metadata,
+            };
           }
           return tc;
         });
@@ -611,10 +842,17 @@ function initListeners() {
 
 // Initialize listeners on import
 initListeners();
+// Initialize theme before first render to avoid color/theme flash.
+applyTheme(theme());
 // Load existing sessions on startup
 loadSessions();
 // Load settings on startup
 loadSettings();
+// Prime and refresh system health for UI status indicators.
+loadHealth();
+setInterval(() => {
+  loadHealth();
+}, 12000);
 
 // --- Export store ---
 export const appStore = {
@@ -655,6 +893,7 @@ export const appStore = {
   toggleMcpServer,
   healthInfo,
   loadHealth,
+  assistantStatus,
   scheduledTasks,
   loadScheduledTasks,
   addScheduledTask,
@@ -671,4 +910,15 @@ export const appStore = {
   loadKnowledgeBase,
   alerts,
   loadAlerts,
+  telegramConfig,
+  telegramBotInfo,
+  loadTelegramConfig,
+  saveTelegramConfig,
+  testTelegramConnection,
+  startTelegramMcp,
+  stopTelegramMcp,
+  googleStatus,
+  loadGoogleStatus,
+  connectGoogle,
+  disconnectGoogle,
 };

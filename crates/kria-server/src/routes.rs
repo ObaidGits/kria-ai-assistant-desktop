@@ -28,17 +28,31 @@ async fn health() -> Json<serde_json::Value> {
 struct ChatRequest {
     message: String,
     session_id: Option<String>,
+    /// Source of the message (e.g. "telegram", "web")
+    #[serde(default)]
+    source: Option<String>,
+    /// Telegram chat ID (when source = "telegram")
+    #[serde(default)]
+    chat_id: Option<i64>,
+    /// Sender name
+    #[serde(default)]
+    from_user: Option<String>,
 }
 
 async fn chat(
     State(_state): State<Arc<ServerState>>,
     Json(req): Json<ChatRequest>,
 ) -> Json<serde_json::Value> {
-    // Placeholder: in production, this would stream via SSE or redirect to WebSocket
+    // TODO: In production, this routes to the AgentLoop and returns the response.
+    // For now, return a structured response that the Telegram MCP server can parse.
     Json(serde_json::json!({
         "status": "received",
         "message": req.message,
+        "source": req.source.unwrap_or_else(|| "api".to_string()),
+        "chat_id": req.chat_id,
+        "from_user": req.from_user,
         "session_id": req.session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        "reply": format!("I received your message: \"{}\"", req.message),
     }))
 }
 

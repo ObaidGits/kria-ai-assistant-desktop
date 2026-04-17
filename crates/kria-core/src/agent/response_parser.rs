@@ -8,7 +8,7 @@ pub struct ParsedToolCall {
     pub arguments: serde_json::Value,
 }
 
-// ─── Tool call regexes (4 patterns, matching Python's parser) ───
+// ─── Tool call regexes (7 patterns) ───
 
 /// Pattern 1: XML-style <tool_call>{"name": ..., "arguments": ...}</tool_call>
 static TOOL_CALL_RE: Lazy<Regex> = Lazy::new(|| {
@@ -28,6 +28,13 @@ static RAW_JSON_TOOL_RE: Lazy<Regex> = Lazy::new(|| {
 /// Pattern 4: Key-value style tool_name: key1=val1, key2=val2
 static KV_TOOL_CALL_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"^(\w+):\s*(.+)$").unwrap()
+});
+
+/// Pattern 7: Python-style positional call  tool_name("value")  or  tool_name(param="value")
+/// Last-resort fallback — only matched when all other patterns fail.
+/// The caller must supply a set of known tool names to prevent false positives.
+static PYTHON_CALL_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?m)^[ \t]*(\w+)\(([^)]*)\)[ \t]*$"#).unwrap()
 });
 
 /// Parse all tool calls from LLM output text.
@@ -91,6 +98,55 @@ pub fn parse_tool_calls(text: &str) -> Vec<ParsedToolCall> {
     }
 
     calls
+}
+
+/// Parse all tool calls from LLM output, using a set of known tool names to enable
+/// the Pattern 7 Python-style fallback for single-required-param tools.
+/// Pass an empty slice if you don't have registry access (Pattern 7 won't fire).
+pub fn parse_tool_calls_with_known(
+    text: &str,
+    known_tools: &[(&str, &str)], // (tool_name, required_param_name) — single-param tools only
+) -> Vec<ParsedToolCall> {
+    // Try Patterns 1-4 first (canonical path)
+    let calls = parse_tool_calls(text);
+    if !calls.is_empty() {
+        return calls;
+    }
+
+    // Pattern 7: Python-style fallback
+    let mut py_calls = Vec::new();
+    for cap in PYTHON_CALL_RE.captures_iter(text) {
+        let name = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+        let args_raw = cap.get(2).map(|m| m.as_str().trim()).unwrap_or("");
+
+        // Only fire if name is a registered single-required-param tool
+        let Some((_tool_name, param_name)) = known_tools.iter().find(|(n, _)| *n == name) else {
+            continue;
+        };
+
+        // Parse args_raw as either positional string literal or key=value
+        let arguments = if let Some((key, val)) = args_raw.split_once('=') {
+            // key="value" or key='value' style
+            let k = key.trim().to_string();
+            let v = val.trim().trim_matches('"').trim_matches('\'').to_string();
+            serde_json::json!({ k: v })
+        } else {
+            // positional: just a quoted string
+            let v = args_raw.trim_matches('"').trim_matches('\'').to_string();
+            if v.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::json!({ *param_name: v })
+            }
+        };
+
+        py_calls.push(ParsedToolCall {
+            name: name.to_string(),
+            arguments,
+        });
+    }
+
+    py_calls
 }
 
 /// Parse key=value comma-separated arguments into JSON.

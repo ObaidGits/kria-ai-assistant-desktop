@@ -9,6 +9,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use tokio::sync::Mutex;
+
 use crate::config::McpServerConfig;
 use crate::safety::RiskLevel;
 use crate::tools::{ToolDef, ToolHandler, ToolRegistry};
@@ -16,10 +18,15 @@ use super::client::{McpClient, McpServerState};
 use super::protocol::McpToolDef;
 use super::tool_bridge::McpToolHandler;
 
+/// Max consecutive ping failures before a restart attempt.
+const MAX_PING_FAILURES: u64 = 3;
+
 /// Manages all configured MCP servers.
 pub struct McpServerManager {
     clients: HashMap<String, Arc<McpClient>>,
     configs: Vec<McpServerConfig>,
+    /// Per-server consecutive ping failure count.
+    ping_failures: HashMap<String, u64>,
 }
 
 impl McpServerManager {
@@ -27,38 +34,101 @@ impl McpServerManager {
         Self {
             clients: HashMap::new(),
             configs,
+            ping_failures: HashMap::new(),
         }
     }
 
     /// Start all enabled MCP servers and register their tools.
-    pub async fn start_all(&mut self, registry: &mut ToolRegistry) {
+    /// Start all enabled MCP servers in parallel and register their tools.
+    pub async fn start_all(&mut self, registry: &ToolRegistry) {
         let configs = self.configs.clone();
+        let total = configs.len();
+        let enabled: Vec<_> = configs.iter().filter(|c| c.enabled).cloned().collect();
+        tracing::info!("[MCP] start_all: {} configured, {} enabled — launching in parallel", total, enabled.len());
+
         for config in &configs {
             if !config.enabled {
-                tracing::info!(server = %config.name, "MCP server disabled, skipping");
-                continue;
-            }
-            if let Err(e) = self.start_server(config, registry).await {
-                tracing::error!(server = %config.name, error = %e, "failed to start MCP server");
+                tracing::info!("[MCP] server '{}' is disabled — skipping", config.name);
             }
         }
+
+        // Launch all enabled servers concurrently
+        let handles: Vec<_> = enabled.iter().map(|config| {
+            let config = config.clone();
+            tokio::spawn(async move {
+                tracing::info!("[MCP] starting server '{}' (command='{}' args={:?})", config.name, config.command, config.args);
+                let client = Arc::new(McpClient::new(&config.name));
+                match client.start(&config.command, &config.args, &config.env).await {
+                    Ok(()) => {
+                        let tools = client.tools().await;
+                        tracing::info!("[MCP] server '{}' started — {} tool(s) discovered", config.name, tools.len());
+                        Ok((config, client, tools))
+                    }
+                    Err(e) => {
+                        tracing::error!("[MCP] server '{}' FAILED to start: {}", config.name, e);
+                        Err(config.name.clone())
+                    }
+                }
+            })
+        }).collect();
+
+        // Collect results and register tools
+        for handle in handles {
+            match handle.await {
+                Ok(Ok((config, client, tools))) => {
+                    for tool_def in &tools {
+                        let override_tier = config.tool_overrides.get(&tool_def.name)
+                            .map(|s| s.as_str())
+                            .unwrap_or("(default)");
+                        tracing::info!("[MCP]   tool='{}' override={}", tool_def.name, override_tier);
+                        register_mcp_tool(
+                            registry,
+                            &client,
+                            &config.name,
+                            tool_def,
+                            &config.trust_level,
+                            &config.tool_overrides,
+                        );
+                    }
+                    tracing::info!(
+                        "[MCP] server '{}' ready: {} tools registered (trust_level={})",
+                        config.name, tools.len(), config.trust_level
+                    );
+                    self.clients.insert(config.name.clone(), client);
+                }
+                Ok(Err(name)) => {
+                    tracing::error!("[MCP] server '{}' failed — skipped", name);
+                }
+                Err(e) => {
+                    tracing::error!("[MCP] server spawn panicked: {}", e);
+                }
+            }
+        }
+        tracing::info!("[MCP] start_all complete — {} server(s) running", self.clients.len());
     }
 
     /// Start a single MCP server and register its tools.
     async fn start_server(
         &mut self,
         config: &McpServerConfig,
-        registry: &mut ToolRegistry,
+        registry: &ToolRegistry,
     ) -> anyhow::Result<()> {
+        tracing::debug!("[MCP] creating McpClient for '{}'", config.name);
         let client = Arc::new(McpClient::new(&config.name));
 
+        tracing::debug!("[MCP] calling client.start() for '{}'", config.name);
         client
             .start(&config.command, &config.args, &config.env)
             .await?;
 
         // Register each discovered tool with a prefixed name
         let tools = client.tools().await;
+        tracing::info!("[MCP] server '{}' advertises {} tool(s):", config.name, tools.len());
         for tool_def in &tools {
+            let override_tier = config.tool_overrides.get(&tool_def.name)
+                .map(|s| s.as_str())
+                .unwrap_or("(default)");
+            tracing::info!("[MCP]   tool='{}' override={}", tool_def.name, override_tier);
             register_mcp_tool(
                 registry,
                 &client,
@@ -70,9 +140,8 @@ impl McpServerManager {
         }
 
         tracing::info!(
-            server = %config.name,
-            tools = tools.len(),
-            "MCP server started and tools registered"
+            "[MCP] server '{}' ready: {} tools registered (trust_level={})",
+            config.name, tools.len(), config.trust_level
         );
 
         self.clients.insert(config.name.clone(), client);
@@ -131,7 +200,7 @@ impl McpServerManager {
     pub async fn restart_server(
         &mut self,
         name: &str,
-        registry: &mut ToolRegistry,
+        registry: &ToolRegistry,
     ) -> anyhow::Result<()> {
         self.stop_server(name).await?;
         let config = self
@@ -141,6 +210,64 @@ impl McpServerManager {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("unknown MCP server: {}", name))?;
         self.start_server(&config, registry).await
+    }
+
+    /// Run one health-check cycle: ping every running server, restart failures.
+    pub async fn health_check_cycle(&mut self, registry: &ToolRegistry) {
+        let names: Vec<String> = self.clients.keys().cloned().collect();
+        for name in names {
+            let alive = if let Some(client) = self.clients.get(&name) {
+                if client.state().await == McpServerState::Running {
+                    client.ping().await
+                } else {
+                    false
+                }
+            } else {
+                continue;
+            };
+
+            if alive {
+                self.ping_failures.remove(&name);
+            } else {
+                let count = self.ping_failures.entry(name.clone()).or_insert(0);
+                *count += 1;
+                tracing::warn!(server = %name, failures = *count, "MCP server ping failed");
+
+                if *count >= MAX_PING_FAILURES {
+                    tracing::error!(server = %name, "MCP server unresponsive — restarting");
+
+                    // Exponential backoff based on the client's restart count
+                    let backoff_secs = self.clients.get(&name)
+                        .map(|c| c.increment_restart())
+                        .unwrap_or(1);
+                    tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+
+                    self.ping_failures.remove(&name);
+                    if let Err(e) = self.restart_server(&name, registry).await {
+                        tracing::error!(server = %name, error = %e, "MCP server restart failed");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Spawn a background task that pings all MCP servers every `interval` seconds.
+    /// Returns a JoinHandle that can be aborted on shutdown.
+    pub fn spawn_health_heartbeat(
+        manager: Arc<Mutex<McpServerManager>>,
+        registry: Arc<ToolRegistry>,
+        interval_secs: u64,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            // Skip the first immediate tick (servers just started)
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let mut mgr = manager.lock().await;
+                mgr.health_check_cycle(&registry).await;
+            }
+        })
     }
 }
 
@@ -158,7 +285,7 @@ pub struct McpServerStatus {
 // ── Helper: register a single MCP tool in the KRIA registry ─────────
 
 fn register_mcp_tool(
-    registry: &mut ToolRegistry,
+    registry: &ToolRegistry,
     client: &Arc<McpClient>,
     server_name: &str,
     mcp_tool: &McpToolDef,

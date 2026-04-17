@@ -10,6 +10,7 @@
     "beforeBuildCommand": "npm run build --prefix ../ui"
   },
   "app": {
+    "enableGTKAppId": true,
     "windows": [
       {
         "title": "K.R.I.A.",
@@ -28,7 +29,7 @@
     },
     "trayIcon": {
       "iconPath": "icons/icon.png",
-      "iconAsTemplate": true
+      "iconAsTemplate": false
     }
   },
   "bundle": {

@@ -101,7 +101,7 @@ impl ToolHandler for AudioPreprocessHandler {
 // ── Registration ────────────────────────────────────────────
 
 /// Register all pre-cognitive tools that delegate to the Python sidecar.
-pub fn register(registry: &mut ToolRegistry, sidecar: Arc<SidecarBridge>) {
+pub fn register(registry: &ToolRegistry, sidecar: Arc<SidecarBridge>) {
     let handle = SidecarHandle(sidecar);
 
     // image.analyze

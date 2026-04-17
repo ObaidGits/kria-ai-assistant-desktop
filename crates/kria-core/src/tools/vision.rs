@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use crate::infra::ToolResult;
 use crate::safety::RiskLevel;
@@ -8,6 +8,129 @@ use crate::tools::registry::{ToolRegistry, ToolDef, ToolHandler, ParamDef};
 
 fn param(name: &str, ty: &str, desc: &str, required: bool) -> ParamDef {
     ParamDef { name: name.into(), param_type: ty.into(), description: desc.into(), required, default: None }
+}
+
+fn trim_trailing_path_noise(input: &str) -> String {
+    let mut s = input.trim().to_string();
+    while let Some(ch) = s.chars().last() {
+        if matches!(ch, ',' | ';' | '.' | '!' | '?') {
+            s.pop();
+            continue;
+        }
+        break;
+    }
+    s
+}
+
+fn decode_common_file_uri_escapes(input: &str) -> String {
+    input
+        .replace("%20", " ")
+        .replace("%23", "#")
+        .replace("%5B", "[")
+        .replace("%5D", "]")
+        .replace("%28", "(")
+        .replace("%29", ")")
+}
+
+fn normalize_input_path(raw: &str) -> String {
+    let mut s = raw
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim_matches('`')
+        .to_string();
+
+    s = trim_trailing_path_noise(&s);
+
+    // Handle markdown link-like wrappers: [label](path)
+    if s.ends_with(')') {
+        if let (Some(open), Some(close)) = (s.rfind('('), s.rfind(')')) {
+            if open < close {
+                let candidate = s[open + 1..close].trim();
+                if !candidate.is_empty() {
+                    s = candidate.to_string();
+                }
+            }
+        }
+    }
+
+    // Handle explicit image placeholder wrappers: [image: path]
+    if let Some(inner) = s.strip_prefix("[image:")
+        .and_then(|v| v.strip_suffix(']'))
+    {
+        s = inner.trim().to_string();
+    }
+
+    if let Some(stripped) = s.strip_prefix("file://") {
+        let no_localhost = stripped.strip_prefix("localhost/").unwrap_or(stripped);
+        s = decode_common_file_uri_escapes(no_localhost);
+    }
+
+    // Support "path: /foo/bar.png" style values.
+    if let Some(stripped) = s.strip_prefix("path:") {
+        s = stripped.trim().to_string();
+    }
+
+    // Use first line when model outputs extra text after path.
+    if let Some(first_line) = s.lines().next() {
+        s = first_line.trim().to_string();
+    }
+
+    // Expand ~/ for local home paths.
+    if s == "~" {
+        if let Some(home) = dirs::home_dir() {
+            s = home.to_string_lossy().to_string();
+        }
+    } else if let Some(rest) = s.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            s = home.join(rest).to_string_lossy().to_string();
+        }
+    }
+
+    trim_trailing_path_noise(&s)
+}
+
+fn resolve_image_path(raw: &str) -> Option<PathBuf> {
+    let normalized = normalize_input_path(raw);
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    let given = PathBuf::from(&normalized);
+    candidates.push(given.clone());
+
+    let kria_paths = crate::platform::paths::KriaPaths::resolve();
+    let attachments_dir = kria_paths.data_dir.join("attachments");
+
+    if !given.is_absolute() {
+        candidates.push(kria_paths.data_dir.join(&normalized));
+        candidates.push(attachments_dir.join(&normalized));
+
+        if let Some(stripped) = normalized.strip_prefix("attachments/") {
+            candidates.push(attachments_dir.join(stripped));
+        }
+    }
+
+    for candidate in &candidates {
+        if candidate.exists() {
+            return Some(candidate.clone());
+        }
+    }
+
+    // Final fallback: if only a filename was provided, look for exact filename in attachments.
+    if let Some(file_name) = Path::new(&normalized).file_name() {
+        if let Ok(entries) = std::fs::read_dir(&attachments_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() && path.file_name() == Some(file_name) {
+                    return Some(path);
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// Wrapper for optional sidecar access.
@@ -37,26 +160,33 @@ impl VisionSidecar {
 struct OcrImage { sidecar: Arc<VisionSidecar> }
 #[async_trait] impl ToolHandler for OcrImage {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
-        let path = match params["path"].as_str() {
+        let path_input = match params["path"].as_str() {
             Some(p) => p,
             None => return ToolResult::err("missing required parameter: path"),
         };
-        if !Path::new(path).exists() {
-            return ToolResult::err(format!("file not found: {path}"));
-        }
+
+        let resolved = match resolve_image_path(path_input) {
+            Some(p) => p,
+            None => {
+                return ToolResult::err(format!(
+                    "file not found: {path_input}. Provide an absolute path or an attachment filename from ~/.kria/attachments"
+                ));
+            }
+        };
+        let resolved_str = resolved.to_string_lossy().to_string();
 
         // Try sidecar OCR first (pytesseract/easyocr)
-        if let Some(text) = self.sidecar.try_ocr(path).await {
+        if let Some(text) = self.sidecar.try_ocr(&resolved_str).await {
             return ToolResult::ok(serde_json::json!({
                 "text": text,
                 "source": "sidecar",
-                "path": path,
+                "path": resolved_str,
             }));
         }
 
         // Fallback: tesseract CLI
         let output = tokio::process::Command::new("tesseract")
-            .args([path, "stdout"])
+            .args([resolved_str.as_str(), "stdout"])
             .output()
             .await;
         match output {
@@ -65,7 +195,7 @@ struct OcrImage { sidecar: Arc<VisionSidecar> }
                 ToolResult::ok(serde_json::json!({
                     "text": text.trim(),
                     "source": "tesseract_cli",
-                    "path": path,
+                    "path": resolved_str,
                 }))
             }
             Ok(o) => ToolResult::err(format!("tesseract failed: {}", String::from_utf8_lossy(&o.stderr))),
@@ -77,16 +207,23 @@ struct OcrImage { sidecar: Arc<VisionSidecar> }
 struct AnalyzeImage { sidecar: Arc<VisionSidecar> }
 #[async_trait] impl ToolHandler for AnalyzeImage {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
-        let path = match params["path"].as_str() {
+        let path_input = match params["path"].as_str() {
             Some(p) => p,
             None => return ToolResult::err("missing required parameter: path"),
         };
-        if !Path::new(path).exists() {
-            return ToolResult::err(format!("file not found: {path}"));
-        }
+
+        let resolved = match resolve_image_path(path_input) {
+            Some(p) => p,
+            None => {
+                return ToolResult::err(format!(
+                    "file not found: {path_input}. Provide an absolute path or an attachment filename from ~/.kria/attachments"
+                ));
+            }
+        };
+        let resolved_str = resolved.to_string_lossy().to_string();
 
         // Get image metadata from Rust
-        let info = match crate::preprocessing::image::ImageProcessor::info(Path::new(path)) {
+        let info = match crate::preprocessing::image::ImageProcessor::info(&resolved) {
             Ok(i) => serde_json::json!({
                 "width": i.width,
                 "height": i.height,
@@ -102,8 +239,9 @@ struct AnalyzeImage { sidecar: Arc<VisionSidecar> }
             .unwrap_or_else(|| vec!["metadata", "ocr"]);
 
         let ops_refs: Vec<&str> = operations.iter().map(|s| s.as_ref()).collect();
-        if let Some(analysis) = self.sidecar.try_analyze(path, &ops_refs).await {
+        if let Some(analysis) = self.sidecar.try_analyze(&resolved_str, &ops_refs).await {
             return ToolResult::ok(serde_json::json!({
+                "path": resolved_str,
                 "metadata": info,
                 "analysis": analysis,
                 "source": "sidecar",
@@ -112,13 +250,14 @@ struct AnalyzeImage { sidecar: Arc<VisionSidecar> }
 
         // Fallback: metadata only + optional tesseract
         let mut result = serde_json::json!({
+            "path": resolved_str,
             "metadata": info,
             "source": "native",
         });
 
         if operations.contains(&"ocr") {
             let output = tokio::process::Command::new("tesseract")
-                .args([path, "stdout"])
+                .args([resolved_str.as_str(), "stdout"])
                 .output()
                 .await;
             if let Ok(o) = output {
@@ -192,7 +331,7 @@ struct ScreenshotAnalyze { sidecar: Arc<VisionSidecar> }
     }
 }
 
-pub fn register(reg: &mut ToolRegistry, sidecar: Option<Arc<SidecarBridge>>) {
+pub fn register(reg: &ToolRegistry, sidecar: Option<Arc<SidecarBridge>>) {
     let vision_sidecar = Arc::new(VisionSidecar(
         sidecar.map(|s| Arc::new(tokio::sync::Mutex::new(s)))
     ));
@@ -205,7 +344,7 @@ pub fn register(reg: &mut ToolRegistry, sidecar: Option<Arc<SidecarBridge>>) {
             default_tier: RiskLevel::Green,
             min_tier: "standard",
             parameters: vec![
-                param("path", "string", "Path to the image file", true),
+                param("path", "string", "Path to the image file (absolute path, file:// URI, or attachment filename)", true),
             ],
         }, Arc::new(OcrImage { sidecar: vision_sidecar.clone() })),
         (ToolDef {
@@ -215,7 +354,7 @@ pub fn register(reg: &mut ToolRegistry, sidecar: Option<Arc<SidecarBridge>>) {
             default_tier: RiskLevel::Green,
             min_tier: "standard",
             parameters: vec![
-                param("path", "string", "Path to the image file", true),
+                param("path", "string", "Path to the image file (absolute path, file:// URI, or attachment filename)", true),
                 param("operations", "array", "Operations to perform (default: metadata, ocr)", false),
             ],
         }, Arc::new(AnalyzeImage { sidecar: vision_sidecar.clone() })),

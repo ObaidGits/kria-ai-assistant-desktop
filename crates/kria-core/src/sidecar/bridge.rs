@@ -47,24 +47,95 @@ impl SidecarBridge {
         let python = if let Some(ref venv) = self.venv_path {
             let venv_python = format!("{}/bin/python", venv);
             if tokio::fs::metadata(&venv_python).await.is_ok() {
+                tracing::info!("sidecar: using venv python at {}", venv_python);
                 venv_python
             } else {
-                self.python_cmd.clone()
+                // Venv doesn't exist — attempt to create it and install kria-modules.
+                tracing::warn!("sidecar: venv not found at {}; attempting auto-setup", venv);
+                match Self::setup_venv(venv, &self.python_cmd).await {
+                    Ok(p) => {
+                        tracing::info!("sidecar: venv setup complete, using {}", p);
+                        p
+                    }
+                    Err(e) => {
+                        tracing::warn!("sidecar: venv setup failed ({}); falling back to system {}", e, self.python_cmd);
+                        self.python_cmd.clone()
+                    }
+                }
             }
         } else {
             self.python_cmd.clone()
         };
 
+        // Detect kria-modules source directory (workspace layout: exe is target/{debug,release}/kria-desktop).
+        // If found, prepend it to PYTHONPATH so the live source files are always used directly —
+        // no venv resync needed when Python files change.
+        let exe = std::env::current_exe().unwrap_or_default();
+        let src_candidates = [
+            // target/debug/kria-desktop  →  ../../..  →  workspace root
+            exe.parent()
+                .and_then(|p| p.parent())
+                .and_then(|p| p.parent())
+                .map(|ws| ws.join("kria-modules").join("src"))
+                .unwrap_or_default(),
+            // direct sibling of exe
+            exe.parent()
+                .map(|p| p.join("kria-modules").join("src"))
+                .unwrap_or_default(),
+        ];
+        let pythonpath: Option<String> = src_candidates
+            .iter()
+            .find(|p| p.join("kria_modules").exists())
+            .map(|p| {
+                let existing = std::env::var("PYTHONPATH").unwrap_or_default();
+                let src = p.to_string_lossy();
+                tracing::info!("sidecar: using live source via PYTHONPATH={}", src);
+                if existing.is_empty() { src.into_owned() } else { format!("{}:{}", src, existing) }
+            });
+
+        // Quick sanity-check: can `python` actually import kria_modules?
+        let mut check_cmd = tokio::process::Command::new(&python);
+        check_cmd.args(["-c", "import kria_modules.bridge"]);
+        if let Some(ref pp) = pythonpath {
+            check_cmd.env("PYTHONPATH", pp);
+        }
+        let can_import = check_cmd
+            .output()
+            .await
+            .map(|o| {
+                if !o.status.success() {
+                    let err = String::from_utf8_lossy(&o.stderr);
+                    tracing::warn!("sidecar pre-check: kria_modules not importable: {}", err.trim());
+                    false
+                } else {
+                    true
+                }
+            })
+            .unwrap_or(false);
+
+        if !can_import {
+            anyhow::bail!(
+                "kria_modules is not installed. \
+                 Run the setup script: scripts/setup.sh  \
+                 Or manually: python3 -m venv ~/.kria/python-env && \
+                 cp -r kria-modules/src/kria_modules ~/.kria/python-env/lib/python*/site-packages/"
+            );
+        }
+
         tracing::info!(python = %python, "spawning Python sidecar");
 
-        let mut child = Command::new(&python)
+        let mut spawn_cmd = Command::new(&python);
+        spawn_cmd
             .arg("-m")
             .arg("kria_modules.bridge")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
+            .kill_on_drop(true);
+        if let Some(ref pp) = pythonpath {
+            spawn_cmd.env("PYTHONPATH", pp);
+        }
+        let mut child = spawn_cmd.spawn()?;
 
         let stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("no stdout"))?;
         let stderr = child.stderr.take().ok_or_else(|| anyhow::anyhow!("no stderr"))?;
@@ -74,7 +145,7 @@ impl SidecarBridge {
         *self.child.lock().await = Some(child);
         *self.stdin.lock().await = Some(stdin);
 
-        // Spawn stderr reader (logs only)
+        // Spawn stderr reader — logs at WARN so Python errors (ModuleNotFoundError etc.) are visible
         tokio::spawn(async move {
             let mut reader = BufReader::new(stderr);
             let mut line = String::new();
@@ -85,7 +156,12 @@ impl SidecarBridge {
                     Ok(_) => {
                         let trimmed = line.trim();
                         if !trimmed.is_empty() {
-                            tracing::debug!(target: "sidecar_stderr", "{}", trimmed);
+                            // Python errors/warnings → WARN so they surface in the log
+                            if trimmed.contains("Error") || trimmed.contains("Traceback") || trimmed.contains("error") {
+                                tracing::warn!(target: "sidecar_stderr", "{}", trimmed);
+                            } else {
+                                tracing::info!(target: "sidecar_stderr", "{}", trimmed);
+                            }
                         }
                     }
                     Err(_) => break,
@@ -253,6 +329,107 @@ impl SidecarBridge {
         }
 
         Ok(())
+    }
+
+    /// Create a virtualenv at `venv_dir` and install `kria-modules` into it.
+    ///
+    /// Looks for the `kria-modules` source directory relative to the kria-modules
+    /// package folder adjacent to the running binary, then falls back to the
+    /// workspace source tree (for dev builds).
+    async fn setup_venv(venv_dir: &str, python_cmd: &str) -> anyhow::Result<String> {
+        tracing::info!("sidecar setup: creating venv at {venv_dir}");
+
+        // 1. Create the venv
+        let out = tokio::process::Command::new(python_cmd)
+            .args(["-m", "venv", venv_dir])
+            .output()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to run `{python_cmd} -m venv`: {e}"))?;
+
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            anyhow::bail!("venv creation failed: {}", err.trim());
+        }
+        tracing::info!("sidecar setup: venv created");
+
+        let venv_python = format!("{venv_dir}/bin/python");
+        let venv_pip = format!("{venv_dir}/bin/pip");
+
+        // 2. Upgrade pip quietly
+        let _ = tokio::process::Command::new(&venv_pip)
+            .args(["install", "--upgrade", "pip", "--quiet"])
+            .output()
+            .await;
+
+        // 3. Find kria-modules source directory
+        //    Try sibling of the current exe, then workspace-relative paths.
+        let exe = std::env::current_exe().unwrap_or_default();
+        let candidates = [
+            // release/debug target dir: exe is target/debug/kria-desktop → go up 3 levels
+            exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent())
+                .map(|ws| ws.join("kria-modules"))
+                .unwrap_or_default(),
+            // direct sibling
+            exe.parent().map(|p| p.join("kria-modules")).unwrap_or_default(),
+        ];
+
+        let modules_dir = candidates.iter().find(|p| p.join("pyproject.toml").exists());
+
+        match modules_dir {
+            Some(src) => {
+                tracing::info!("sidecar setup: installing kria-modules from {}", src.display());
+
+                // Strategy: directly copy kria_modules into site-packages.
+                // This avoids any build-backend dependency (hatchling/setuptools)
+                // that may not be installed in the new venv.
+                let site_pkgs_out = tokio::process::Command::new(&venv_python)
+                    .args(["-c", "import site; print(site.getsitepackages()[0])"])
+                    .output()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to get site-packages: {e}"))?;
+
+                let site_pkgs = String::from_utf8_lossy(&site_pkgs_out.stdout)
+                    .trim()
+                    .to_string();
+
+                if site_pkgs.is_empty() {
+                    anyhow::bail!("could not determine venv site-packages path");
+                }
+
+                let src_pkg = src.join("src").join("kria_modules");
+                let dst_pkg = std::path::Path::new(&site_pkgs).join("kria_modules");
+
+                // Use `cp -r` to copy the package directory
+                let cp_out = tokio::process::Command::new("cp")
+                    .args(["-r", src_pkg.to_str().unwrap_or(""), dst_pkg.to_str().unwrap_or("")])
+                    .output()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("cp failed: {e}"))?;
+
+                if !cp_out.status.success() {
+                    let err = String::from_utf8_lossy(&cp_out.stderr);
+                    anyhow::bail!("failed to copy kria_modules: {}", err.trim());
+                }
+
+                // Install runtime deps for all processors
+                let _ = tokio::process::Command::new(&venv_pip)
+                    .args(["install", "psutil", "feedparser", "trafilatura", "--quiet"])
+                    .output()
+                    .await;
+
+                tracing::info!("sidecar setup: kria-modules installed to {}", site_pkgs);
+            }
+            None => {
+                // Couldn't find source — install minimal deps only (bridge.py is self-contained)
+                tracing::warn!("sidecar setup: kria-modules source not found; installing bridge deps only");
+                let _ = tokio::process::Command::new(&venv_pip)
+                    .args(["install", "psutil", "--quiet"])
+                    .output()
+                    .await;
+            }
+        }
+
+        Ok(venv_python)
     }
 }
 

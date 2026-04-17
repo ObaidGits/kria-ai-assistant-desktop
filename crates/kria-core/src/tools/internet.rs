@@ -1,8 +1,73 @@
 use std::sync::Arc;
+use std::net::IpAddr;
+use std::time::Duration;
 use async_trait::async_trait;
 use crate::infra::ToolResult;
 use crate::safety::RiskLevel;
 use crate::tools::registry::{ToolRegistry, ToolDef, ToolHandler, ParamDef};
+
+const WEB_RETRY_ATTEMPTS: usize = 3;
+
+fn backoff_delay(attempt: usize) -> Duration {
+    let shift = attempt.min(4) as u32;
+    let ms = 250u64.saturating_mul(1u64 << shift);
+    Duration::from_millis(ms)
+}
+
+fn is_private_or_sensitive_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_multicast()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.octets()[0] == 0
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_multicast()
+                || v6.is_unspecified()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+        }
+    }
+}
+
+fn validate_safe_url(raw_url: &str) -> Result<reqwest::Url, String> {
+    let parsed = reqwest::Url::parse(raw_url)
+        .map_err(|e| format!("invalid url: {e}"))?;
+
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("unsupported URL scheme (only http/https allowed)".to_string());
+    }
+
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("URLs with embedded credentials are not allowed".to_string());
+    }
+
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "URL host is missing".to_string())?
+        .to_ascii_lowercase();
+
+    if host == "localhost"
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
+        || host.ends_with(".localhost")
+    {
+        return Err("local/internal hosts are blocked".to_string());
+    }
+
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_private_or_sensitive_ip(ip) {
+            return Err("private/internal IP ranges are blocked".to_string());
+        }
+    }
+
+    Ok(parsed)
+}
 
 fn param(name: &str, ty: &str, desc: &str, required: bool) -> ParamDef {
     ParamDef { name: name.into(), param_type: ty.into(), description: desc.into(), required, default: None }
@@ -11,17 +76,33 @@ fn param(name: &str, ty: &str, desc: &str, required: bool) -> ParamDef {
 struct WebSearch;
 #[async_trait] impl ToolHandler for WebSearch {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
-        let query = params["query"].as_str().unwrap_or("");
+        let query = params["query"].as_str().unwrap_or("").trim();
         let max_results = params["max_results"].as_u64().unwrap_or(5);
-        // Uses DuckDuckGo lite HTML (no API key required)
-        let client = reqwest::Client::new();
-        let resp = client.get("https://lite.duckduckgo.com/lite/")
-            .query(&[("q", query)])
-            .header("User-Agent", "KRIA/0.1")
-            .send().await;
+        if query.is_empty() {
+            return ToolResult::err("query is required".to_string());
+        }
 
-        match resp {
-            Ok(r) => {
+        // Uses DuckDuckGo lite HTML (no API key required)
+        let client = match reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(12))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => return ToolResult::err(format!("web_search client init failed: {e}")),
+        };
+
+        let mut last_err = String::new();
+        for attempt in 0..WEB_RETRY_ATTEMPTS {
+            let resp = client
+                .get("https://lite.duckduckgo.com/lite/")
+                .query(&[("q", query)])
+                .header("User-Agent", "KRIA/0.1")
+                .send()
+                .await;
+
+            match resp {
+                Ok(r) if r.status().is_success() => {
                 let text = r.text().await.unwrap_or_default();
                 // Parse results from HTML (simplified)
                 let doc = scraper::Html::parse_document(&text);
@@ -32,28 +113,87 @@ struct WebSearch;
                         results.push(el.text().collect::<String>().trim().to_string());
                     }
                 }
-                ToolResult::ok(serde_json::json!({
+                return ToolResult::ok(serde_json::json!({
                     "query": query,
                     "results": results,
-                }))
+                }));
+                }
+                Ok(r) => {
+                    last_err = format!("duckduckgo returned status {}", r.status());
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                }
             }
-            Err(e) => ToolResult::err(format!("web_search failed: {e}"))
+
+            if attempt + 1 < WEB_RETRY_ATTEMPTS {
+                tokio::time::sleep(backoff_delay(attempt)).await;
+            }
         }
+
+        ToolResult::err(format!("web_search failed after retries: {last_err}"))
     }
 }
 
 struct FetchWebpage;
 #[async_trait] impl ToolHandler for FetchWebpage {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
-        let url = params["url"].as_str().unwrap_or("");
+        let url = params["url"].as_str().unwrap_or("").trim();
         let max_chars = params["max_chars"].as_u64().unwrap_or(20000) as usize;
+        if url.is_empty() {
+            return ToolResult::err("url is required".to_string());
+        }
+        let safe_url = match validate_safe_url(url) {
+            Ok(u) => u,
+            Err(e) => return ToolResult::err(format!("unsafe url: {e}")),
+        };
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .build().unwrap_or_default();
+        let content_limit = ((max_chars as u64).saturating_mul(8)).clamp(128 * 1024, 3 * 1024 * 1024);
 
-        match client.get(url).header("User-Agent", "KRIA/0.1").send().await {
-            Ok(resp) => {
+        let client = match reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => return ToolResult::err(format!("fetch_webpage client init failed: {e}")),
+        };
+
+        let mut last_err = String::new();
+        for attempt in 0..WEB_RETRY_ATTEMPTS {
+            let resp = client
+                .get(safe_url.clone())
+                .header("User-Agent", "KRIA/0.1")
+                .send()
+                .await;
+
+            match resp {
+                Ok(resp) if resp.status().is_success() => {
+                    let content_type = resp
+                        .headers()
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    if !content_type.is_empty()
+                        && !content_type.contains("text/")
+                        && !content_type.contains("html")
+                        && !content_type.contains("xml")
+                        && !content_type.contains("json")
+                    {
+                        return ToolResult::err(format!("unsupported content type: {content_type}"));
+                    }
+
+                    if let Some(len) = resp.content_length() {
+                        if len > content_limit {
+                            return ToolResult::err(format!(
+                                "response too large: {} bytes (limit {} bytes)",
+                                len, content_limit
+                            ));
+                        }
+                    }
+
                 let text = resp.text().await.unwrap_or_default();
                 // Strip HTML tags for text content
                 let doc = scraper::Html::parse_document(&text);
@@ -67,36 +207,84 @@ struct FetchWebpage;
                 } else {
                     &body_text
                 };
-                ToolResult::ok(serde_json::json!({
+                return ToolResult::ok(serde_json::json!({
                     "url": url,
                     "content": content.trim(),
                     "truncated": body_text.len() > max_chars,
-                }))
+                }));
+                }
+                Ok(resp) => {
+                    last_err = format!("status {}", resp.status());
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                }
             }
-            Err(e) => ToolResult::err(format!("fetch_webpage failed: {e}"))
+
+            if attempt + 1 < WEB_RETRY_ATTEMPTS {
+                tokio::time::sleep(backoff_delay(attempt)).await;
+            }
         }
+
+        ToolResult::err(format!("fetch_webpage failed after retries: {last_err}"))
     }
 }
 
 struct CheckUrlStatus;
 #[async_trait] impl ToolHandler for CheckUrlStatus {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
-        let url = params["url"].as_str().unwrap_or("");
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build().unwrap_or_default();
-        match client.head(url).send().await {
-            Ok(resp) => ToolResult::ok(serde_json::json!({
-                "url": url,
-                "status": resp.status().as_u16(),
-                "reachable": resp.status().is_success() || resp.status().is_redirection(),
-            })),
-            Err(e) => ToolResult::ok(serde_json::json!({
-                "url": url,
-                "reachable": false,
-                "error": e.to_string(),
-            }))
+        let url = params["url"].as_str().unwrap_or("").trim();
+        let safe_url = match validate_safe_url(url) {
+            Ok(u) => u,
+            Err(e) => {
+                return ToolResult::ok(serde_json::json!({
+                    "url": url,
+                    "reachable": false,
+                    "error": format!("unsafe url: {e}"),
+                }));
+            }
+        };
+
+        let client = match reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return ToolResult::ok(serde_json::json!({
+                    "url": url,
+                    "reachable": false,
+                    "error": format!("client init failed: {e}"),
+                }));
+            }
+        };
+
+        let mut last_err = String::new();
+        for attempt in 0..WEB_RETRY_ATTEMPTS {
+            match client.head(safe_url.clone()).send().await {
+                Ok(resp) => {
+                    return ToolResult::ok(serde_json::json!({
+                        "url": url,
+                        "status": resp.status().as_u16(),
+                        "reachable": resp.status().is_success() || resp.status().is_redirection(),
+                    }))
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                }
+            }
+
+            if attempt + 1 < WEB_RETRY_ATTEMPTS {
+                tokio::time::sleep(backoff_delay(attempt)).await;
+            }
         }
+
+        ToolResult::ok(serde_json::json!({
+            "url": url,
+            "reachable": false,
+            "error": format!("status check failed after retries: {last_err}"),
+        }))
     }
 }
 
@@ -154,14 +342,52 @@ struct DnsLookup;
 struct DownloadFile;
 #[async_trait] impl ToolHandler for DownloadFile {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
-        let url = params["url"].as_str().unwrap_or("");
+        let url = params["url"].as_str().unwrap_or("").trim();
         let dest = params["destination"].as_str().unwrap_or("");
         let max_mb = params["max_size_mb"].as_u64().unwrap_or(500);
+        if url.is_empty() {
+            return ToolResult::err("url is required".to_string());
+        }
+        if dest.trim().is_empty() {
+            return ToolResult::err("destination is required".to_string());
+        }
+        let safe_url = match validate_safe_url(url) {
+            Ok(u) => u,
+            Err(e) => return ToolResult::err(format!("unsafe url: {e}")),
+        };
 
-        let client = reqwest::Client::new();
-        let resp = match client.get(url).send().await {
-            Ok(r) => r,
-            Err(e) => return ToolResult::err(format!("download failed: {e}")),
+        let client = match reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => return ToolResult::err(format!("download client init failed: {e}")),
+        };
+
+        let mut last_err = String::new();
+        let mut resp_opt = None;
+        for attempt in 0..WEB_RETRY_ATTEMPTS {
+            match client.get(safe_url.clone()).send().await {
+                Ok(r) if r.status().is_success() => {
+                    resp_opt = Some(r);
+                    break;
+                }
+                Ok(r) => {
+                    last_err = format!("status {}", r.status());
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                }
+            }
+            if attempt + 1 < WEB_RETRY_ATTEMPTS {
+                tokio::time::sleep(backoff_delay(attempt)).await;
+            }
+        }
+        let resp = match resp_opt {
+            Some(r) => r,
+            None => return ToolResult::err(format!("download failed after retries: {last_err}")),
         };
 
         if let Some(len) = resp.content_length() {
@@ -174,6 +400,13 @@ struct DownloadFile;
             Ok(b) => b,
             Err(e) => return ToolResult::err(format!("download failed: {e}")),
         };
+
+        if bytes.len() as u64 > max_mb * 1024 * 1024 {
+            return ToolResult::err(format!(
+                "file too large after download: {} MB (max {max_mb} MB)",
+                bytes.len() / (1024 * 1024)
+            ));
+        }
 
         if let Some(parent) = std::path::Path::new(dest).parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
@@ -683,7 +916,7 @@ fn skip_spaces(chars: &mut std::iter::Peekable<std::str::Chars>) {
     while chars.peek() == Some(&' ') { chars.next(); }
 }
 
-pub fn register(reg: &mut ToolRegistry) {
+pub fn register(reg: &ToolRegistry) {
     let tools: Vec<(ToolDef, Arc<dyn ToolHandler>)> = vec![
         // GREEN
         (ToolDef {
@@ -796,4 +1029,29 @@ pub fn register(reg: &mut ToolRegistry) {
         }, Arc::new(Calculate)),
     ];
     for (def, handler) in tools { reg.register(def, handler); }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_safe_url;
+
+    #[test]
+    fn allows_public_https_url() {
+        assert!(validate_safe_url("https://example.com/path?q=1").is_ok());
+    }
+
+    #[test]
+    fn blocks_localhost_and_private_ips() {
+        assert!(validate_safe_url("http://localhost:8080").is_err());
+        assert!(validate_safe_url("http://127.0.0.1:8080").is_err());
+        assert!(validate_safe_url("http://10.0.0.5").is_err());
+        assert!(validate_safe_url("http://192.168.1.3").is_err());
+    }
+
+    #[test]
+    fn blocks_non_http_schemes_and_embedded_credentials() {
+        assert!(validate_safe_url("file:///etc/passwd").is_err());
+        assert!(validate_safe_url("ftp://example.com/file.txt").is_err());
+        assert!(validate_safe_url("https://user:pass@example.com").is_err());
+    }
 }

@@ -39,6 +39,12 @@ rollback_max_age_days = 30
 host = "127.0.0.1"
 port = 3001
 
+[telegram]
+enabled = false
+bot_token = ""
+allowed_chat_ids = ""
+auto_start = true
+
 [ui]
 theme = "dark"
 font_size = 14
@@ -50,3 +56,17 @@ news_feeds = [
     "https://feeds.arstechnica.com/arstechnica/index",
     "https://hnrss.org/frontpage",
 ]
+
+[hardware]
+tier = ""                                   # "" = auto-detect; or lite|standard|performance|high
+max_context_tokens = 0                       # 0 = tier default/clamp
+gpu_layers = -1                              # -1 = tier default
+threads = 0                                  # 0 = tier default
+
+[agent]
+autonomy_profile = "balanced"               # conservative | balanced | aggressive
+min_confidence_to_act = 0.55
+clarify_threshold = 0.40
+require_plan_for_complex_tasks = true
+require_evidence_for_completion = true
+max_tool_rounds = 10

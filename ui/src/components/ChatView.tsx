@@ -1,4 +1,4 @@
-import { Component, For, Show, createEffect, createSignal, createMemo } from "solid-js";
+import { Component, For, Show, createEffect, createSignal, createMemo, onCleanup } from "solid-js";
 import { appStore } from "../stores/app";
 import MessageBubble from "./MessageBubble";
 import ExportDropdown from "./ExportDropdown";
@@ -13,7 +13,19 @@ const ChatView: Component = () => {
   let messagesEnd: HTMLDivElement | undefined;
   let fileInput: HTMLInputElement | undefined;
   let textareaRef: HTMLTextAreaElement | undefined;
-  const { messages, isThinking, inputText, setInputText, sendMessage, sendImageMessage, toggleVoice, voiceActive, voiceState, currentSession, sessions } = appStore;
+  const {
+    messages,
+    isThinking,
+    inputText,
+    setInputText,
+    sendMessage,
+    sendImageMessage,
+    toggleVoice,
+    voiceActive,
+    voiceState,
+    currentSession,
+    sessions,
+  } = appStore;
 
   // Derive the title of the current session for exports
   const currentSessionTitle = () => {
@@ -26,6 +38,23 @@ const ChatView: Component = () => {
   const [isDragOver, setIsDragOver] = createSignal(false);
   const [showSlash, setShowSlash] = createSignal(false);
   const [slashIndex, setSlashIndex] = createSignal(0);
+
+  const starterPrompts = [
+    "Plan my day and prioritize deep work blocks.",
+    "Audit my TODO list and suggest what to ship today.",
+    "Summarize my latest inbox in five bullets.",
+  ];
+
+  const clearPendingImage = () => {
+    const img = pendingImage();
+    if (img) {
+      URL.revokeObjectURL(img.preview);
+    }
+    setPendingImage(null);
+    if (fileInput) {
+      fileInput.value = "";
+    }
+  };
 
   const slashCommands: SlashCmd[] = [
     { name: "/clear", desc: "Clear current messages", action: () => { /* handled in store if needed */ sendMessage("/clear"); } },
@@ -54,6 +83,16 @@ const ChatView: Component = () => {
     messagesEnd?.scrollIntoView({ behavior: "smooth" });
   });
 
+  // Reset pending image when session changes to avoid stale preview/input state.
+  createEffect(() => {
+    currentSession();
+    clearPendingImage();
+  });
+
+  onCleanup(() => {
+    clearPendingImage();
+  });
+
   // Auto-grow textarea
   const autoGrow = () => {
     if (textareaRef) {
@@ -80,8 +119,10 @@ const ChatView: Component = () => {
     }
     const img = pendingImage();
     if (img) {
-      sendImageMessage(img.data, img.mime, inputText() || undefined);
-      setPendingImage(null);
+      const data = img.data;
+      const mime = img.mime;
+      clearPendingImage();
+      sendImageMessage(data, mime, inputText() || undefined);
     } else {
       sendMessage(inputText());
     }
@@ -114,8 +155,10 @@ const ChatView: Component = () => {
       e.preventDefault();
       const img = pendingImage();
       if (img) {
-        sendImageMessage(img.data, img.mime, inputText() || undefined);
-        setPendingImage(null);
+        const data = img.data;
+        const mime = img.mime;
+        clearPendingImage();
+        sendImageMessage(data, mime, inputText() || undefined);
       } else {
         sendMessage(inputText());
       }
@@ -125,10 +168,17 @@ const ChatView: Component = () => {
 
   const processFile = async (file: File) => {
     if (!file.type.startsWith("image/")) return;
+    const previous = pendingImage();
+    if (previous) {
+      URL.revokeObjectURL(previous.preview);
+    }
     const buffer = await file.arrayBuffer();
     const data = new Uint8Array(buffer);
     const preview = URL.createObjectURL(file);
     setPendingImage({ data, mime: file.type, preview });
+    if (fileInput) {
+      fileInput.value = "";
+    }
   };
 
   const handlePaste = async (e: ClipboardEvent) => {
@@ -168,6 +218,33 @@ const ChatView: Component = () => {
       </div>
 
       <div class="chat-messages">
+        <Show when={messages().length === 0 && !isThinking()}>
+          <div class="assistant-welcome-card">
+            <div class="assistant-welcome-eyebrow">Personal Mission Control</div>
+            <h2>What should we accomplish first?</h2>
+            <p>
+              Ask for planning, execution help, tool-driven actions, or attach an image for analysis.
+            </p>
+            <div class="assistant-starter-grid">
+              <For each={starterPrompts}>
+                {(prompt) => (
+                  <button
+                    class="starter-prompt"
+                    type="button"
+                    onClick={() => {
+                      setInputText(prompt);
+                      textareaRef?.focus();
+                      autoGrow();
+                    }}
+                  >
+                    {prompt}
+                  </button>
+                )}
+              </For>
+            </div>
+          </div>
+        </Show>
+
         <For each={messages()}>
           {(msg) => <MessageBubble message={msg} />}
         </For>
@@ -191,11 +268,7 @@ const ChatView: Component = () => {
           <span class="image-preview-label">Image attached</span>
           <button
             class="image-preview-remove"
-            onClick={() => {
-              const img = pendingImage();
-              if (img) URL.revokeObjectURL(img.preview);
-              setPendingImage(null);
-            }}
+            onClick={clearPendingImage}
           >✕</button>
         </div>
       </Show>

@@ -10,10 +10,12 @@ pub struct KriaConfig {
     pub voice: VoiceConfig,
     pub memory: MemoryConfig,
     pub safety: SafetyConfig,
+    pub agent: AgentConfig,
     pub server: ServerConfig,
     pub ui: UiConfig,
     pub search: SearchConfig,
     pub mcp: McpConfig,
+    pub telegram: TelegramConfig,
     pub hardware: HardwareConfig,
 }
 
@@ -83,6 +85,24 @@ pub struct SafetyConfig {
     pub max_concurrent_tools: usize,
 }
 
+/// Agent intelligence behavior controls.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct AgentConfig {
+    /// `conservative`, `balanced`, or `aggressive`.
+    pub autonomy_profile: String,
+    /// Minimum confidence before autonomous action on ambiguous tasks.
+    pub min_confidence_to_act: f32,
+    /// If confidence is below this threshold, ask a targeted clarification.
+    pub clarify_threshold: f32,
+    /// Require explicit internal planning for multi-step tasks.
+    pub require_plan_for_complex_tasks: bool,
+    /// Require observed tool evidence before claiming completion.
+    pub require_evidence_for_completion: bool,
+    /// Maximum tool-action rounds per turn.
+    pub max_tool_rounds: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ServerConfig {
@@ -113,6 +133,29 @@ pub struct SearchConfig {
     pub searxng_url: String,
     /// News RSS feeds (comma-separated or Vec)
     pub news_feeds: Vec<String>,
+}
+
+/// Telegram integration configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TelegramConfig {
+    pub enabled: bool,
+    pub bot_token: String,
+    /// Comma-separated allowed chat IDs. Empty = allow all.
+    pub allowed_chat_ids: String,
+    /// Whether to auto-register the Telegram MCP server on startup.
+    pub auto_start: bool,
+}
+
+impl Default for TelegramConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bot_token: String::new(),
+            allowed_chat_ids: String::new(),
+            auto_start: true,
+        }
+    }
 }
 
 /// MCP (Model Context Protocol) configuration.
@@ -181,10 +224,12 @@ impl Default for KriaConfig {
             voice: VoiceConfig::default(),
             memory: MemoryConfig::default(),
             safety: SafetyConfig::default(),
+            agent: AgentConfig::default(),
             server: ServerConfig::default(),
             ui: UiConfig::default(),
             search: SearchConfig::default(),
             mcp: McpConfig::default(),
+            telegram: TelegramConfig::default(),
             hardware: HardwareConfig::default(),
         }
     }
@@ -255,6 +300,19 @@ impl Default for SafetyConfig {
             tool_timeout_secs: 30,
             emergency_mode: false,
             max_concurrent_tools: 3,
+        }
+    }
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            autonomy_profile: "balanced".into(),
+            min_confidence_to_act: 0.55,
+            clarify_threshold: 0.40,
+            require_plan_for_complex_tasks: true,
+            require_evidence_for_completion: true,
+            max_tool_rounds: 10,
         }
     }
 }
@@ -351,6 +409,30 @@ pub fn load_config(default_path: &Path, override_path: Option<&Path>) -> anyhow:
     if let Ok(v) = std::env::var("KRIA_CLOUD_API_KEY") {
         config.llm.cloud_api_key = v;
     }
+    if let Ok(v) = std::env::var("KRIA_TIER") {
+        if !v.trim().is_empty() {
+            config.hardware.tier = v;
+        }
+    }
+    if let Ok(v) = std::env::var("KRIA_AGENT_AUTONOMY_PROFILE") {
+        if !v.trim().is_empty() {
+            config.agent.autonomy_profile = v;
+        }
+    }
+    if let Ok(v) = std::env::var("KRIA_AGENT_MAX_TOOL_ROUNDS") {
+        if let Ok(parsed) = v.parse::<usize>() {
+            if parsed > 0 {
+                config.agent.max_tool_rounds = parsed;
+            }
+        }
+    }
+    if let Ok(v) = std::env::var("KRIA_AGENT_MIN_CONFIDENCE") {
+        if let Ok(parsed) = v.parse::<f32>() {
+            if (0.0..=1.0).contains(&parsed) {
+                config.agent.min_confidence_to_act = parsed;
+            }
+        }
+    }
 
     Ok(config)
 }
@@ -374,6 +456,101 @@ fn merge_config(base: &mut KriaConfig, user: &KriaConfig) {
     if user.safety.emergency_mode {
         base.safety.emergency_mode = true;
     }
+    if user.agent != AgentConfig::default() {
+        base.agent = user.agent.clone();
+    }
+    if !user.hardware.tier.is_empty() {
+        base.hardware.tier = user.hardware.tier.clone();
+    }
+    if user.hardware.max_context_tokens > 0 {
+        base.hardware.max_context_tokens = user.hardware.max_context_tokens;
+    }
+    if user.hardware.gpu_layers >= 0 {
+        base.hardware.gpu_layers = user.hardware.gpu_layers;
+    }
+    if user.hardware.threads > 0 {
+        base.hardware.threads = user.hardware.threads;
+    }
+}
+
+/// Load MCP server configs from `mcp_servers.json` next to the running executable
+/// or in the standard config directory. Merges into the existing McpConfig.
+pub fn load_mcp_servers(config: &mut KriaConfig) {
+    // Search order: alongside exe, then in config dir
+    let candidates: Vec<std::path::PathBuf> = {
+        let mut v = Vec::new();
+        // 1. Next to the executable (dev mode: workspace config/)
+        if let Ok(exe) = std::env::current_exe() {
+            tracing::debug!("[MCP config] exe path: {}", exe.display());
+            if let Some(parent) = exe.parent() {
+                // In dev builds the exe is in target/debug, so walk up to find config/
+                let mut dir = parent.to_path_buf();
+                for i in 0..5 {
+                    let candidate = dir.join("config").join("mcp_servers.json");
+                    tracing::debug!("[MCP config] checking candidate [{}]: {}", i, candidate.display());
+                    if candidate.exists() {
+                        tracing::info!("[MCP config] found mcp_servers.json at: {}", candidate.display());
+                        v.push(candidate);
+                        break;
+                    }
+                    if !dir.pop() {
+                        tracing::debug!("[MCP config] reached filesystem root, stopping walk");
+                        break;
+                    }
+                }
+            }
+        } else {
+            tracing::warn!("[MCP config] could not determine current exe path");
+        }
+        // 2. Standard config dir (~/.kria/mcp_servers.json)
+        let paths = crate::platform::paths::KriaPaths::resolve();
+        let user_cfg = paths.config_dir.join("mcp_servers.json");
+        tracing::debug!("[MCP config] user config candidate: {}", user_cfg.display());
+        v.push(user_cfg);
+        v
+    };
+
+    for path in &candidates {
+        if path.exists() {
+            tracing::info!("[MCP config] reading: {}", path.display());
+            match std::fs::read_to_string(path) {
+                Ok(text) => {
+                    match serde_json::from_str::<McpConfig>(&text) {
+                        Ok(mcp_cfg) => {
+                            let enabled = mcp_cfg.servers.iter().filter(|s| s.enabled).count();
+                            tracing::info!(
+                                "[MCP config] loaded {} server(s) ({} enabled) from {}",
+                                mcp_cfg.servers.len(), enabled, path.display()
+                            );
+                            // Merge: JSON servers supplement TOML servers (no duplicates by name)
+                            for server in mcp_cfg.servers {
+                                if !config.mcp.servers.iter().any(|s| s.name == server.name) {
+                                    tracing::info!(
+                                        "[MCP config] adding server '{}' (enabled={}) from JSON",
+                                        server.name, server.enabled
+                                    );
+                                    config.mcp.servers.push(server);
+                                } else {
+                                    tracing::debug!(
+                                        "[MCP config] server '{}' already in config — skipping duplicate",
+                                        server.name
+                                    );
+                                }
+                            }
+                            return;
+                        }
+                        Err(e) => {
+                            tracing::warn!("[MCP config] failed to parse {}: {}", path.display(), e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("[MCP config] failed to read {}: {}", path.display(), e);
+                }
+            }
+        }
+    }
+    tracing::warn!("[MCP config] no mcp_servers.json found in any candidate path — MCP servers from TOML config only");
 }
 
 /// Select model config based on hardware tier.

@@ -197,11 +197,11 @@ struct SummarizeDocument {
     }
 }
 
-pub fn register(reg: &mut ToolRegistry) {
+pub fn register(reg: &ToolRegistry) {
     register_with_sidecar(reg, None);
 }
 
-pub fn register_with_sidecar(reg: &mut ToolRegistry, sidecar: Option<Arc<SidecarBridge>>) {
+pub fn register_with_sidecar(reg: &ToolRegistry, sidecar: Option<Arc<SidecarBridge>>) {
     let doc_sc = DocSidecar(sidecar.map(|s| Arc::new(Mutex::new(s))));
 
     let tools: Vec<(ToolDef, Arc<dyn ToolHandler>)> = vec![

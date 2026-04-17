@@ -31,6 +31,24 @@ pub enum PackageManager {
     Brew,
     Winget,
     Choco,
+    Snap,
+    Flatpak,
+}
+
+impl PackageManager {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Apt     => "apt",
+            Self::Dnf     => "dnf",
+            Self::Pacman  => "pacman",
+            Self::Zypper  => "zypper",
+            Self::Brew    => "brew",
+            Self::Winget  => "winget",
+            Self::Choco   => "choco",
+            Self::Snap    => "snap",
+            Self::Flatpak => "flatpak",
+        }
+    }
 }
 
 /// Snapshot of detected hardware capabilities.
@@ -174,6 +192,30 @@ pub fn get_package_manager() -> Option<PackageManager> {
             }
         }
     }
+}
+
+/// Detect ALL available package managers on the system.
+/// On Linux a machine may have apt + snap + flatpak simultaneously.
+pub fn get_available_package_managers() -> Vec<PackageManager> {
+    let mut pms = Vec::new();
+    match get_os() {
+        Os::Linux => {
+            if has_command("apt-get")  { pms.push(PackageManager::Apt); }
+            if has_command("dnf")      { pms.push(PackageManager::Dnf); }
+            if has_command("pacman")   { pms.push(PackageManager::Pacman); }
+            if has_command("zypper")   { pms.push(PackageManager::Zypper); }
+            if has_command("snap")     { pms.push(PackageManager::Snap); }
+            if has_command("flatpak")  { pms.push(PackageManager::Flatpak); }
+        }
+        Os::MacOS => {
+            if has_command("brew") { pms.push(PackageManager::Brew); }
+        }
+        Os::Windows => {
+            if has_command("winget") { pms.push(PackageManager::Winget); }
+            if has_command("choco")  { pms.push(PackageManager::Choco); }
+        }
+    }
+    pms
 }
 
 /// Attempt to detect NVIDIA GPU VRAM via nvidia-smi.

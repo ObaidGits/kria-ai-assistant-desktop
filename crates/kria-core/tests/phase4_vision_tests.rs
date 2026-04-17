@@ -299,6 +299,61 @@ async fn phase4_analyze_image_file_not_found() {
     assert!(result.error.as_ref().unwrap().contains("not found"));
 }
 
+#[tokio::test]
+async fn phase4_analyze_image_accepts_file_uri_path() {
+    let reg = registry::build_default_registry();
+    let handler = reg.get_handler("analyze_image").unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("uri_test.png");
+    let img = image::ImageBuffer::from_fn(2, 2, |_, _| image::Rgb([0u8, 255, 0]));
+    img.save(&path).unwrap();
+
+    let uri = format!("file://{}", path.display());
+    let result = handler.execute(serde_json::json!({"path": uri})).await;
+
+    assert!(result.success, "expected file:// path to resolve");
+    let data = result.data;
+    assert!(data.get("metadata").is_some());
+}
+
+#[tokio::test]
+async fn phase4_analyze_image_accepts_markdown_wrapped_path() {
+    let reg = registry::build_default_registry();
+    let handler = reg.get_handler("analyze_image").unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wrapped_path_test.png");
+    let img = image::ImageBuffer::from_fn(2, 2, |_, _| image::Rgb([0u8, 0, 255]));
+    img.save(&path).unwrap();
+
+    let wrapped = format!("[image: {}].", path.display());
+    let result = handler.execute(serde_json::json!({"path": wrapped})).await;
+
+    assert!(result.success, "expected [image: ...]. path to resolve");
+    let data = result.data;
+    assert!(data.get("metadata").is_some());
+}
+
+#[tokio::test]
+async fn phase4_analyze_image_accepts_urlencoded_file_uri() {
+    let reg = registry::build_default_registry();
+    let handler = reg.get_handler("analyze_image").unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("uri test image.png");
+    let img = image::ImageBuffer::from_fn(2, 2, |_, _| image::Rgb([255u8, 255, 0]));
+    img.save(&path).unwrap();
+
+    let encoded_path = path.to_string_lossy().replace(' ', "%20");
+    let uri = format!("file://{}", encoded_path);
+    let result = handler.execute(serde_json::json!({"path": uri})).await;
+
+    assert!(result.success, "expected URL-encoded file:// path to resolve");
+    let data = result.data;
+    assert!(data.get("metadata").is_some());
+}
+
 // ── 4.6: Integration — tool count includes vision tools ─────
 
 #[test]

@@ -176,7 +176,7 @@ struct IngestDocument(StoreHandle);
     }
 }
 
-pub fn register(reg: &mut ToolRegistry, store: Arc<MemoryStore>) {
+pub fn register(reg: &ToolRegistry, store: Arc<MemoryStore>) {
     let h = StoreHandle(store);
     let tools: Vec<(ToolDef, Arc<dyn ToolHandler>)> = vec![
         (ToolDef {
@@ -234,7 +234,7 @@ pub fn register(reg: &mut ToolRegistry, store: Arc<MemoryStore>) {
 }
 
 /// Stub registration for tests (no MemoryStore required).
-pub fn register_stubs(reg: &mut ToolRegistry) {
+pub fn register_stubs(reg: &ToolRegistry) {
     struct Stub;
     #[async_trait] impl ToolHandler for Stub {
         async fn execute(&self, _params: serde_json::Value) -> ToolResult {

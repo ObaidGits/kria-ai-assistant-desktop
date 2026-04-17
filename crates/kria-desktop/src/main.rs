@@ -6,6 +6,8 @@
 mod commands;
 mod tray;
 
+use tauri::Manager;
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -20,6 +22,11 @@ fn main() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
+            // Register the AppStateCell immediately so Tauri never panics with
+            // "state not managed" — commands that arrive before init_runtime()
+            // finishes will get a clean "still initializing" error instead.
+            app.handle().manage(commands::AppStateCell::new());
+
             // Initialize tray icon
             tray::create_tray(app.handle())?;
 
@@ -57,6 +64,11 @@ fn main() {
             commands::add_mcp_server,
             commands::remove_mcp_server,
             commands::toggle_mcp_server,
+            commands::get_telegram_config,
+            commands::update_telegram_config,
+            commands::start_telegram_mcp,
+            commands::stop_telegram_mcp,
+            commands::test_telegram_connection,
             commands::list_scheduled_tasks,
             commands::add_scheduled_task,
             commands::remove_scheduled_task,
@@ -71,6 +83,9 @@ fn main() {
             commands::get_alerts,
             commands::save_export_file,
             commands::open_html_for_print,
+            commands::get_google_workspace_status,
+            commands::connect_google_workspace,
+            commands::disconnect_google_workspace,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

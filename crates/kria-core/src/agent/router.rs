@@ -73,6 +73,9 @@ static DIRECT_TOOL_RE: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
         (r"(?i)\b(brightness)\s*(set|to|at)\s*(\d+)\b", "set_brightness"),
         (r"(?i)\b(wifi)\s*(on|off|enable|disable|toggle)\b", "toggle_wifi"),
         // Internet
+        (r"(?i)\b(latest|breaking|today|current|recent)\b.*\b(news|headlines|updates?)\b", "search_news"),
+        (r"(?i)\b(news|headlines|updates?)\b.*\b(india|indian|pakistan|bangladesh|sri\s*lanka|us|uk|europe|asia|middle\s*east)\b", "search_news"),
+        (r"(?i)\b(news|headlines|updates?)\b.*\b(authentic|trusted|reliable|verified)\b", "search_news"),
         (r"(?i)\b(search|google|look\s+up|find\s+online)\b.*\b(web|online|internet)\b", "web_search"),
         (r"(?i)\b(search|google|look\s+up)\s+(for|the|about)\b", "web_search"),
         (r"(?i)\b(ping)\s+\w+", "ping_host"),
@@ -169,5 +172,31 @@ impl IntentRouter {
             category: None,
             confidence: 0.3,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Intent, IntentRouter};
+
+    #[test]
+    fn routes_latest_news_prompts_to_search_news() {
+        let result = IntentRouter::classify("Give me latest breaking news updates");
+        assert!(matches!(result.intent, Intent::DirectTool(_)));
+        assert_eq!(result.tool_hint.as_deref(), Some("search_news"));
+    }
+
+    #[test]
+    fn routes_region_news_prompts_to_search_news() {
+        let result = IntentRouter::classify("Show trusted news from India about economy");
+        assert!(matches!(result.intent, Intent::DirectTool(_)));
+        assert_eq!(result.tool_hint.as_deref(), Some("search_news"));
+    }
+
+    #[test]
+    fn keeps_general_web_lookup_on_web_search() {
+        let result = IntentRouter::classify("Search online for rust ownership examples");
+        assert!(matches!(result.intent, Intent::DirectTool(_)));
+        assert_eq!(result.tool_hint.as_deref(), Some("web_search"));
     }
 }

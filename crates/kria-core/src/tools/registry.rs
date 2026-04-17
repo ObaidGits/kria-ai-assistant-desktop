@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use crate::infra::ToolResult;
 use crate::safety::RiskLevel;
@@ -66,43 +66,45 @@ pub trait ToolHandler: Send + Sync {
 }
 
 /// Central tool registry. Holds all tool definitions and their handlers.
+/// Thread-safe for dynamic registration (e.g. MCP servers connecting in background).
 pub struct ToolRegistry {
-    defs: HashMap<String, ToolDef>,
-    handlers: HashMap<String, Arc<dyn ToolHandler>>,
+    defs: RwLock<HashMap<String, ToolDef>>,
+    handlers: RwLock<HashMap<String, Arc<dyn ToolHandler>>>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
-            defs: HashMap::new(),
-            handlers: HashMap::new(),
+            defs: RwLock::new(HashMap::new()),
+            handlers: RwLock::new(HashMap::new()),
         }
     }
 
     /// Register a tool with its definition and handler.
-    pub fn register(&mut self, def: ToolDef, handler: Arc<dyn ToolHandler>) {
+    /// Thread-safe: can be called concurrently from background tasks.
+    pub fn register(&self, def: ToolDef, handler: Arc<dyn ToolHandler>) {
         let name = def.name.clone();
-        self.defs.insert(name.clone(), def);
-        self.handlers.insert(name, handler);
+        self.defs.write().expect("tool registry defs lock poisoned").insert(name.clone(), def);
+        self.handlers.write().expect("tool registry handlers lock poisoned").insert(name, handler);
     }
 
     /// Get a tool definition by name.
-    pub fn get_def(&self, name: &str) -> Option<&ToolDef> {
-        self.defs.get(name)
+    pub fn get_def(&self, name: &str) -> Option<ToolDef> {
+        self.defs.read().expect("tool registry defs lock poisoned").get(name).cloned()
     }
 
     /// Get a tool handler by name.
-    pub fn get_handler(&self, name: &str) -> Option<&Arc<dyn ToolHandler>> {
-        self.handlers.get(name)
+    pub fn get_handler(&self, name: &str) -> Option<Arc<dyn ToolHandler>> {
+        self.handlers.read().expect("tool registry handlers lock poisoned").get(name).cloned()
     }
 
     /// List all tool definitions (for LLM system prompt).
-    pub fn list_defs(&self) -> Vec<&ToolDef> {
-        self.defs.values().collect()
+    pub fn list_defs(&self) -> Vec<ToolDef> {
+        self.defs.read().expect("tool registry defs lock poisoned").values().cloned().collect()
     }
 
     /// List tool definitions filtered by hardware tier.
-    pub fn list_for_tier(&self, hw_tier: &str) -> Vec<&ToolDef> {
+    pub fn list_for_tier(&self, hw_tier: &str) -> Vec<ToolDef> {
         let tier_rank = |t: &str| -> u8 {
             match t {
                 "lite" => 0,
@@ -113,17 +115,20 @@ impl ToolRegistry {
             }
         };
         let rank = tier_rank(hw_tier);
-        self.defs.values().filter(|d| tier_rank(d.min_tier) <= rank).collect()
+        self.defs.read().expect("tool registry defs lock poisoned")
+            .values().filter(|d| tier_rank(d.min_tier) <= rank).cloned().collect()
     }
 
     /// List tools by category.
-    pub fn list_by_category(&self, category: &str) -> Vec<&ToolDef> {
-        self.defs.values().filter(|d| d.category == category).collect()
+    pub fn list_by_category(&self, category: &str) -> Vec<ToolDef> {
+        self.defs.read().expect("tool registry defs lock poisoned")
+            .values().filter(|d| d.category == category).cloned().collect()
     }
 
     /// Get all category names.
     pub fn categories(&self) -> Vec<String> {
-        let mut cats: Vec<String> = self.defs.values().map(|d| d.category.clone()).collect();
+        let defs = self.defs.read().expect("tool registry defs lock poisoned");
+        let mut cats: Vec<String> = defs.values().map(|d| d.category.clone()).collect();
         cats.sort();
         cats.dedup();
         cats
@@ -136,11 +141,11 @@ impl ToolRegistry {
 
     /// Total number of registered tools.
     pub fn len(&self) -> usize {
-        self.defs.len()
+        self.defs.read().expect("tool registry defs lock poisoned").len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.defs.is_empty()
+        self.defs.read().expect("tool registry defs lock poisoned").is_empty()
     }
 }
 
@@ -160,36 +165,37 @@ pub fn build_registry_full(
     rag: Option<std::sync::Arc<crate::memory::rag::RagEngine>>,
     proactive: Option<std::sync::Arc<crate::automation::proactive::ProactiveEngine>>,
 ) -> ToolRegistry {
-    let mut reg = ToolRegistry::new();
+    let reg = ToolRegistry::new();
 
-    super::system_info::register(&mut reg);
-    super::file_ops::register(&mut reg);
-    super::app_lifecycle::register(&mut reg);
-    super::shell::register(&mut reg);
-    super::internet::register(&mut reg);
+    super::system_info::register(&reg);
+    super::file_ops::register(&reg);
+    super::app_lifecycle::register(&reg);
+    super::shell::register(&reg);
+    super::internet::register(&reg);
     if let Some(s) = store {
-        super::knowledge::register(&mut reg, s);
+        super::knowledge::register(&reg, s);
     } else {
         // Register without memory backing (stubs for testing)
-        super::knowledge::register_stubs(&mut reg);
+        super::knowledge::register_stubs(&reg);
     }
-    super::system_config::register(&mut reg);
-    super::power::register(&mut reg);
-    super::process::register(&mut reg);
-    super::documents::register(&mut reg);
-    super::communication::register(&mut reg);
-    super::interaction::register(&mut reg);
-    super::disk::register(&mut reg);
-    super::scheduler::register(&mut reg);
-    super::vision::register(&mut reg, None);
-    super::desktop::register(&mut reg);
-    super::developer::register(&mut reg);
-    super::i18n::register(&mut reg);
+    super::system_config::register(&reg);
+    super::power::register(&reg);
+    super::process::register(&reg);
+    super::documents::register(&reg);
+    super::communication::register(&reg);
+    super::interaction::register(&reg);
+    super::disk::register(&reg);
+    super::packages::register(&reg);
+    super::scheduler::register(&reg);
+    super::vision::register(&reg, None);
+    super::desktop::register(&reg);
+    super::developer::register(&reg);
+    super::i18n::register(&reg);
     if let Some(rag_engine) = rag {
-        super::rag::register(&mut reg, rag_engine);
+        super::rag::register(&reg, rag_engine);
     }
     if let Some(proactive_engine) = proactive {
-        super::proactive::register(&mut reg, proactive_engine);
+        super::proactive::register(&reg, proactive_engine);
     }
 
     tracing::info!(count = reg.len(), "tool registry built");

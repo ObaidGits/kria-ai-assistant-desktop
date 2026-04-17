@@ -101,6 +101,14 @@ static GREEN_ACTIONS: Lazy<HashSet<&str>> = Lazy::new(|| {
         "web_extract_article", "embeddings_generate", "audio_preprocess",
         // Misc
         "open_url", "list_installed_packages",
+        // Package queries (read-only)
+        "search_package", "check_package_installed", "check_package_updates", "get_package_info",
+        "search_news", "fetch_article", "list_news_sources", "news_status",
+        // Google Workspace (read-only)
+        "gw_gmail_inbox", "gw_gmail_search", "gw_gmail_read",
+        "gw_calendar_today", "gw_calendar_search",
+        "gw_drive_search", "gw_drive_list", "gw_drive_read",
+        "gw_docs_read", "gw_sheets_read", "gw_slides_read",
     ].into_iter().collect()
 });
 
@@ -135,6 +143,10 @@ static YELLOW_ACTIONS: Lazy<HashSet<&str>> = Lazy::new(|| {
         "watch_directory",
         // Desktop (window manipulation)
         "move_window", "resize_window", "maximize_window", "minimize_window", "tile_windows",
+        // Google Workspace (create/edit — reversible)
+        "gw_docs_create", "gw_docs_edit",
+        "gw_sheets_create", "gw_sheets_edit",
+        "gw_slides_create",
     ].into_iter().collect()
 });
 
@@ -150,6 +162,7 @@ static RED_ACTIONS: Lazy<HashSet<&str>> = Lazy::new(|| {
         "shutdown_system", "reboot_system", "clean_temp_files",
         // Package Management
         "install_application", "uninstall_application", "update_all_packages",
+        "install_package", "uninstall_package",
         // Code Execution
         "execute_python", "execute_bash", "execute_powershell",
         // Scheduled Tasks
@@ -164,6 +177,10 @@ static RED_ACTIONS: Lazy<HashSet<&str>> = Lazy::new(|| {
         "git_commit", "git_checkout",
         // RAG (destructive)
         "delete_knowledge_item",
+        // Google Workspace (send/delete/share — irreversible)
+        "gw_gmail_send", "gw_gmail_delete",
+        "gw_drive_delete",
+        "gw_calendar_create", "gw_calendar_delete",
     ].into_iter().collect()
 });
 
