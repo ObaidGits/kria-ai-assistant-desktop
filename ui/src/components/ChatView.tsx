@@ -1,4 +1,4 @@
-import { Component, For, Show, createEffect, createSignal, createMemo, onCleanup } from "solid-js";
+import { Component, For, Show, createEffect, createSignal, createMemo, onCleanup, untrack } from "solid-js";
 import { appStore } from "../stores/app";
 import MessageBubble from "./MessageBubble";
 import ExportDropdown from "./ExportDropdown";
@@ -86,7 +86,9 @@ const ChatView: Component = () => {
   // Reset pending image when session changes to avoid stale preview/input state.
   createEffect(() => {
     currentSession();
-    clearPendingImage();
+    // Avoid tracking `pendingImage` here; otherwise selecting an image retriggers this
+    // effect and clears the preview immediately.
+    untrack(() => clearPendingImage());
   });
 
   onCleanup(() => {

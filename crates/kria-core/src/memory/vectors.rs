@@ -41,7 +41,12 @@ impl VectorIndex {
 
     /// Add a vector.
     pub fn add(&self, id: i64, vector: Vec<f32>) -> anyhow::Result<()> {
-        anyhow::ensure!(vector.len() == self.dim, "vector dimension mismatch: expected {}, got {}", self.dim, vector.len());
+        anyhow::ensure!(
+            vector.len() == self.dim,
+            "vector dimension mismatch: expected {}, got {}",
+            self.dim,
+            vector.len()
+        );
         self.vectors.lock().unwrap().insert(id, vector);
         Ok(())
     }

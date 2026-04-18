@@ -1,6 +1,6 @@
-use rusqlite::{Connection, params};
-use std::sync::Mutex;
 use crate::safety::RiskLevel;
+use rusqlite::{params, Connection};
+use std::sync::Mutex;
 
 /// Decision made by the policy/HITL system.
 #[derive(Debug, Clone, Copy, serde::Serialize)]
@@ -93,7 +93,9 @@ impl AuditLogger {
             CREATE INDEX IF NOT EXISTS idx_audit_action    ON audit_log(action);"
         ).expect("failed to create audit_log table");
 
-        Self { conn: Mutex::new(conn) }
+        Self {
+            conn: Mutex::new(conn),
+        }
     }
 
     /// Log a tool action with its policy decision.
@@ -173,19 +175,21 @@ impl AuditLogger {
             .map(|v| v as &dyn rusqlite::types::ToSql)
             .collect();
 
-        let rows = stmt.query_map(param_refs.as_slice(), |row| {
-            Ok(serde_json::json!({
-                "id": row.get::<_, i64>(0)?,
-                "timestamp": row.get::<_, String>(1)?,
-                "session_id": row.get::<_, String>(2)?,
-                "action": row.get::<_, String>(3)?,
-                "risk_level": row.get::<_, String>(4)?,
-                "decision": row.get::<_, String>(5)?,
-                "decided_by": row.get::<_, String>(6)?,
-                "result": row.get::<_, Option<String>>(7)?,
-                "error_msg": row.get::<_, Option<String>>(8)?,
-            }))
-        }).unwrap();
+        let rows = stmt
+            .query_map(param_refs.as_slice(), |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, i64>(0)?,
+                    "timestamp": row.get::<_, String>(1)?,
+                    "session_id": row.get::<_, String>(2)?,
+                    "action": row.get::<_, String>(3)?,
+                    "risk_level": row.get::<_, String>(4)?,
+                    "decision": row.get::<_, String>(5)?,
+                    "decided_by": row.get::<_, String>(6)?,
+                    "result": row.get::<_, Option<String>>(7)?,
+                    "error_msg": row.get::<_, Option<String>>(8)?,
+                }))
+            })
+            .unwrap();
 
         rows.filter_map(|r| r.ok()).collect()
     }
@@ -193,12 +197,16 @@ impl AuditLogger {
     /// Count entries per risk level (for dashboard stats).
     pub fn stats(&self) -> serde_json::Value {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT risk_level, COUNT(*) FROM audit_log GROUP BY risk_level"
-        ).unwrap();
-        let rows: Vec<_> = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        }).unwrap().filter_map(|r| r.ok()).collect();
+        let mut stmt = conn
+            .prepare("SELECT risk_level, COUNT(*) FROM audit_log GROUP BY risk_level")
+            .unwrap();
+        let rows: Vec<_> = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
 
         let mut m = serde_json::Map::new();
         for (level, count) in rows {

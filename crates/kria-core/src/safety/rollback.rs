@@ -1,6 +1,6 @@
-use std::path::{Path, PathBuf};
 use chrono::Utc;
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
 
 /// Manifest for a rollback snapshot.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -61,7 +61,8 @@ impl RollbackManager {
             if !path.exists() {
                 continue;
             }
-            let filename = path.file_name()
+            let filename = path
+                .file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();

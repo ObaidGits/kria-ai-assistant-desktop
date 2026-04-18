@@ -1,13 +1,13 @@
 pub mod capture;
-pub mod vad;
+pub mod pipeline;
+pub mod playback;
 pub mod stt;
 pub mod tts;
-pub mod playback;
-pub mod pipeline;
+pub mod vad;
 
-pub use capture::AudioCapture;
-pub use vad::VoiceActivityDetector;
+pub use capture::{default_input_device_name, list_input_devices, AudioCapture};
+pub use pipeline::{VoicePipeline, VoicePipelineEvent, VoicePipelineState, VoiceTranscriptFrame};
+pub use playback::{default_output_device_name, list_output_devices, AudioPlayer};
 pub use stt::SpeechToText;
 pub use tts::TextToSpeech;
-pub use playback::AudioPlayer;
-pub use pipeline::{VoicePipeline, VoicePipelineState, VoicePipelineEvent};
+pub use vad::VoiceActivityDetector;

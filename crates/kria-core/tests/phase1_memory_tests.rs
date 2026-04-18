@@ -1,16 +1,15 @@
+use chrono::Utc;
+use kria_core::memory::embeddings::EmbeddingModel;
+use kria_core::memory::facts::FactManager;
+use kria_core::memory::retrieval::ContextBuilder;
 /// Phase 1 — Persistent Memory & Chat History tests
 ///
 /// Validates: MemoryStore CRUD, session management, fact extraction,
 /// knowledge tool wiring, embeddings (fallback), vector index, and
 /// the ContextBuilder retrieval pipeline.
-
-use kria_core::memory::store::{MemoryStore, MemoryFact, ConversationTurn};
+use kria_core::memory::store::{ConversationTurn, MemoryFact, MemoryStore};
 use kria_core::memory::vectors::VectorIndex;
-use kria_core::memory::embeddings::EmbeddingModel;
-use kria_core::memory::facts::FactManager;
-use kria_core::memory::retrieval::ContextBuilder;
 use kria_core::tools::registry;
-use chrono::Utc;
 use std::sync::Arc;
 
 fn tmp_store() -> MemoryStore {
@@ -24,9 +23,14 @@ fn store_and_retrieve_turns() {
     let store = tmp_store();
     let sid = "test-session-1";
     let turn = ConversationTurn {
-        id: None, session_id: sid.into(), role: "user".into(),
-        content: "Hello KRIA".into(), tool_name: None, tool_result: None,
-        tokens_used: Some(5), timestamp: Utc::now(),
+        id: None,
+        session_id: sid.into(),
+        role: "user".into(),
+        content: "Hello KRIA".into(),
+        tool_name: None,
+        tool_result: None,
+        tokens_used: Some(5),
+        timestamp: Utc::now(),
     };
     let id = store.store_turn(&turn).unwrap();
     assert!(id > 0);
@@ -42,11 +46,18 @@ fn multiple_turns_ordered_correctly() {
     let store = tmp_store();
     let sid = "session-order";
     for i in 0..5 {
-        store.store_turn(&ConversationTurn {
-            id: None, session_id: sid.into(), role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
-            content: format!("msg-{}", i), tool_name: None, tool_result: None,
-            tokens_used: None, timestamp: Utc::now(),
-        }).unwrap();
+        store
+            .store_turn(&ConversationTurn {
+                id: None,
+                session_id: sid.into(),
+                role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+                content: format!("msg-{}", i),
+                tool_name: None,
+                tool_result: None,
+                tokens_used: None,
+                timestamp: Utc::now(),
+            })
+            .unwrap();
     }
     let turns = store.get_recent_turns(sid, 10).unwrap();
     assert_eq!(turns.len(), 5);
@@ -59,11 +70,18 @@ fn multiple_turns_ordered_correctly() {
 fn list_sessions_returns_all() {
     let store = tmp_store();
     for sid in &["s1", "s2", "s3"] {
-        store.store_turn(&ConversationTurn {
-            id: None, session_id: sid.to_string(), role: "user".into(),
-            content: "hi".into(), tool_name: None, tool_result: None,
-            tokens_used: None, timestamp: Utc::now(),
-        }).unwrap();
+        store
+            .store_turn(&ConversationTurn {
+                id: None,
+                session_id: sid.to_string(),
+                role: "user".into(),
+                content: "hi".into(),
+                tool_name: None,
+                tool_result: None,
+                tokens_used: None,
+                timestamp: Utc::now(),
+            })
+            .unwrap();
     }
     let sessions = store.list_sessions().unwrap();
     assert_eq!(sessions.len(), 3);
@@ -74,11 +92,18 @@ fn delete_session_removes_all_turns() {
     let store = tmp_store();
     let sid = "doomed-session";
     for _ in 0..3 {
-        store.store_turn(&ConversationTurn {
-            id: None, session_id: sid.into(), role: "user".into(),
-            content: "temp".into(), tool_name: None, tool_result: None,
-            tokens_used: None, timestamp: Utc::now(),
-        }).unwrap();
+        store
+            .store_turn(&ConversationTurn {
+                id: None,
+                session_id: sid.into(),
+                role: "user".into(),
+                content: "temp".into(),
+                tool_name: None,
+                tool_result: None,
+                tokens_used: None,
+                timestamp: Utc::now(),
+            })
+            .unwrap();
     }
     let deleted = store.delete_session(sid).unwrap();
     assert_eq!(deleted, 3);
@@ -88,16 +113,30 @@ fn delete_session_removes_all_turns() {
 #[test]
 fn search_conversations_fts() {
     let store = tmp_store();
-    store.store_turn(&ConversationTurn {
-        id: None, session_id: "s".into(), role: "user".into(),
-        content: "Tell me about quantum computing".into(),
-        tool_name: None, tool_result: None, tokens_used: None, timestamp: Utc::now(),
-    }).unwrap();
-    store.store_turn(&ConversationTurn {
-        id: None, session_id: "s".into(), role: "assistant".into(),
-        content: "Quantum computing uses qubits".into(),
-        tool_name: None, tool_result: None, tokens_used: None, timestamp: Utc::now(),
-    }).unwrap();
+    store
+        .store_turn(&ConversationTurn {
+            id: None,
+            session_id: "s".into(),
+            role: "user".into(),
+            content: "Tell me about quantum computing".into(),
+            tool_name: None,
+            tool_result: None,
+            tokens_used: None,
+            timestamp: Utc::now(),
+        })
+        .unwrap();
+    store
+        .store_turn(&ConversationTurn {
+            id: None,
+            session_id: "s".into(),
+            role: "assistant".into(),
+            content: "Quantum computing uses qubits".into(),
+            tool_name: None,
+            tool_result: None,
+            tokens_used: None,
+            timestamp: Utc::now(),
+        })
+        .unwrap();
 
     let results = store.search_conversations("quantum", 10).unwrap();
     assert!(results.len() >= 1, "FTS should find 'quantum'");
@@ -109,10 +148,14 @@ fn search_conversations_fts() {
 fn store_and_search_facts() {
     let store = tmp_store();
     let fact = MemoryFact {
-        id: None, text: "User prefers dark mode".into(),
-        category: "preference".into(), source: "conversation".into(),
-        created_at: Utc::now(), last_accessed: Utc::now(),
-        access_count: 0, decay_score: 1.0,
+        id: None,
+        text: "User prefers dark mode".into(),
+        category: "preference".into(),
+        source: "conversation".into(),
+        created_at: Utc::now(),
+        last_accessed: Utc::now(),
+        access_count: 0,
+        decay_score: 1.0,
     };
     let id = store.store_fact(&fact).unwrap();
     assert!(id > 0);
@@ -125,16 +168,30 @@ fn store_and_search_facts() {
 #[test]
 fn all_facts_with_decay_filters() {
     let store = tmp_store();
-    store.store_fact(&MemoryFact {
-        id: None, text: "high decay".into(), category: "test".into(),
-        source: "test".into(), created_at: Utc::now(), last_accessed: Utc::now(),
-        access_count: 0, decay_score: 0.9,
-    }).unwrap();
-    store.store_fact(&MemoryFact {
-        id: None, text: "low decay".into(), category: "test".into(),
-        source: "test".into(), created_at: Utc::now(), last_accessed: Utc::now(),
-        access_count: 0, decay_score: 0.1,
-    }).unwrap();
+    store
+        .store_fact(&MemoryFact {
+            id: None,
+            text: "high decay".into(),
+            category: "test".into(),
+            source: "test".into(),
+            created_at: Utc::now(),
+            last_accessed: Utc::now(),
+            access_count: 0,
+            decay_score: 0.9,
+        })
+        .unwrap();
+    store
+        .store_fact(&MemoryFact {
+            id: None,
+            text: "low decay".into(),
+            category: "test".into(),
+            source: "test".into(),
+            created_at: Utc::now(),
+            last_accessed: Utc::now(),
+            access_count: 0,
+            decay_score: 0.1,
+        })
+        .unwrap();
 
     let high = store.all_facts_with_decay(0.5).unwrap();
     assert_eq!(high.len(), 1);
@@ -144,11 +201,18 @@ fn all_facts_with_decay_filters() {
 #[test]
 fn update_fact_access_increments() {
     let store = tmp_store();
-    let id = store.store_fact(&MemoryFact {
-        id: None, text: "access test".into(), category: "t".into(),
-        source: "t".into(), created_at: Utc::now(), last_accessed: Utc::now(),
-        access_count: 0, decay_score: 1.0,
-    }).unwrap();
+    let id = store
+        .store_fact(&MemoryFact {
+            id: None,
+            text: "access test".into(),
+            category: "t".into(),
+            source: "t".into(),
+            created_at: Utc::now(),
+            last_accessed: Utc::now(),
+            access_count: 0,
+            decay_score: 1.0,
+        })
+        .unwrap();
 
     store.update_fact_access(id).unwrap();
     store.update_fact_access(id).unwrap();
@@ -161,9 +225,19 @@ fn update_fact_access_increments() {
 #[test]
 fn save_and_get_snippet() {
     let store = tmp_store();
-    store.save_snippet("hello_world", "fn main() { println!(\"Hello\"); }", "rust", &[]).unwrap();
+    store
+        .save_snippet(
+            "hello_world",
+            "fn main() { println!(\"Hello\"); }",
+            "rust",
+            &[],
+        )
+        .unwrap();
 
-    let (content, lang, _tags) = store.get_snippet("hello_world").unwrap().expect("snippet exists");
+    let (content, lang, _tags) = store
+        .get_snippet("hello_world")
+        .unwrap()
+        .expect("snippet exists");
     assert_eq!(lang, "rust");
     assert!(content.contains("println"));
 }
@@ -209,7 +283,11 @@ fn embedding_fallback_is_normalized() {
     let model = EmbeddingModel::load(128).unwrap();
     let vec = model.embed("test embedding").unwrap();
     let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
-    assert!((norm - 1.0).abs() < 0.01, "should be L2-normalized, got norm={}", norm);
+    assert!(
+        (norm - 1.0).abs() < 0.01,
+        "should be L2-normalized, got norm={}",
+        norm
+    );
 }
 
 #[test]
@@ -218,7 +296,11 @@ fn embedding_different_texts_differ() {
     let v1 = model.embed("rust programming").unwrap();
     let v2 = model.embed("chocolate cake recipe").unwrap();
     let sim: f32 = v1.iter().zip(&v2).map(|(a, b)| a * b).sum();
-    assert!(sim < 0.99, "different texts should produce different embeddings, sim={}", sim);
+    assert!(
+        sim < 0.99,
+        "different texts should produce different embeddings, sim={}",
+        sim
+    );
 }
 
 // ── VectorIndex ────────────────────────────────────────────────
@@ -256,11 +338,15 @@ fn fact_manager_deduplicates() {
     let embeddings = EmbeddingModel::load(128).unwrap();
     let mgr = FactManager::new(&store, &vectors, &embeddings);
 
-    let id1 = mgr.add_fact("user likes rust", "preference", "test").unwrap();
+    let id1 = mgr
+        .add_fact("user likes rust", "preference", "test")
+        .unwrap();
     assert!(id1.is_some(), "first insert should succeed");
 
     // Exact same text → should deduplicate (similarity ≥ 0.92)
-    let id2 = mgr.add_fact("user likes rust", "preference", "test").unwrap();
+    let id2 = mgr
+        .add_fact("user likes rust", "preference", "test")
+        .unwrap();
     assert!(id2.is_none(), "duplicate should be skipped");
 }
 
@@ -272,11 +358,18 @@ fn fact_manager_extract_from_turn() {
     let mgr = FactManager::new(&store, &vectors, &embeddings);
 
     // Message with a "I prefer" pattern → should extract
-    let ids = mgr.extract_from_turn("I prefer dark mode for coding", "OK, noted!").unwrap();
-    assert!(!ids.is_empty(), "should extract fact from 'I prefer' pattern");
+    let ids = mgr
+        .extract_from_turn("I prefer dark mode for coding", "OK, noted!")
+        .unwrap();
+    assert!(
+        !ids.is_empty(),
+        "should extract fact from 'I prefer' pattern"
+    );
 
     // Message without any pattern → should not extract
-    let ids2 = mgr.extract_from_turn("What's the weather?", "I can't check weather yet.").unwrap();
+    let ids2 = mgr
+        .extract_from_turn("What's the weather?", "I can't check weather yet.")
+        .unwrap();
     assert!(ids2.is_empty(), "no pattern → no extraction");
 }
 
@@ -309,10 +402,12 @@ async fn remember_fact_tool_persists() {
     let reg = registry::build_registry_with_store(Some(store.clone()));
     let handler = reg.get_handler("remember_fact").unwrap().clone();
 
-    let result = handler.execute(serde_json::json!({
-        "key": "food",
-        "value": "user loves sushi"
-    })).await;
+    let result = handler
+        .execute(serde_json::json!({
+            "key": "food",
+            "value": "user loves sushi"
+        }))
+        .await;
 
     assert!(result.success);
     assert_eq!(result.data["stored"], true);
@@ -327,17 +422,25 @@ async fn remember_fact_tool_persists() {
 #[tokio::test]
 async fn recall_fact_tool_searches() {
     let store = Arc::new(tmp_store());
-    store.store_fact(&MemoryFact {
-        id: None, text: "User enjoys hiking in mountains".into(),
-        category: "hobby".into(), source: "test".into(),
-        created_at: Utc::now(), last_accessed: Utc::now(),
-        access_count: 0, decay_score: 1.0,
-    }).unwrap();
+    store
+        .store_fact(&MemoryFact {
+            id: None,
+            text: "User enjoys hiking in mountains".into(),
+            category: "hobby".into(),
+            source: "test".into(),
+            created_at: Utc::now(),
+            last_accessed: Utc::now(),
+            access_count: 0,
+            decay_score: 1.0,
+        })
+        .unwrap();
 
     let reg = registry::build_registry_with_store(Some(store));
     let handler = reg.get_handler("recall_fact").unwrap().clone();
 
-    let result = handler.execute(serde_json::json!({ "query": "hiking" })).await;
+    let result = handler
+        .execute(serde_json::json!({ "query": "hiking" }))
+        .await;
     assert!(result.success);
     assert!(result.data["count"].as_u64().unwrap() >= 1);
 }
@@ -350,9 +453,11 @@ async fn save_and_get_snippet_tools() {
     let save = reg.get_handler("save_snippet").unwrap().clone();
     let get = reg.get_handler("get_snippet").unwrap().clone();
 
-    let res = save.execute(serde_json::json!({
-        "name": "greet", "content": "print('hello')", "language": "python"
-    })).await;
+    let res = save
+        .execute(serde_json::json!({
+            "name": "greet", "content": "print('hello')", "language": "python"
+        }))
+        .await;
     assert!(res.success);
 
     let res2 = get.execute(serde_json::json!({ "name": "greet" })).await;
@@ -370,12 +475,22 @@ fn context_builder_retrieves_relevant_facts() {
     let embeddings = EmbeddingModel::load(128).unwrap();
 
     // Add some facts with vectors
-    for (_i, text) in ["Rust is fast", "Python is flexible", "KRIA uses local LLMs"].iter().enumerate() {
-        let id = store.store_fact(&MemoryFact {
-            id: None, text: text.to_string(), category: "tech".into(),
-            source: "test".into(), created_at: Utc::now(), last_accessed: Utc::now(),
-            access_count: 0, decay_score: 1.0,
-        }).unwrap();
+    for (_i, text) in ["Rust is fast", "Python is flexible", "KRIA uses local LLMs"]
+        .iter()
+        .enumerate()
+    {
+        let id = store
+            .store_fact(&MemoryFact {
+                id: None,
+                text: text.to_string(),
+                category: "tech".into(),
+                source: "test".into(),
+                created_at: Utc::now(),
+                last_accessed: Utc::now(),
+                access_count: 0,
+                decay_score: 1.0,
+            })
+            .unwrap();
         let vec = embeddings.embed(text).unwrap();
         vectors.add(id, vec).unwrap();
     }

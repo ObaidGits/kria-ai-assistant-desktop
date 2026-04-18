@@ -60,7 +60,9 @@ async fn ws_chat_returns_ack_then_done() {
     let _ = next_text(&mut stream).await;
 
     let msg = serde_json::json!({ "type": "chat", "message": "Hello!" });
-    sink.send(Message::Text(msg.to_string().into())).await.unwrap();
+    sink.send(Message::Text(msg.to_string().into()))
+        .await
+        .unwrap();
 
     let ack = next_text(&mut stream).await;
     assert_eq!(ack["type"], "ack");
@@ -82,7 +84,9 @@ async fn ws_approve_returns_hitl_ack() {
     let _ = next_text(&mut stream).await; // welcome
 
     let msg = serde_json::json!({ "type": "approve", "request_id": "abc-123" });
-    sink.send(Message::Text(msg.to_string().into())).await.unwrap();
+    sink.send(Message::Text(msg.to_string().into()))
+        .await
+        .unwrap();
 
     let resp = next_text(&mut stream).await;
     assert_eq!(resp["type"], "hitl_ack");
@@ -98,7 +102,9 @@ async fn ws_deny_returns_hitl_ack() {
     let _ = next_text(&mut stream).await; // welcome
 
     let msg = serde_json::json!({ "type": "deny", "request_id": "abc-123", "reason": "too risky" });
-    sink.send(Message::Text(msg.to_string().into())).await.unwrap();
+    sink.send(Message::Text(msg.to_string().into()))
+        .await
+        .unwrap();
 
     let resp = next_text(&mut stream).await;
     assert_eq!(resp["type"], "hitl_ack");
@@ -116,7 +122,9 @@ async fn ws_ping_returns_pong() {
     let _ = next_text(&mut stream).await; // welcome
 
     let ping = serde_json::json!({ "type": "ping" });
-    sink.send(Message::Text(ping.to_string().into())).await.unwrap();
+    sink.send(Message::Text(ping.to_string().into()))
+        .await
+        .unwrap();
 
     let pong = next_text(&mut stream).await;
     assert_eq!(pong["type"], "pong");
@@ -133,11 +141,16 @@ async fn ws_unknown_type_returns_error() {
     let _ = next_text(&mut stream).await; // welcome
 
     let bad = serde_json::json!({ "type": "foobar" });
-    sink.send(Message::Text(bad.to_string().into())).await.unwrap();
+    sink.send(Message::Text(bad.to_string().into()))
+        .await
+        .unwrap();
 
     let err = next_text(&mut stream).await;
     assert_eq!(err["type"], "error");
-    assert!(err["message"].as_str().unwrap().contains("unknown message type"));
+    assert!(err["message"]
+        .as_str()
+        .unwrap()
+        .contains("unknown message type"));
 }
 
 #[tokio::test]
@@ -148,7 +161,9 @@ async fn ws_invalid_json_returns_error() {
 
     let _ = next_text(&mut stream).await; // welcome
 
-    sink.send(Message::Text("not valid json {{{".into())).await.unwrap();
+    sink.send(Message::Text("not valid json {{{".into()))
+        .await
+        .unwrap();
 
     let err = next_text(&mut stream).await;
     assert_eq!(err["type"], "error");

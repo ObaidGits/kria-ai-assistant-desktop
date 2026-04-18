@@ -26,7 +26,11 @@ pub struct CircuitBreaker {
 }
 
 impl CircuitBreaker {
-    pub fn new(name: impl Into<String>, failure_threshold: u32, recovery_timeout: Duration) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        failure_threshold: u32,
+        recovery_timeout: Duration,
+    ) -> Self {
         Self {
             name: name.into(),
             failure_threshold,

@@ -25,7 +25,7 @@
       "trust_level": "YELLOW",
       "tool_overrides": {
         "createGmailDraft": "YELLOW",
-        "sendGmailDraft": "RED",
+        "sendGmailDraft": "YELLOW",
         "deleteGmailMessage": "RED",
         "deleteFile": "RED",
         "createCalendarEvent": "YELLOW",

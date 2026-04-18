@@ -1,3 +1,5 @@
+use ort::session::Session;
+use ort::value::Tensor;
 /// Local sentence embeddings.
 ///
 /// Uses ONNX Runtime (`ort`) for real embedding inference with
@@ -5,8 +7,6 @@
 /// if the ONNX model is not available.
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use ort::session::Session;
-use ort::value::Tensor;
 
 pub struct EmbeddingModel {
     dim: usize,
@@ -19,7 +19,9 @@ impl EmbeddingModel {
     pub fn load(dim: usize) -> anyhow::Result<Self> {
         // Try to find the ONNX model in standard locations
         let model_paths = [
-            dirs::home_dir().unwrap_or_default().join(".kria/models/embeddings/all-MiniLM-L6-v2.onnx"),
+            dirs::home_dir()
+                .unwrap_or_default()
+                .join(".kria/models/embeddings/all-MiniLM-L6-v2.onnx"),
             PathBuf::from("models/embeddings/all-MiniLM-L6-v2.onnx"),
         ];
 
@@ -28,7 +30,10 @@ impl EmbeddingModel {
                 match Session::builder()?.commit_from_file(path) {
                     Ok(session) => {
                         tracing::info!(path = %path.display(), "embedding model loaded (ONNX)");
-                        return Ok(Self { dim, session: Some(Arc::new(Mutex::new(session))) });
+                        return Ok(Self {
+                            dim,
+                            session: Some(Arc::new(Mutex::new(session))),
+                        });
                     }
                     Err(e) => {
                         tracing::warn!(path = %path.display(), error = %e, "failed to load ONNX model, using fallback");
@@ -44,7 +49,9 @@ impl EmbeddingModel {
     /// Generate an embedding vector for the given text.
     pub fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
         if let Some(ref session) = self.session {
-            let mut guard = session.lock().map_err(|e| anyhow::anyhow!("mutex poisoned: {e}"))?;
+            let mut guard = session
+                .lock()
+                .map_err(|e| anyhow::anyhow!("mutex poisoned: {e}"))?;
             self.embed_onnx(&mut guard, text)
         } else {
             self.embed_fallback(text)
@@ -58,18 +65,10 @@ impl EmbeddingModel {
         let tokens = self.simple_tokenize(text);
         let seq_len = tokens.len();
 
-        let input_ids = Array2::from_shape_vec(
-            (1, seq_len),
-            tokens.iter().map(|&t| t as i64).collect(),
-        )?;
-        let attention_mask = Array2::from_shape_vec(
-            (1, seq_len),
-            vec![1i64; seq_len],
-        )?;
-        let token_type_ids = Array2::from_shape_vec(
-            (1, seq_len),
-            vec![0i64; seq_len],
-        )?;
+        let input_ids =
+            Array2::from_shape_vec((1, seq_len), tokens.iter().map(|&t| t as i64).collect())?;
+        let attention_mask = Array2::from_shape_vec((1, seq_len), vec![1i64; seq_len])?;
+        let token_type_ids = Array2::from_shape_vec((1, seq_len), vec![0i64; seq_len])?;
 
         let input_ids_val = Tensor::from_array(input_ids)?;
         let attention_mask_val = Tensor::from_array(attention_mask)?;
@@ -84,8 +83,16 @@ impl EmbeddingModel {
         // try_extract_tensor returns (&Shape, &[f32])
         // Shape derefs to &[i64], shape is [batch=1, seq_len, hidden_dim]
         let (shape, data) = outputs[0].try_extract_tensor::<f32>()?;
-        let hidden_dim = if shape.len() >= 3 { shape[2] as usize } else { self.dim };
-        let seq_len_out = if shape.len() >= 3 { shape[1] as usize } else { 1 };
+        let hidden_dim = if shape.len() >= 3 {
+            shape[2] as usize
+        } else {
+            self.dim
+        };
+        let seq_len_out = if shape.len() >= 3 {
+            shape[1] as usize
+        } else {
+            1
+        };
 
         // Mean pool over sequence dimension
         let mut pooled = vec![0.0f32; hidden_dim];
@@ -120,7 +127,9 @@ impl EmbeddingModel {
         let mut tokens = vec![101u32]; // [CLS]
         for word in text.split_whitespace().take(510) {
             // Simple hash to vocab range (30522 for BERT-like models)
-            let hash = word.bytes().fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
+            let hash = word
+                .bytes()
+                .fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
             tokens.push(hash % 30520 + 2); // avoid special tokens 0,1
         }
         tokens.push(102); // [SEP]

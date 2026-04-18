@@ -1,16 +1,25 @@
-use std::sync::Arc;
-use async_trait::async_trait;
 use crate::infra::ToolResult;
-use crate::safety::RiskLevel;
-use crate::tools::registry::{ToolRegistry, ToolDef, ToolHandler, ParamDef};
 use crate::memory::rag::RagEngine;
+use crate::safety::RiskLevel;
+use crate::tools::registry::{ParamDef, ToolDef, ToolHandler, ToolRegistry};
+use async_trait::async_trait;
+use std::sync::Arc;
 
 fn param(name: &str, ty: &str, desc: &str, required: bool) -> ParamDef {
-    ParamDef { name: name.into(), param_type: ty.into(), description: desc.into(), required, default: None }
+    ParamDef {
+        name: name.into(),
+        param_type: ty.into(),
+        description: desc.into(),
+        required,
+        default: None,
+    }
 }
 
-struct IngestDocument { rag: Arc<RagEngine> }
-#[async_trait] impl ToolHandler for IngestDocument {
+struct IngestDocument {
+    rag: Arc<RagEngine>,
+}
+#[async_trait]
+impl ToolHandler for IngestDocument {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
         let path = params["path"].as_str().unwrap_or("");
         if path.is_empty() {
@@ -21,11 +30,13 @@ struct IngestDocument { rag: Arc<RagEngine> }
             return ToolResult::err(format!("file not found: {path}"));
         }
 
-        let name = file_path.file_name()
+        let name = file_path
+            .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or(path)
             .to_string();
-        let doc_type = file_path.extension()
+        let doc_type = file_path
+            .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("text")
             .to_string();
@@ -42,7 +53,10 @@ struct IngestDocument { rag: Arc<RagEngine> }
 
         let chunk_size = params["chunk_size"].as_u64().unwrap_or(512) as usize;
         let overlap = params["overlap"].as_u64().unwrap_or(64) as usize;
-        let config = crate::memory::rag::ChunkConfig { chunk_size, overlap };
+        let config = crate::memory::rag::ChunkConfig {
+            chunk_size,
+            overlap,
+        };
 
         match self.rag.ingest(&name, &doc_type, &text, &config) {
             Ok((doc_id, chunks)) => ToolResult::ok(serde_json::json!({
@@ -56,8 +70,11 @@ struct IngestDocument { rag: Arc<RagEngine> }
     }
 }
 
-struct RagQuery { rag: Arc<RagEngine> }
-#[async_trait] impl ToolHandler for RagQuery {
+struct RagQuery {
+    rag: Arc<RagEngine>,
+}
+#[async_trait]
+impl ToolHandler for RagQuery {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
         let query = params["query"].as_str().unwrap_or("");
         if query.is_empty() {
@@ -67,19 +84,33 @@ struct RagQuery { rag: Arc<RagEngine> }
 
         match self.rag.retrieve(query, limit) {
             Ok(results) => {
-                let citations: Vec<serde_json::Value> = results.iter().map(|r| {
-                    serde_json::json!({
-                        "content": r.content,
-                        "source": r.doc_name,
-                        "doc_id": r.doc_id,
-                        "chunk_index": r.chunk_index,
-                        "score": (r.score * 100.0).round() / 100.0,
+                let citations: Vec<serde_json::Value> = results
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "content": r.content,
+                            "source": r.doc_name,
+                            "doc_id": r.doc_id,
+                            "chunk_index": r.chunk_index,
+                            "score": (r.score * 100.0).round() / 100.0,
+                        })
                     })
-                }).collect();
+                    .collect();
                 // Build a context string for the LLM
-                let context: String = results.iter().enumerate().map(|(i, r)| {
-                    format!("[{}] (from {}, chunk {}): {}", i + 1, r.doc_name, r.chunk_index, r.content)
-                }).collect::<Vec<_>>().join("\n\n");
+                let context: String = results
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| {
+                        format!(
+                            "[{}] (from {}, chunk {}): {}",
+                            i + 1,
+                            r.doc_name,
+                            r.chunk_index,
+                            r.content
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
 
                 ToolResult::ok(serde_json::json!({
                     "results": citations,
@@ -92,19 +123,25 @@ struct RagQuery { rag: Arc<RagEngine> }
     }
 }
 
-struct ListKnowledgeBase { rag: Arc<RagEngine> }
-#[async_trait] impl ToolHandler for ListKnowledgeBase {
+struct ListKnowledgeBase {
+    rag: Arc<RagEngine>,
+}
+#[async_trait]
+impl ToolHandler for ListKnowledgeBase {
     async fn execute(&self, _params: serde_json::Value) -> ToolResult {
         match self.rag.list_documents() {
             Ok(docs) => {
-                let items: Vec<serde_json::Value> = docs.iter().map(|(id, name, dtype, chunks)| {
-                    serde_json::json!({
-                        "doc_id": id,
-                        "name": name,
-                        "type": dtype,
-                        "chunks": chunks,
+                let items: Vec<serde_json::Value> = docs
+                    .iter()
+                    .map(|(id, name, dtype, chunks)| {
+                        serde_json::json!({
+                            "doc_id": id,
+                            "name": name,
+                            "type": dtype,
+                            "chunks": chunks,
+                        })
                     })
-                }).collect();
+                    .collect();
                 ToolResult::ok(serde_json::json!({
                     "documents": items,
                     "count": items.len(),
@@ -115,15 +152,20 @@ struct ListKnowledgeBase { rag: Arc<RagEngine> }
     }
 }
 
-struct DeleteKnowledgeItem { rag: Arc<RagEngine> }
-#[async_trait] impl ToolHandler for DeleteKnowledgeItem {
+struct DeleteKnowledgeItem {
+    rag: Arc<RagEngine>,
+}
+#[async_trait]
+impl ToolHandler for DeleteKnowledgeItem {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
         let doc_id = params["doc_id"].as_str().unwrap_or("");
         if doc_id.is_empty() {
             return ToolResult::err("doc_id is required");
         }
         match self.rag.delete_document(doc_id) {
-            Ok(deleted) => ToolResult::ok(serde_json::json!({ "deleted_chunks": deleted, "doc_id": doc_id })),
+            Ok(deleted) => {
+                ToolResult::ok(serde_json::json!({ "deleted_chunks": deleted, "doc_id": doc_id }))
+            }
             Err(e) => ToolResult::err(format!("delete failed: {e}")),
         }
     }
@@ -161,5 +203,7 @@ pub fn register(reg: &ToolRegistry, rag: Arc<RagEngine>) {
             ],
         }, Arc::new(DeleteKnowledgeItem { rag })),
     ];
-    for (def, handler) in tools { reg.register(def, handler); }
+    for (def, handler) in tools {
+        reg.register(def, handler);
+    }
 }

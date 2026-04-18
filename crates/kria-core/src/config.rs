@@ -1,6 +1,6 @@
+use crate::platform::HardwareTier;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use crate::platform::HardwareTier;
 
 /// Root configuration loaded from TOML.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,7 +50,7 @@ pub struct LocalModelDef {
     pub mmproj_file: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct VoiceConfig {
     pub enabled: bool,
@@ -62,6 +62,14 @@ pub struct VoiceConfig {
     pub mic_device: String,
     pub speaker_device: String,
     pub push_to_talk_key: String,
+    pub language: String,
+    pub partial_update_ms: u64,
+    pub confidence_threshold: f32,
+    pub noise_suppression_mode: String,
+    pub follow_system_default_mic: bool,
+    pub follow_system_default_speaker: bool,
+    pub persist_transcripts: bool,
+    pub persist_raw_audio: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -271,10 +279,18 @@ impl Default for VoiceConfig {
             stt_model: "ggml-base.en.bin".into(),
             tts_voice: "en_US-lessac-high".into(),
             vad_silence_ms: 1000,
-            energy_threshold: 2000.0,
+            energy_threshold: 0.02,
             mic_device: "auto".into(),
             speaker_device: "auto".into(),
             push_to_talk_key: "ctrl+space".into(),
+            language: "auto".into(),
+            partial_update_ms: 2000,
+            confidence_threshold: 0.30,
+            noise_suppression_mode: "off".into(),
+            follow_system_default_mic: true,
+            follow_system_default_speaker: true,
+            persist_transcripts: true,
+            persist_raw_audio: false,
         }
     }
 }
@@ -385,7 +401,10 @@ impl KriaConfig {
 }
 
 /// Load config from default.toml + optional user override.
-pub fn load_config(default_path: &Path, override_path: Option<&Path>) -> anyhow::Result<KriaConfig> {
+pub fn load_config(
+    default_path: &Path,
+    override_path: Option<&Path>,
+) -> anyhow::Result<KriaConfig> {
     let mut config: KriaConfig = if default_path.exists() {
         let text = std::fs::read_to_string(default_path)?;
         toml::from_str(&text)?
@@ -450,7 +469,7 @@ fn merge_config(base: &mut KriaConfig, user: &KriaConfig) {
     if !user.llm.cloud_endpoint.is_empty() {
         base.llm.cloud_endpoint = user.llm.cloud_endpoint.clone();
     }
-    if user.voice.enabled {
+    if user.voice != VoiceConfig::default() {
         base.voice = user.voice.clone();
     }
     if user.safety.emergency_mode {
@@ -487,9 +506,16 @@ pub fn load_mcp_servers(config: &mut KriaConfig) {
                 let mut dir = parent.to_path_buf();
                 for i in 0..5 {
                     let candidate = dir.join("config").join("mcp_servers.json");
-                    tracing::debug!("[MCP config] checking candidate [{}]: {}", i, candidate.display());
+                    tracing::debug!(
+                        "[MCP config] checking candidate [{}]: {}",
+                        i,
+                        candidate.display()
+                    );
                     if candidate.exists() {
-                        tracing::info!("[MCP config] found mcp_servers.json at: {}", candidate.display());
+                        tracing::info!(
+                            "[MCP config] found mcp_servers.json at: {}",
+                            candidate.display()
+                        );
                         v.push(candidate);
                         break;
                     }
@@ -520,14 +546,17 @@ pub fn load_mcp_servers(config: &mut KriaConfig) {
                             let enabled = mcp_cfg.servers.iter().filter(|s| s.enabled).count();
                             tracing::info!(
                                 "[MCP config] loaded {} server(s) ({} enabled) from {}",
-                                mcp_cfg.servers.len(), enabled, path.display()
+                                mcp_cfg.servers.len(),
+                                enabled,
+                                path.display()
                             );
                             // Merge: JSON servers supplement TOML servers (no duplicates by name)
                             for server in mcp_cfg.servers {
                                 if !config.mcp.servers.iter().any(|s| s.name == server.name) {
                                     tracing::info!(
                                         "[MCP config] adding server '{}' (enabled={}) from JSON",
-                                        server.name, server.enabled
+                                        server.name,
+                                        server.enabled
                                     );
                                     config.mcp.servers.push(server);
                                 } else {
@@ -540,7 +569,11 @@ pub fn load_mcp_servers(config: &mut KriaConfig) {
                             return;
                         }
                         Err(e) => {
-                            tracing::warn!("[MCP config] failed to parse {}: {}", path.display(), e);
+                            tracing::warn!(
+                                "[MCP config] failed to parse {}: {}",
+                                path.display(),
+                                e
+                            );
                         }
                     }
                 }

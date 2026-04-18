@@ -10,10 +10,7 @@ pub enum KriaEvent {
         size_bytes: u64,
     },
     /// A user message was received (before processing).
-    MessageReceived {
-        session_id: String,
-        content: String,
-    },
+    MessageReceived { session_id: String, content: String },
     /// A tool execution completed.
     ToolCompleted {
         name: String,
@@ -27,18 +24,11 @@ pub enum KriaEvent {
         success: bool,
     },
     /// Voice transcription completed.
-    VoiceTranscribed {
-        text: String,
-        confidence: f32,
-    },
+    VoiceTranscribed { text: String, confidence: f32 },
     /// Hardware tier was (re)detected.
-    HardwareChanged {
-        tier: String,
-    },
+    HardwareChanged { tier: String },
     /// A skill/plugin was installed or removed.
-    SkillInstalled {
-        name: String,
-    },
+    SkillInstalled { name: String },
     /// Sidecar process is ready.
     SidecarReady,
 }

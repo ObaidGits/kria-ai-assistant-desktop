@@ -1,8 +1,8 @@
-use rusqlite::{Connection, params};
+use chrono::{DateTime, Utc};
+use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Mutex;
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 
 /// Central SQLite storage for conversations, facts, preferences, audit log.
 pub struct MemoryStore {
@@ -170,7 +170,7 @@ impl MemoryStore {
             CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
                 content, content=document_chunks, content_rowid=id
             );
-            "
+            ",
         )?;
         Ok(())
     }
@@ -201,27 +201,34 @@ impl MemoryStore {
         Ok(id)
     }
 
-    pub fn get_recent_turns(&self, session_id: &str, limit: usize) -> anyhow::Result<Vec<ConversationTurn>> {
+    pub fn get_recent_turns(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ConversationTurn>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, session_id, role, content, tool_name, tool_result, tokens_used, timestamp
-             FROM conversations WHERE session_id = ?1 ORDER BY id DESC LIMIT ?2"
+             FROM conversations WHERE session_id = ?1 ORDER BY id DESC LIMIT ?2",
         )?;
-        let turns = stmt.query_map(params![session_id, limit as i64], |row| {
-            Ok(ConversationTurn {
-                id: Some(row.get(0)?),
-                session_id: row.get(1)?,
-                role: row.get(2)?,
-                content: row.get(3)?,
-                tool_name: row.get(4)?,
-                tool_result: row.get(5)?,
-                tokens_used: row.get(6)?,
-                timestamp: row.get::<_, String>(7)
-                    .map(|s| DateTime::parse_from_rfc3339(&s)
-                        .map(|d| d.with_timezone(&Utc))
-                        .unwrap_or_else(|_| Utc::now()))?,
-            })
-        })?.collect::<Result<Vec<_>, _>>()?;
+        let turns = stmt
+            .query_map(params![session_id, limit as i64], |row| {
+                Ok(ConversationTurn {
+                    id: Some(row.get(0)?),
+                    session_id: row.get(1)?,
+                    role: row.get(2)?,
+                    content: row.get(3)?,
+                    tool_name: row.get(4)?,
+                    tool_result: row.get(5)?,
+                    tokens_used: row.get(6)?,
+                    timestamp: row.get::<_, String>(7).map(|s| {
+                        DateTime::parse_from_rfc3339(&s)
+                            .map(|d| d.with_timezone(&Utc))
+                            .unwrap_or_else(|_| Utc::now())
+                    })?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(turns.into_iter().rev().collect())
     }
 
@@ -229,11 +236,11 @@ impl MemoryStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT session_id, COUNT(*) as turns, MAX(timestamp) as last_active
-             FROM conversations GROUP BY session_id ORDER BY last_active DESC"
+             FROM conversations GROUP BY session_id ORDER BY last_active DESC",
         )?;
-        let sessions = stmt.query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?.collect::<Result<Vec<_>, _>>()?;
+        let sessions = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(sessions)
     }
 
@@ -246,28 +253,35 @@ impl MemoryStore {
         Ok(deleted)
     }
 
-    pub fn search_conversations(&self, query: &str, limit: usize) -> anyhow::Result<Vec<ConversationTurn>> {
+    pub fn search_conversations(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ConversationTurn>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT c.id, c.session_id, c.role, c.content, c.tool_name, c.tool_result, c.tokens_used, c.timestamp
              FROM conversations_fts f JOIN conversations c ON f.rowid = c.id
              WHERE conversations_fts MATCH ?1 ORDER BY rank LIMIT ?2"
         )?;
-        let turns = stmt.query_map(params![query, limit as i64], |row| {
-            Ok(ConversationTurn {
-                id: Some(row.get(0)?),
-                session_id: row.get(1)?,
-                role: row.get(2)?,
-                content: row.get(3)?,
-                tool_name: row.get(4)?,
-                tool_result: row.get(5)?,
-                tokens_used: row.get(6)?,
-                timestamp: row.get::<_, String>(7)
-                    .map(|s| DateTime::parse_from_rfc3339(&s)
-                        .map(|d| d.with_timezone(&Utc))
-                        .unwrap_or_else(|_| Utc::now()))?,
-            })
-        })?.collect::<Result<Vec<_>, _>>()?;
+        let turns = stmt
+            .query_map(params![query, limit as i64], |row| {
+                Ok(ConversationTurn {
+                    id: Some(row.get(0)?),
+                    session_id: row.get(1)?,
+                    role: row.get(2)?,
+                    content: row.get(3)?,
+                    tool_name: row.get(4)?,
+                    tool_result: row.get(5)?,
+                    tokens_used: row.get(6)?,
+                    timestamp: row.get::<_, String>(7).map(|s| {
+                        DateTime::parse_from_rfc3339(&s)
+                            .map(|d| d.with_timezone(&Utc))
+                            .unwrap_or_else(|_| Utc::now())
+                    })?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(turns)
     }
 
@@ -320,18 +334,20 @@ impl MemoryStore {
              FROM facts_fts fts JOIN memory_facts f ON fts.rowid = f.id
              WHERE facts_fts MATCH ?1 ORDER BY rank LIMIT ?2"
         )?;
-        let facts = stmt.query_map(params![query, limit as i64], |row| {
-            Ok(MemoryFact {
-                id: Some(row.get(0)?),
-                text: row.get(1)?,
-                category: row.get(2)?,
-                source: row.get(3)?,
-                created_at: parse_dt(row.get::<_, String>(4)?),
-                last_accessed: parse_dt(row.get::<_, String>(5)?),
-                access_count: row.get(6)?,
-                decay_score: row.get(7)?,
-            })
-        })?.collect::<Result<Vec<_>, _>>()?;
+        let facts = stmt
+            .query_map(params![query, limit as i64], |row| {
+                Ok(MemoryFact {
+                    id: Some(row.get(0)?),
+                    text: row.get(1)?,
+                    category: row.get(2)?,
+                    source: row.get(3)?,
+                    created_at: parse_dt(row.get::<_, String>(4)?),
+                    last_accessed: parse_dt(row.get::<_, String>(5)?),
+                    access_count: row.get(6)?,
+                    decay_score: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(facts)
     }
 
@@ -341,18 +357,20 @@ impl MemoryStore {
             "SELECT id, text, category, source, created_at, last_accessed, access_count, decay_score
              FROM memory_facts WHERE decay_score >= ?1 ORDER BY decay_score DESC"
         )?;
-        let facts = stmt.query_map(params![min_score], |row| {
-            Ok(MemoryFact {
-                id: Some(row.get(0)?),
-                text: row.get(1)?,
-                category: row.get(2)?,
-                source: row.get(3)?,
-                created_at: parse_dt(row.get::<_, String>(4)?),
-                last_accessed: parse_dt(row.get::<_, String>(5)?),
-                access_count: row.get(6)?,
-                decay_score: row.get(7)?,
-            })
-        })?.collect::<Result<Vec<_>, _>>()?;
+        let facts = stmt
+            .query_map(params![min_score], |row| {
+                Ok(MemoryFact {
+                    id: Some(row.get(0)?),
+                    text: row.get(1)?,
+                    category: row.get(2)?,
+                    source: row.get(3)?,
+                    created_at: parse_dt(row.get::<_, String>(4)?),
+                    last_accessed: parse_dt(row.get::<_, String>(5)?),
+                    access_count: row.get(6)?,
+                    decay_score: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(facts)
     }
 
@@ -395,16 +413,18 @@ impl MemoryStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT fact_a_id, fact_b_id, relation_type, strength FROM memory_links
-             WHERE fact_a_id = ?1 OR fact_b_id = ?1"
+             WHERE fact_a_id = ?1 OR fact_b_id = ?1",
         )?;
-        let links = stmt.query_map(params![fact_id], |row| {
-            Ok(MemoryLink {
-                fact_a_id: row.get(0)?,
-                fact_b_id: row.get(1)?,
-                relation_type: row.get(2)?,
-                strength: row.get(3)?,
-            })
-        })?.collect::<Result<Vec<_>, _>>()?;
+        let links = stmt
+            .query_map(params![fact_id], |row| {
+                Ok(MemoryLink {
+                    fact_a_id: row.get(0)?,
+                    fact_b_id: row.get(1)?,
+                    relation_type: row.get(2)?,
+                    strength: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(links)
     }
 
@@ -429,7 +449,9 @@ impl MemoryStore {
     pub fn list_preferences(&self) -> anyhow::Result<Vec<(String, String)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT key, value FROM preferences ORDER BY key")?;
-        let prefs = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<Result<Vec<_>, _>>()?;
+        let prefs = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(prefs)
     }
 
@@ -450,7 +472,12 @@ impl MemoryStore {
         Ok(())
     }
 
-    pub fn query_audit(&self, limit: usize, risk_level: Option<&str>, session_id: Option<&str>) -> anyhow::Result<Vec<AuditEntry>> {
+    pub fn query_audit(
+        &self,
+        limit: usize,
+        risk_level: Option<&str>,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<AuditEntry>> {
         let conn = self.conn.lock().unwrap();
         let sql = match (risk_level, session_id) {
             (Some(rl), Some(sid)) =>
@@ -463,28 +490,36 @@ impl MemoryStore {
                 format!("SELECT * FROM audit_log ORDER BY id DESC LIMIT {}", limit),
         };
         let mut stmt = conn.prepare(&sql)?;
-        let entries = stmt.query_map([], |row| {
-            Ok(AuditEntry {
-                id: Some(row.get(0)?),
-                session_id: row.get(1)?,
-                action: row.get(2)?,
-                parameters: row.get(3)?,
-                risk_level: row.get(4)?,
-                decision: row.get(5)?,
-                decided_by: row.get(6)?,
-                result: row.get(7)?,
-                error_msg: row.get(8)?,
-                rollback_id: row.get(9)?,
-                duration_ms: row.get(10)?,
-                timestamp: parse_dt(row.get::<_, String>(11)?),
-            })
-        })?.collect::<Result<Vec<_>, _>>()?;
+        let entries = stmt
+            .query_map([], |row| {
+                Ok(AuditEntry {
+                    id: Some(row.get(0)?),
+                    session_id: row.get(1)?,
+                    action: row.get(2)?,
+                    parameters: row.get(3)?,
+                    risk_level: row.get(4)?,
+                    decision: row.get(5)?,
+                    decided_by: row.get(6)?,
+                    result: row.get(7)?,
+                    error_msg: row.get(8)?,
+                    rollback_id: row.get(9)?,
+                    duration_ms: row.get(10)?,
+                    timestamp: parse_dt(row.get::<_, String>(11)?),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(entries)
     }
 
     // ── Snippets ────────────────────────────────────────────────────
 
-    pub fn save_snippet(&self, name: &str, content: &str, language: &str, tags: &[String]) -> anyhow::Result<()> {
+    pub fn save_snippet(
+        &self,
+        name: &str,
+        content: &str,
+        language: &str,
+        tags: &[String],
+    ) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         let tags_json = serde_json::to_string(tags)?;
         conn.execute(
@@ -496,21 +531,28 @@ impl MemoryStore {
 
     pub fn get_snippet(&self, name: &str) -> anyhow::Result<Option<(String, String, String)>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT content, language, tags FROM snippets WHERE name = ?1")?;
-        let mut rows = stmt.query_map(params![name], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        let mut stmt =
+            conn.prepare("SELECT content, language, tags FROM snippets WHERE name = ?1")?;
+        let mut rows = stmt.query_map(params![name], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
         Ok(rows.next().transpose()?)
     }
 
     pub fn list_snippets(&self, tag: Option<&str>) -> anyhow::Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT name, tags FROM snippets ORDER BY name")?;
-        let all: Vec<(String, String)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<Result<Vec<_>, _>>()?;
-        let filtered: Vec<String> = all.into_iter().filter(|(_, tags_json)| {
-            match tag {
+        let all: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let filtered: Vec<String> = all
+            .into_iter()
+            .filter(|(_, tags_json)| match tag {
                 Some(t) => tags_json.contains(t),
                 None => true,
-            }
-        }).map(|(name, _)| name).collect();
+            })
+            .map(|(name, _)| name)
+            .collect();
         Ok(filtered)
     }
 
@@ -548,18 +590,20 @@ impl MemoryStore {
              FROM chunks_fts f JOIN document_chunks c ON f.rowid = c.id
              WHERE chunks_fts MATCH ?1 ORDER BY rank LIMIT ?2"
         )?;
-        let chunks = stmt.query_map(params![query, limit as i64], |row| {
-            Ok(DocumentChunk {
-                id: Some(row.get(0)?),
-                doc_id: row.get(1)?,
-                doc_name: row.get(2)?,
-                doc_type: row.get(3)?,
-                chunk_index: row.get(4)?,
-                content: row.get(5)?,
-                char_offset: row.get(6)?,
-                created_at: parse_dt(row.get::<_, String>(7)?),
-            })
-        })?.collect::<Result<Vec<_>, _>>()?;
+        let chunks = stmt
+            .query_map(params![query, limit as i64], |row| {
+                Ok(DocumentChunk {
+                    id: Some(row.get(0)?),
+                    doc_id: row.get(1)?,
+                    doc_name: row.get(2)?,
+                    doc_type: row.get(3)?,
+                    chunk_index: row.get(4)?,
+                    content: row.get(5)?,
+                    char_offset: row.get(6)?,
+                    created_at: parse_dt(row.get::<_, String>(7)?),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(chunks)
     }
 
@@ -567,7 +611,7 @@ impl MemoryStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, doc_id, doc_name, doc_type, chunk_index, content, char_offset, created_at
-             FROM document_chunks WHERE id = ?1"
+             FROM document_chunks WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], |row| {
             Ok(DocumentChunk {
@@ -588,11 +632,13 @@ impl MemoryStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT doc_id, doc_name, doc_type, COUNT(*) as chunks
-             FROM document_chunks GROUP BY doc_id ORDER BY doc_name"
+             FROM document_chunks GROUP BY doc_id ORDER BY doc_name",
         )?;
-        let docs = stmt.query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })?.collect::<Result<Vec<_>, _>>()?;
+        let docs = stmt
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(docs)
     }
 
@@ -609,20 +655,22 @@ impl MemoryStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, doc_id, doc_name, doc_type, chunk_index, content, char_offset, created_at
-             FROM document_chunks WHERE doc_id = ?1 ORDER BY chunk_index"
+             FROM document_chunks WHERE doc_id = ?1 ORDER BY chunk_index",
         )?;
-        let chunks = stmt.query_map(params![doc_id], |row| {
-            Ok(DocumentChunk {
-                id: Some(row.get(0)?),
-                doc_id: row.get(1)?,
-                doc_name: row.get(2)?,
-                doc_type: row.get(3)?,
-                chunk_index: row.get(4)?,
-                content: row.get(5)?,
-                char_offset: row.get(6)?,
-                created_at: parse_dt(row.get::<_, String>(7)?),
-            })
-        })?.collect::<Result<Vec<_>, _>>()?;
+        let chunks = stmt
+            .query_map(params![doc_id], |row| {
+                Ok(DocumentChunk {
+                    id: Some(row.get(0)?),
+                    doc_id: row.get(1)?,
+                    doc_name: row.get(2)?,
+                    doc_type: row.get(3)?,
+                    chunk_index: row.get(4)?,
+                    content: row.get(5)?,
+                    char_offset: row.get(6)?,
+                    created_at: parse_dt(row.get::<_, String>(7)?),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(chunks)
     }
 }

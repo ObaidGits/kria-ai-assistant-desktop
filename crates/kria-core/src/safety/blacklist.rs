@@ -1,5 +1,5 @@
-use regex::Regex;
 use once_cell::sync::Lazy;
+use regex::Regex;
 
 /// All BLACK tier patterns — hardcoded, cannot be overridden.
 static BLACK_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {

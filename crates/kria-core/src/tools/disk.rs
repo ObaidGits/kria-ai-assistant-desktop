@@ -1,20 +1,27 @@
-use std::sync::Arc;
-use async_trait::async_trait;
 use crate::infra::ToolResult;
 use crate::safety::RiskLevel;
-use crate::tools::registry::{ToolRegistry, ToolDef, ToolHandler, ParamDef};
+use crate::tools::registry::{ParamDef, ToolDef, ToolHandler, ToolRegistry};
+use async_trait::async_trait;
+use std::sync::Arc;
 
 fn param(name: &str, ty: &str, desc: &str, required: bool) -> ParamDef {
-    ParamDef { name: name.into(), param_type: ty.into(), description: desc.into(), required, default: None }
+    ParamDef {
+        name: name.into(),
+        param_type: ty.into(),
+        description: desc.into(),
+        required,
+        default: None,
+    }
 }
 
 struct CleanTempFiles;
-#[async_trait] impl ToolHandler for CleanTempFiles {
+#[async_trait]
+impl ToolHandler for CleanTempFiles {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
         let older_than_days = params["older_than_days"].as_u64().unwrap_or(7);
         let temp_dir = std::env::temp_dir();
-        let threshold = std::time::SystemTime::now() -
-            std::time::Duration::from_secs(older_than_days * 86400);
+        let threshold =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(older_than_days * 86400);
 
         let mut deleted = 0u64;
         let mut freed_bytes = 0u64;
@@ -49,11 +56,24 @@ struct CleanTempFiles;
 pub fn register(reg: &ToolRegistry) {
     let tools: Vec<(ToolDef, Arc<dyn ToolHandler>)> = vec![
         // RED
-        (ToolDef {
-            name: "clean_temp_files".into(), description: "Delete old temporary files".into(),
-            category: "disk".into(), default_tier: RiskLevel::Red, min_tier: "lite",
-            parameters: vec![param("older_than_days", "integer", "Only delete files older than N days (default 7)", false)],
-        }, Arc::new(CleanTempFiles)),
+        (
+            ToolDef {
+                name: "clean_temp_files".into(),
+                description: "Delete old temporary files".into(),
+                category: "disk".into(),
+                default_tier: RiskLevel::Red,
+                min_tier: "lite",
+                parameters: vec![param(
+                    "older_than_days",
+                    "integer",
+                    "Only delete files older than N days (default 7)",
+                    false,
+                )],
+            },
+            Arc::new(CleanTempFiles),
+        ),
     ];
-    for (def, handler) in tools { reg.register(def, handler); }
+    for (def, handler) in tools {
+        reg.register(def, handler);
+    }
 }

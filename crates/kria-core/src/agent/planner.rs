@@ -24,7 +24,8 @@ impl Planner {
         for line in llm_output.lines() {
             let trimmed = line.trim();
             // Match numbered lines: "1. ..." or "Step 1: ..."
-            if let Some(rest) = trimmed.strip_prefix(&format!("{}.", current_step + 1))
+            if let Some(rest) = trimmed
+                .strip_prefix(&format!("{}.", current_step + 1))
                 .or_else(|| trimmed.strip_prefix(&format!("Step {}: ", current_step + 1)))
                 .or_else(|| trimmed.strip_prefix(&format!("Step {}:", current_step + 1)))
             {
@@ -39,7 +40,11 @@ impl Planner {
                     tool_name: tool_name.unwrap_or_default(),
                     description: rest.to_string(),
                     parameters: serde_json::json!({}),
-                    depends_on: if current_step > 1 { vec![current_step - 1] } else { vec![] },
+                    depends_on: if current_step > 1 {
+                        vec![current_step - 1]
+                    } else {
+                        vec![]
+                    },
                     error_handling: String::new(),
                 });
             }

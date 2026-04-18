@@ -41,12 +41,19 @@ async fn health_returns_ok_with_version() {
     let base = spawn_test_server().await;
     let client = Client::new();
 
-    let res = client.get(format!("{base}/api/health")).send().await.unwrap();
+    let res = client
+        .get(format!("{base}/api/health"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
     let body: serde_json::Value = res.json().await.unwrap();
     assert_eq!(body["status"], "healthy");
-    assert!(body.get("version").is_some(), "response must include version");
+    assert!(
+        body.get("version").is_some(),
+        "response must include version"
+    );
 }
 
 // ── Chat endpoint ───────────────────────────────────────────────────
@@ -139,7 +146,11 @@ async fn sessions_returns_empty_list() {
     let base = spawn_test_server().await;
     let client = Client::new();
 
-    let res = client.get(format!("{base}/api/sessions")).send().await.unwrap();
+    let res = client
+        .get(format!("{base}/api/sessions"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
     let body: serde_json::Value = res.json().await.unwrap();
@@ -154,7 +165,11 @@ async fn models_returns_models_array() {
     let base = spawn_test_server().await;
     let client = Client::new();
 
-    let res = client.get(format!("{base}/api/models")).send().await.unwrap();
+    let res = client
+        .get(format!("{base}/api/models"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
     let body: serde_json::Value = res.json().await.unwrap();
@@ -169,16 +184,35 @@ async fn get_settings_returns_full_config() {
     let base = spawn_test_server().await;
     let client = Client::new();
 
-    let res = client.get(format!("{base}/api/settings")).send().await.unwrap();
+    let res = client
+        .get(format!("{base}/api/settings"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
     let body: serde_json::Value = res.json().await.unwrap();
     // Should contain top-level config sections
-    assert!(body.get("llm").is_some(), "settings must include llm section");
-    assert!(body.get("voice").is_some(), "settings must include voice section");
-    assert!(body.get("memory").is_some(), "settings must include memory section");
-    assert!(body.get("safety").is_some(), "settings must include safety section");
-    assert!(body.get("server").is_some(), "settings must include server section");
+    assert!(
+        body.get("llm").is_some(),
+        "settings must include llm section"
+    );
+    assert!(
+        body.get("voice").is_some(),
+        "settings must include voice section"
+    );
+    assert!(
+        body.get("memory").is_some(),
+        "settings must include memory section"
+    );
+    assert!(
+        body.get("safety").is_some(),
+        "settings must include safety section"
+    );
+    assert!(
+        body.get("server").is_some(),
+        "settings must include server section"
+    );
     assert!(body.get("ui").is_some(), "settings must include ui section");
 }
 

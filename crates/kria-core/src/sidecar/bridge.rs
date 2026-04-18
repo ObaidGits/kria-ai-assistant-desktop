@@ -1,14 +1,14 @@
+use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, oneshot};
-use std::collections::HashMap;
-use std::time::Duration;
+use tokio::sync::{oneshot, Mutex};
 
-use super::protocol::{JsonRpcRequest, JsonRpcResponse};
 use super::health::SidecarHealth;
+use super::protocol::{JsonRpcRequest, JsonRpcResponse};
 
 /// Manages the Python sidecar process and JSON-RPC communication.
 pub struct SidecarBridge {
@@ -58,7 +58,11 @@ impl SidecarBridge {
                         p
                     }
                     Err(e) => {
-                        tracing::warn!("sidecar: venv setup failed ({}); falling back to system {}", e, self.python_cmd);
+                        tracing::warn!(
+                            "sidecar: venv setup failed ({}); falling back to system {}",
+                            e,
+                            self.python_cmd
+                        );
                         self.python_cmd.clone()
                     }
                 }
@@ -90,7 +94,11 @@ impl SidecarBridge {
                 let existing = std::env::var("PYTHONPATH").unwrap_or_default();
                 let src = p.to_string_lossy();
                 tracing::info!("sidecar: using live source via PYTHONPATH={}", src);
-                if existing.is_empty() { src.into_owned() } else { format!("{}:{}", src, existing) }
+                if existing.is_empty() {
+                    src.into_owned()
+                } else {
+                    format!("{}:{}", src, existing)
+                }
             });
 
         // Quick sanity-check: can `python` actually import kria_modules?
@@ -105,7 +113,10 @@ impl SidecarBridge {
             .map(|o| {
                 if !o.status.success() {
                     let err = String::from_utf8_lossy(&o.stderr);
-                    tracing::warn!("sidecar pre-check: kria_modules not importable: {}", err.trim());
+                    tracing::warn!(
+                        "sidecar pre-check: kria_modules not importable: {}",
+                        err.trim()
+                    );
                     false
                 } else {
                     true
@@ -137,9 +148,18 @@ impl SidecarBridge {
         }
         let mut child = spawn_cmd.spawn()?;
 
-        let stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("no stdout"))?;
-        let stderr = child.stderr.take().ok_or_else(|| anyhow::anyhow!("no stderr"))?;
-        let stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("no stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("no stdout"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("no stderr"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("no stdin"))?;
 
         // Store child & stdin
         *self.child.lock().await = Some(child);
@@ -157,7 +177,10 @@ impl SidecarBridge {
                         let trimmed = line.trim();
                         if !trimmed.is_empty() {
                             // Python errors/warnings → WARN so they surface in the log
-                            if trimmed.contains("Error") || trimmed.contains("Traceback") || trimmed.contains("error") {
+                            if trimmed.contains("Error")
+                                || trimmed.contains("Traceback")
+                                || trimmed.contains("error")
+                            {
                                 tracing::warn!(target: "sidecar_stderr", "{}", trimmed);
                             } else {
                                 tracing::info!(target: "sidecar_stderr", "{}", trimmed);
@@ -209,7 +232,11 @@ impl SidecarBridge {
                                 }
                             }
                             Err(e) => {
-                                tracing::warn!("failed to parse sidecar response: {}: {}", e, trimmed);
+                                tracing::warn!(
+                                    "failed to parse sidecar response: {}: {}",
+                                    e,
+                                    trimmed
+                                );
                             }
                         }
                     }
@@ -235,7 +262,9 @@ impl SidecarBridge {
 
         // Configure tier
         let tier = self.hw_tier.lock().await.clone();
-        let _ = self.request("configure_tier", serde_json::json!({"tier": tier})).await;
+        let _ = self
+            .request("configure_tier", serde_json::json!({"tier": tier}))
+            .await;
 
         tracing::info!("sidecar bridge established");
         Ok(())
@@ -292,13 +321,15 @@ impl SidecarBridge {
 
     /// List available sidecar capabilities.
     pub async fn list_capabilities(&self) -> anyhow::Result<serde_json::Value> {
-        self.request("list_capabilities", serde_json::json!({})).await
+        self.request("list_capabilities", serde_json::json!({}))
+            .await
     }
 
     /// Configure the hardware tier for tier-aware processing.
     pub async fn configure_tier(&self, tier: &str) -> anyhow::Result<()> {
         *self.hw_tier.lock().await = tier.to_string();
-        self.request("configure_tier", serde_json::json!({"tier": tier})).await?;
+        self.request("configure_tier", serde_json::json!({"tier": tier}))
+            .await?;
         Ok(())
     }
 
@@ -366,18 +397,27 @@ impl SidecarBridge {
         let exe = std::env::current_exe().unwrap_or_default();
         let candidates = [
             // release/debug target dir: exe is target/debug/kria-desktop → go up 3 levels
-            exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent())
+            exe.parent()
+                .and_then(|p| p.parent())
+                .and_then(|p| p.parent())
                 .map(|ws| ws.join("kria-modules"))
                 .unwrap_or_default(),
             // direct sibling
-            exe.parent().map(|p| p.join("kria-modules")).unwrap_or_default(),
+            exe.parent()
+                .map(|p| p.join("kria-modules"))
+                .unwrap_or_default(),
         ];
 
-        let modules_dir = candidates.iter().find(|p| p.join("pyproject.toml").exists());
+        let modules_dir = candidates
+            .iter()
+            .find(|p| p.join("pyproject.toml").exists());
 
         match modules_dir {
             Some(src) => {
-                tracing::info!("sidecar setup: installing kria-modules from {}", src.display());
+                tracing::info!(
+                    "sidecar setup: installing kria-modules from {}",
+                    src.display()
+                );
 
                 // Strategy: directly copy kria_modules into site-packages.
                 // This avoids any build-backend dependency (hatchling/setuptools)
@@ -401,7 +441,11 @@ impl SidecarBridge {
 
                 // Use `cp -r` to copy the package directory
                 let cp_out = tokio::process::Command::new("cp")
-                    .args(["-r", src_pkg.to_str().unwrap_or(""), dst_pkg.to_str().unwrap_or("")])
+                    .args([
+                        "-r",
+                        src_pkg.to_str().unwrap_or(""),
+                        dst_pkg.to_str().unwrap_or(""),
+                    ])
                     .output()
                     .await
                     .map_err(|e| anyhow::anyhow!("cp failed: {e}"))?;
@@ -421,7 +465,9 @@ impl SidecarBridge {
             }
             None => {
                 // Couldn't find source — install minimal deps only (bridge.py is self-contained)
-                tracing::warn!("sidecar setup: kria-modules source not found; installing bridge deps only");
+                tracing::warn!(
+                    "sidecar setup: kria-modules source not found; installing bridge deps only"
+                );
                 let _ = tokio::process::Command::new(&venv_pip)
                     .args(["install", "psutil", "--quiet"])
                     .output()

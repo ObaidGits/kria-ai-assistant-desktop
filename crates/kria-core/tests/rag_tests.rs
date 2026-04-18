@@ -1,6 +1,5 @@
 /// Phase 12 — RAG, Document Chat & Deep Knowledge Tests
 /// Tests document chunking, RAG ingestion, retrieval, and knowledge base management.
-
 use std::sync::Arc;
 
 fn make_test_rag() -> (
@@ -13,7 +12,11 @@ fn make_test_rag() -> (
     let store = Arc::new(kria_core::memory::store::MemoryStore::open(tmp.path()).unwrap());
     let vectors = Arc::new(kria_core::memory::vectors::VectorIndex::in_memory(384));
     let embeddings = Arc::new(kria_core::memory::embeddings::EmbeddingModel::load(384).unwrap());
-    let rag = Arc::new(kria_core::memory::rag::RagEngine::new(store.clone(), vectors.clone(), embeddings.clone()));
+    let rag = Arc::new(kria_core::memory::rag::RagEngine::new(
+        store.clone(),
+        vectors.clone(),
+        embeddings.clone(),
+    ));
     (store, vectors, embeddings, rag)
 }
 
@@ -37,7 +40,11 @@ fn chunk_text_short() {
 fn chunk_text_splits_long() {
     let text = "a ".repeat(500); // 1000 chars
     let chunks = kria_core::memory::rag::chunk_text(&text, 200, 20);
-    assert!(chunks.len() >= 3, "expected at least 3 chunks, got {}", chunks.len());
+    assert!(
+        chunks.len() >= 3,
+        "expected at least 3 chunks, got {}",
+        chunks.len()
+    );
 }
 
 #[test]
@@ -49,13 +56,19 @@ fn chunk_text_overlap() {
     if chunks.len() >= 2 {
         let end_first = chunks[0].0 + chunks[0].1.len();
         let start_second = chunks[1].0;
-        assert!(start_second < end_first, "expected overlap: end_first={}, start_second={}", end_first, start_second);
+        assert!(
+            start_second < end_first,
+            "expected overlap: end_first={}, start_second={}",
+            end_first,
+            start_second
+        );
     }
 }
 
 #[test]
 fn chunk_text_preserves_content() {
-    let text = "The quick brown fox jumps over the lazy dog. This is a test of the chunking system.";
+    let text =
+        "The quick brown fox jumps over the lazy dog. This is a test of the chunking system.";
     let chunks = kria_core::memory::rag::chunk_text(text, 50, 10);
     assert!(!chunks.is_empty());
     // All chunks should be non-empty
@@ -84,7 +97,10 @@ fn store_and_retrieve_chunks() {
 
     let retrieved = store.get_chunk(id).unwrap();
     assert!(retrieved.is_some());
-    assert_eq!(retrieved.unwrap().content, "Hello world this is a test chunk");
+    assert_eq!(
+        retrieved.unwrap().content,
+        "Hello world this is a test chunk"
+    );
 }
 
 #[test]
@@ -205,7 +221,11 @@ fn rag_tools_registered() {
     let store = Arc::new(kria_core::memory::store::MemoryStore::open(tmp.path()).unwrap());
     let vectors = Arc::new(kria_core::memory::vectors::VectorIndex::in_memory(384));
     let embeddings = Arc::new(kria_core::memory::embeddings::EmbeddingModel::load(384).unwrap());
-    let rag = Arc::new(kria_core::memory::rag::RagEngine::new(store.clone(), vectors, embeddings));
+    let rag = Arc::new(kria_core::memory::rag::RagEngine::new(
+        store.clone(),
+        vectors,
+        embeddings,
+    ));
     let full_reg = kria_core::tools::registry::build_registry_full(Some(store), Some(rag), None);
     assert!(full_reg.get_def("ingest_document_rag").is_some());
     assert!(full_reg.get_def("rag_query").is_some());
@@ -219,11 +239,19 @@ fn rag_tools_in_knowledge_category() {
     let store = Arc::new(kria_core::memory::store::MemoryStore::open(tmp.path()).unwrap());
     let vectors = Arc::new(kria_core::memory::vectors::VectorIndex::in_memory(384));
     let embeddings = Arc::new(kria_core::memory::embeddings::EmbeddingModel::load(384).unwrap());
-    let rag = Arc::new(kria_core::memory::rag::RagEngine::new(store.clone(), vectors, embeddings));
+    let rag = Arc::new(kria_core::memory::rag::RagEngine::new(
+        store.clone(),
+        vectors,
+        embeddings,
+    ));
     let reg = kria_core::tools::registry::build_registry_full(Some(store), Some(rag), None);
     let knowledge_tools = reg.list_by_category("knowledge");
     // Should include original 8 + 4 RAG tools = 12
-    assert!(knowledge_tools.len() >= 12, "expected at least 12 knowledge tools, got {}", knowledge_tools.len());
+    assert!(
+        knowledge_tools.len() >= 12,
+        "expected at least 12 knowledge tools, got {}",
+        knowledge_tools.len()
+    );
 }
 
 #[tokio::test]
@@ -232,7 +260,11 @@ async fn rag_query_tool_requires_query() {
     let store = Arc::new(kria_core::memory::store::MemoryStore::open(tmp.path()).unwrap());
     let vectors = Arc::new(kria_core::memory::vectors::VectorIndex::in_memory(384));
     let embeddings = Arc::new(kria_core::memory::embeddings::EmbeddingModel::load(384).unwrap());
-    let rag = Arc::new(kria_core::memory::rag::RagEngine::new(store.clone(), vectors, embeddings));
+    let rag = Arc::new(kria_core::memory::rag::RagEngine::new(
+        store.clone(),
+        vectors,
+        embeddings,
+    ));
     let reg = kria_core::tools::registry::build_registry_full(Some(store), Some(rag), None);
     let handler = reg.get_handler("rag_query").unwrap();
     let result = handler.execute(serde_json::json!({})).await;
@@ -246,10 +278,16 @@ async fn ingest_tool_invalid_path() {
     let store = Arc::new(kria_core::memory::store::MemoryStore::open(tmp.path()).unwrap());
     let vectors = Arc::new(kria_core::memory::vectors::VectorIndex::in_memory(384));
     let embeddings = Arc::new(kria_core::memory::embeddings::EmbeddingModel::load(384).unwrap());
-    let rag = Arc::new(kria_core::memory::rag::RagEngine::new(store.clone(), vectors, embeddings));
+    let rag = Arc::new(kria_core::memory::rag::RagEngine::new(
+        store.clone(),
+        vectors,
+        embeddings,
+    ));
     let reg = kria_core::tools::registry::build_registry_full(Some(store), Some(rag), None);
     let handler = reg.get_handler("ingest_document_rag").unwrap();
-    let result = handler.execute(serde_json::json!({ "path": "/nonexistent/file.pdf" })).await;
+    let result = handler
+        .execute(serde_json::json!({ "path": "/nonexistent/file.pdf" }))
+        .await;
     assert!(!result.success);
     assert!(result.error.unwrap().contains("not found"));
 }

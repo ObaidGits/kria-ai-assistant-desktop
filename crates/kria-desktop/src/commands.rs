@@ -1,46 +1,394 @@
-use kria_core::config::KriaConfig;
-use kria_core::llm::{ChatMessage, ImageAttachment, ModelRouter};
-use kria_core::safety::hitl::{HitlGateway, ApprovalResponse};
-use kria_core::safety::{PolicyEngine, AuditLogger, RollbackManager};
-use kria_core::agent::AgentLoop;
-use kria_core::agent::loop_engine::StreamEvent;
-use kria_core::tools::registry::{self, ToolRegistry};
-use kria_core::tools::mount_manager;
-use kria_core::tools::google_workspace as gw;
-use kria_core::mcp::McpServerManager;
-use kria_core::memory::MemoryStore;
-use kria_core::memory::store::ConversationTurn;
-use kria_core::memory::embeddings::EmbeddingModel;
-use kria_core::memory::vectors::VectorIndex;
-use kria_core::infra::EventBus;
-use kria_core::infra::health::{HealthRegistry, ServiceStatus};
-use kria_core::automation::{AutomationScheduler, MacroRecorder, WorkflowEngine};
-use kria_core::platform::detect::{HardwareInfo, HardwareTier, detect_hardware, get_available_package_managers};
-use kria_core::sidecar::SidecarBridge;
-use kria_core::voice::{VoicePipeline, VoicePipelineState, VoicePipelineEvent, SpeechToText, TextToSpeech};
-use std::sync::Arc;
+use async_trait::async_trait;
+use axum::{
+    extract::State as AxumState,
+    http::StatusCode,
+    routing::{get, post},
+    Json, Router,
+};
 use chrono::Utc;
-use tauri::{AppHandle, Manager, State, Emitter};
+use kria_core::agent::loop_engine::StreamEvent;
+use kria_core::agent::AgentLoop;
+use kria_core::automation::{AutomationScheduler, MacroRecorder, WorkflowEngine};
+use kria_core::config::KriaConfig;
+use kria_core::infra::health::{HealthRegistry, ServiceStatus};
+use kria_core::infra::EventBus;
+use kria_core::llm::{ChatMessage, ImageAttachment, ModelRouter};
+use kria_core::mcp::client::McpServerState;
+use kria_core::mcp::server_manager::McpServerStatus;
+use kria_core::mcp::McpServerManager;
+use kria_core::memory::embeddings::EmbeddingModel;
+use kria_core::memory::store::ConversationTurn;
+use kria_core::memory::vectors::VectorIndex;
+use kria_core::memory::MemoryStore;
+use kria_core::platform::detect::{
+    detect_hardware, get_available_package_managers, HardwareInfo, HardwareTier,
+};
+use kria_core::safety::hitl::{ApprovalResponse, HitlGateway};
+use kria_core::safety::{AuditLogger, PolicyEngine, RollbackManager};
+use kria_core::sidecar::SidecarBridge;
+use kria_core::tools::google_workspace as gw;
+use kria_core::tools::mount_manager;
+use kria_core::tools::registry::{self, ToolRegistry};
+use kria_core::voice::{
+    default_input_device_name, default_output_device_name, list_input_devices, list_output_devices,
+    SpeechToText, TextToSpeech, VoicePipeline, VoicePipelineEvent, VoicePipelineState,
+};
+use std::path::Path;
+use std::sync::Arc;
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::RwLock;
 
 use kria_core::platform::telegram::TelegramBridge;
 
-/// Find a binary on the system PATH.
-fn which_binary(name: &str) -> Option<std::path::PathBuf> {
-    std::env::var_os("PATH")
-        .and_then(|paths| {
-            std::env::split_paths(&paths)
-                .map(|dir| dir.join(name))
-                .find(|p| p.exists())
-        })
+const AGENT_EVENT_IDLE_TIMEOUT_SECS: u64 = 180;
+const AGENT_TIMEOUT_MESSAGE: &str = "⚠️ Timed out waiting for model output. Please verify the model runtime is healthy and try again.";
+const IMAGE_PREANALYSIS_TIMEOUT_SECS: u64 = 35;
+
+// 1x1 white PPM probe image used for sidecar OCR capability checks.
+const OCR_HEALTH_PROBE_IMAGE_BYTES: &[u8] = b"P3\n1 1\n255\n255 255 255\n";
+
+#[derive(Debug)]
+struct OcrProbeState {
+    in_flight: bool,
+    next_allowed_at: std::time::Instant,
+    consecutive_failures: u32,
 }
 
-fn emit_agent_stage(
-    app: &AppHandle,
-    step: &str,
-    message: &str,
-    detail: Option<serde_json::Value>,
+impl Default for OcrProbeState {
+    fn default() -> Self {
+        Self {
+            in_flight: false,
+            next_allowed_at: std::time::Instant::now(),
+            consecutive_failures: 0,
+        }
+    }
+}
+
+static OCR_PROBE_STATE: std::sync::OnceLock<tokio::sync::Mutex<OcrProbeState>> =
+    std::sync::OnceLock::new();
+
+fn ocr_probe_state() -> &'static tokio::sync::Mutex<OcrProbeState> {
+    OCR_PROBE_STATE.get_or_init(|| tokio::sync::Mutex::new(OcrProbeState::default()))
+}
+
+async fn finalize_ocr_probe_schedule(success: bool) {
+    let mut state = ocr_probe_state().lock().await;
+    state.in_flight = false;
+    if success {
+        state.consecutive_failures = 0;
+        state.next_allowed_at = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    } else {
+        let failures = state.consecutive_failures.saturating_add(1).min(6);
+        state.consecutive_failures = failures;
+        let backoff_secs = (10u64.saturating_mul(1u64 << (failures.saturating_sub(1)))).min(300);
+        state.next_allowed_at =
+            std::time::Instant::now() + std::time::Duration::from_secs(backoff_secs);
+    }
+}
+
+fn encode_base64_bytes(data: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+
+        result.push(CHARS[((triple >> 18) & 0x3F) as usize] as char);
+        result.push(CHARS[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            result.push(CHARS[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
+        if chunk.len() > 2 {
+            result.push(CHARS[(triple & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
+    }
+    result
+}
+
+fn build_native_preprocessed_attachment(path: &str) -> Option<ImageAttachment> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let path_obj = Path::new(trimmed);
+    if !path_obj.exists() {
+        return None;
+    }
+
+    // Native fallback preprocessing: generate a normalized PNG thumbnail.
+    let thumb_bytes =
+        kria_core::preprocessing::image::ImageProcessor::thumbnail(path_obj, 1280).ok()?;
+
+    Some(ImageAttachment {
+        data: encode_base64_bytes(&thumb_bytes),
+        mime_type: "image/png".to_string(),
+    })
+}
+
+/// Find a binary on the system PATH.
+fn which_binary(name: &str) -> Option<std::path::PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|dir| dir.join(name))
+            .find(|p| p.exists())
+    })
+}
+
+fn local_api_base_url(host: &str, port: u16) -> String {
+    let probe_host = match host {
+        "0.0.0.0" | "::" => "127.0.0.1",
+        other => other,
+    };
+    format!("http://{probe_host}:{port}")
+}
+
+fn telegram_api_url(config: &KriaConfig) -> String {
+    format!("http://{}:{}", config.server.host, config.server.port)
+}
+
+fn update_server_env_var(
+    env: &mut std::collections::HashMap<String, String>,
+    key: &str,
+    value: Option<String>,
+) -> bool {
+    match value.filter(|v| !v.trim().is_empty()) {
+        Some(next) => {
+            if env.get(key) == Some(&next) {
+                false
+            } else {
+                env.insert(key.to_string(), next);
+                true
+            }
+        }
+        None => env.remove(key).is_some(),
+    }
+}
+
+fn should_manage_local_telegram_api_url(current: Option<&String>) -> bool {
+    current
+        .map(|url| {
+            let lower = url.to_ascii_lowercase();
+            lower.contains("127.0.0.1") || lower.contains("localhost") || lower.contains("0.0.0.0")
+        })
+        .unwrap_or(true)
+}
+
+fn sync_telegram_mcp_server_config(config: &mut KriaConfig) -> bool {
+    let mut changed = false;
+    let desired_enabled = config.telegram.enabled;
+    let desired_bot_token = config.telegram.bot_token.clone();
+    let desired_chat_ids = config.telegram.allowed_chat_ids.clone();
+    let desired_api_url = telegram_api_url(config);
+
+    if let Some(server) = config
+        .mcp
+        .servers
+        .iter_mut()
+        .find(|s| s.name.eq_ignore_ascii_case("telegram"))
+    {
+        if server.enabled != desired_enabled {
+            server.enabled = desired_enabled;
+            changed = true;
+        }
+
+        changed |= update_server_env_var(
+            &mut server.env,
+            "TELEGRAM_BOT_TOKEN",
+            Some(desired_bot_token),
+        );
+        changed |=
+            update_server_env_var(&mut server.env, "TELEGRAM_CHAT_IDS", Some(desired_chat_ids));
+
+        if should_manage_local_telegram_api_url(server.env.get("KRIA_API_URL")) {
+            changed |=
+                update_server_env_var(&mut server.env, "KRIA_API_URL", Some(desired_api_url));
+        }
+    }
+
+    changed
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct LocalApiChatRequest {
+    message: String,
+    session_id: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    chat_id: Option<i64>,
+    #[serde(default)]
+    from_user: Option<String>,
+}
+
+#[async_trait]
+trait LocalApiResponder: Send + Sync {
+    async fn respond(&self, request: &LocalApiChatRequest) -> serde_json::Value;
+}
+
+#[derive(Clone)]
+struct LocalApiBridgeState {
+    responder: Arc<dyn LocalApiResponder>,
+}
+
+#[derive(Clone)]
+struct AgentLoopLocalApiResponder {
+    agent_loop: Arc<AgentLoop>,
+    memory_store: Arc<MemoryStore>,
+    tool_registry: Arc<ToolRegistry>,
+    embeddings: Arc<EmbeddingModel>,
+    vectors: Arc<VectorIndex>,
+    hw_tier: String,
+}
+
+#[async_trait]
+impl LocalApiResponder for AgentLoopLocalApiResponder {
+    async fn respond(&self, request: &LocalApiChatRequest) -> serde_json::Value {
+        let chat_id = request.chat_id.unwrap_or(0);
+        let from_user = request.from_user.as_deref().unwrap_or("User");
+        let reply = kria_core::platform::telegram::process_message(
+            &request.message,
+            chat_id,
+            from_user,
+            &self.agent_loop,
+            &self.memory_store,
+            &self.tool_registry,
+            &self.embeddings,
+            &self.vectors,
+            &self.hw_tier,
+        )
+        .await;
+
+        let session_id = request.session_id.clone().unwrap_or_else(|| {
+            if request.chat_id.is_some() || request.source.as_deref() == Some("telegram") {
+                format!("telegram_{chat_id}")
+            } else {
+                uuid::Uuid::new_v4().to_string()
+            }
+        });
+
+        serde_json::json!({
+            "status": "received",
+            "message": request.message,
+            "source": request.source.clone().unwrap_or_else(|| "api".to_string()),
+            "chat_id": request.chat_id,
+            "from_user": request.from_user,
+            "session_id": session_id,
+            "reply": reply,
+        })
+    }
+}
+
+async fn local_api_health() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "status": "healthy",
+        "bridge": "desktop",
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+async fn local_api_chat(
+    AxumState(state): AxumState<LocalApiBridgeState>,
+    Json(request): Json<LocalApiChatRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if request.message.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": "message is required",
+            })),
+        );
+    }
+
+    let response = state.responder.respond(&request).await;
+    (StatusCode::OK, Json(response))
+}
+
+async fn probe_existing_local_api_bridge(health_url: &str) -> bool {
+    match reqwest::Client::new()
+        .get(health_url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+    {
+        Ok(resp) => resp.status().is_success(),
+        Err(_) => false,
+    }
+}
+
+fn start_local_api_bridge(
+    host: String,
+    port: u16,
+    responder: Arc<dyn LocalApiResponder>,
+    health: Arc<HealthRegistry>,
 ) {
+    let bind_addr = format!("{host}:{port}");
+    let health_url = format!("{}/api/health", local_api_base_url(&host, port));
+    health.register("local_api_bridge");
+    health.update(
+        "local_api_bridge",
+        ServiceStatus::Starting,
+        Some(format!("binding {bind_addr}")),
+    );
+
+    tokio::spawn(async move {
+        match tokio::net::TcpListener::bind(&bind_addr).await {
+            Ok(listener) => {
+                let router = Router::new()
+                    .route("/api/health", get(local_api_health))
+                    .route("/api/chat", post(local_api_chat))
+                    .with_state(LocalApiBridgeState { responder });
+
+                health.update(
+                    "local_api_bridge",
+                    ServiceStatus::Healthy,
+                    Some(format!("listening on {health_url}")),
+                );
+
+                if let Err(e) = axum::serve(listener, router).await {
+                    health.update(
+                        "local_api_bridge",
+                        ServiceStatus::Degraded,
+                        Some(format!("bridge stopped: {e}")),
+                    );
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                if probe_existing_local_api_bridge(&health_url).await {
+                    health.update(
+                        "local_api_bridge",
+                        ServiceStatus::Healthy,
+                        Some(format!("reusing existing listener at {health_url}")),
+                    );
+                } else {
+                    health.update(
+                        "local_api_bridge",
+                        ServiceStatus::Degraded,
+                        Some(format!(
+                            "{bind_addr} already in use, but {health_url} is not responding"
+                        )),
+                    );
+                }
+            }
+            Err(e) => {
+                health.update(
+                    "local_api_bridge",
+                    ServiceStatus::Degraded,
+                    Some(format!("failed to bind {bind_addr}: {e}")),
+                );
+            }
+        }
+    });
+}
+
+fn emit_agent_stage(app: &AppHandle, step: &str, message: &str, detail: Option<serde_json::Value>) {
     let detail_value = detail.unwrap_or(serde_json::Value::Null);
     let payload = serde_json::json!({
         "step": step,
@@ -114,7 +462,11 @@ fn compute_tool_result_metadata(name: &str, result: &serde_json::Value) -> serde
                         corroboration_n += 1;
                     }
 
-                    if row.get("region_match").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    if row
+                        .get("region_match")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                    {
                         region_match = true;
                     }
 
@@ -185,7 +537,10 @@ fn compute_tool_result_metadata(name: &str, result: &serde_json::Value) -> serde
             })
         }
         "fetch_article" => {
-            let chars = result.get("char_count").and_then(|v| v.as_u64()).unwrap_or(0);
+            let chars = result
+                .get("char_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             let confidence = if chars >= 2500 {
                 0.82
             } else if chars >= 900 {
@@ -221,10 +576,449 @@ fn build_tool_result_event_payload(
     })
 }
 
+fn extract_image_preanalysis_summary(tool_data: &serde_json::Value) -> Option<String> {
+    let analysis = tool_data.get("analysis").unwrap_or(tool_data);
+    let mut lines: Vec<String> = Vec::new();
+
+    if let Some(summary) = analysis.get("summary").and_then(|v| v.as_str()) {
+        let trimmed = summary.trim();
+        if !trimmed.is_empty() {
+            lines.push(format!("Summary: {}", trimmed));
+        }
+    }
+
+    let metadata = analysis
+        .get("metadata")
+        .or_else(|| tool_data.get("metadata"));
+    if let Some(meta) = metadata {
+        let width = meta.get("width").and_then(|v| v.as_u64());
+        let height = meta.get("height").and_then(|v| v.as_u64());
+        let format_name = meta
+            .get("format")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        if let (Some(w), Some(h)) = (width, height) {
+            lines.push(format!("Resolution: {}x{} ({})", w, h, format_name));
+        }
+    }
+
+    let features = analysis
+        .get("features")
+        .or_else(|| tool_data.get("features"));
+    if let Some(scene) = features
+        .and_then(|f| f.get("scene_type"))
+        .and_then(|v| v.as_str())
+    {
+        lines.push(format!("Scene type: {}", scene));
+    }
+
+    if let Some(mode) = analysis.get("mode_selected").and_then(|v| v.as_str()) {
+        lines.push(format!("Preprocessing mode: {}", mode));
+    }
+
+    if let Some(count) = analysis
+        .get("selected_images")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.len())
+    {
+        lines.push(format!("Preprocessed images: {}", count));
+    }
+
+    let ocr_text = analysis
+        .get("ocr_text")
+        .or_else(|| tool_data.get("ocr_text"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if !ocr_text.trim().is_empty() {
+        let compact = ocr_text
+            .lines()
+            .map(|line| line.trim())
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !compact.is_empty() {
+            let excerpt: String = compact.chars().take(420).collect();
+            let clipped = if compact.chars().count() > 420 {
+                format!("{}...", excerpt)
+            } else {
+                excerpt
+            };
+            lines.push(format!("OCR excerpt: {}", clipped));
+        }
+    } else if let Some(engine) = analysis
+        .get("ocr")
+        .and_then(|v| v.get("engine"))
+        .and_then(|v| v.as_str())
+    {
+        let status = if engine == "none" {
+            "unavailable"
+        } else {
+            "no text extracted"
+        };
+        lines.push(format!("OCR status: {}", status));
+    }
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
+fn extract_preprocessed_image_attachments(
+    tool_data: &serde_json::Value,
+    default_mime_type: &str,
+) -> Option<Vec<ImageAttachment>> {
+    let analysis = tool_data.get("analysis").unwrap_or(tool_data);
+
+    let thumbnail_attachment = analysis
+        .get("thumbnail_base64")
+        .or_else(|| tool_data.get("thumbnail_base64"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|thumb_b64| ImageAttachment {
+            data: thumb_b64.to_string(),
+            mime_type: analysis
+                .get("thumbnail_mime_type")
+                .or_else(|| tool_data.get("thumbnail_mime_type"))
+                .and_then(|v| v.as_str())
+                .filter(|m| !m.trim().is_empty())
+                .unwrap_or(default_mime_type)
+                .to_string(),
+        });
+
+    if let Some(items) = analysis.get("selected_images").and_then(|v| v.as_array()) {
+        let mut attachments = Vec::new();
+        let mut has_global_frame = false;
+        for item in items {
+            let data = item
+                .get("data_base64")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if data.is_empty() {
+                continue;
+            }
+
+            let mime_type = item
+                .get("mime_type")
+                .and_then(|v| v.as_str())
+                .filter(|m| !m.trim().is_empty())
+                .unwrap_or(default_mime_type)
+                .to_string();
+
+            if item
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .map(|kind| kind.eq_ignore_ascii_case("global"))
+                .unwrap_or(false)
+            {
+                has_global_frame = true;
+            }
+
+            attachments.push(ImageAttachment {
+                data: data.to_string(),
+                mime_type,
+            });
+        }
+
+        if !has_global_frame {
+            if let Some(thumb) = thumbnail_attachment.clone() {
+                attachments.push(thumb);
+            }
+        }
+
+        if !attachments.is_empty() {
+            return Some(attachments);
+        }
+    }
+
+    if let Some(thumb) = thumbnail_attachment {
+        return Some(vec![thumb]);
+    }
+
+    // Sidecar may be unavailable and analyze_image can degrade to native metadata only.
+    // In that case, create a native preprocessed thumbnail so the LLM still gets an image.
+    let path_fallback = analysis
+        .get("path")
+        .or_else(|| tool_data.get("path"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if let Some(native) = build_native_preprocessed_attachment(path_fallback) {
+        return Some(vec![native]);
+    }
+
+    None
+}
+
+async fn refresh_ocr_dependency_health(health: &HealthRegistry, sidecar: &SidecarBridge) {
+    if !sidecar.is_alive() {
+        health.update(
+            "ocr_dependency",
+            ServiceStatus::Starting,
+            Some("Waiting for sidecar startup before OCR dependency probe".into()),
+        );
+        return;
+    }
+
+    {
+        let mut probe_state = ocr_probe_state().lock().await;
+        let now = std::time::Instant::now();
+        if probe_state.in_flight {
+            tracing::debug!("OCR dependency probe skipped: already in-flight");
+            return;
+        }
+        if now < probe_state.next_allowed_at {
+            tracing::debug!("OCR dependency probe skipped: backoff/interval active");
+            return;
+        }
+        probe_state.in_flight = true;
+    }
+
+    let probe_path = std::env::temp_dir().join("kria_ocr_probe.ppm");
+    if let Err(e) = std::fs::write(&probe_path, OCR_HEALTH_PROBE_IMAGE_BYTES) {
+        health.update(
+            "ocr_dependency",
+            ServiceStatus::Degraded,
+            Some(format!("Failed to write OCR probe image: {e}")),
+        );
+        finalize_ocr_probe_schedule(false).await;
+        return;
+    }
+
+    let payload = serde_json::json!({
+        "file": probe_path.to_string_lossy().to_string(),
+        "operations": ["ocr", "thumbnail"],
+        "intent": "text_reading",
+    });
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        sidecar.request("image.analyze", payload),
+    )
+    .await;
+
+    let _ = std::fs::remove_file(&probe_path);
+
+    let mut probe_success = false;
+
+    match response {
+        Ok(Ok(result)) => {
+            probe_success = true;
+            let engine = result
+                .get("ocr")
+                .and_then(|v| v.get("engine"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("none");
+
+            if engine.eq_ignore_ascii_case("none") {
+                health.update(
+                    "ocr_dependency",
+                    ServiceStatus::Degraded,
+                    Some(
+                        "OCR unavailable in sidecar runtime (engine: none). Image analysis still works via visual path."
+                            .into(),
+                    ),
+                );
+            } else {
+                health.update(
+                    "ocr_dependency",
+                    ServiceStatus::Healthy,
+                    Some(format!("OCR engine ready in sidecar: {engine}")),
+                );
+            }
+        }
+        Ok(Err(e)) => {
+            health.update(
+                "ocr_dependency",
+                ServiceStatus::Degraded,
+                Some(format!("OCR probe failed via sidecar: {e}")),
+            );
+        }
+        Err(_) => {
+            health.update(
+                "ocr_dependency",
+                ServiceStatus::Degraded,
+                Some("OCR probe timed out while contacting sidecar".into()),
+            );
+        }
+    }
+
+    finalize_ocr_probe_schedule(probe_success).await;
+}
+
+fn build_preprocessing_step_status(
+    tool_data: &serde_json::Value,
+    image_intent: &str,
+) -> serde_json::Value {
+    let analysis = tool_data.get("analysis").unwrap_or(tool_data);
+
+    let normalization_steps = analysis
+        .get("normalization_plan")
+        .and_then(|v| v.get("branches"))
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.len())
+        .unwrap_or(0);
+
+    let resized_images = analysis
+        .get("resize_plan")
+        .and_then(|v| v.get("images"))
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.len())
+        .unwrap_or(0);
+
+    let selected_images = analysis
+        .get("selected_images")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.len())
+        .unwrap_or(0);
+
+    let has_thumbnail = analysis
+        .get("thumbnail_base64")
+        .or_else(|| tool_data.get("thumbnail_base64"))
+        .and_then(|v| v.as_str())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+
+    let has_ocr_text = analysis
+        .get("ocr_text")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+
+    let ocr_engine = analysis
+        .get("ocr")
+        .and_then(|v| v.get("engine"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    let within_context = analysis
+        .get("token_accounting")
+        .and_then(|v| v.get("within_context"))
+        .and_then(|v| v.as_bool());
+
+    serde_json::json!({
+        "source": tool_data.get("source").and_then(|v| v.as_str()).unwrap_or("unknown"),
+        "image_intent": image_intent,
+        "mode_selected": analysis.get("mode_selected").and_then(|v| v.as_str()),
+        "normalization_steps": normalization_steps,
+        "resized_images": resized_images,
+        "selected_images": selected_images,
+        "fallback_level_applied": analysis.get("fallback_level_applied").and_then(|v| v.as_i64()).unwrap_or(0),
+        "token_accounting_present": analysis.get("token_accounting").is_some(),
+        "within_context": within_context,
+        "has_thumbnail": has_thumbnail,
+        "has_ocr_text": has_ocr_text,
+        "ocr_engine": ocr_engine,
+    })
+}
+
+fn infer_image_intent_from_text(user_text: &str) -> &'static str {
+    let text = user_text.trim().to_ascii_lowercase();
+    if text.is_empty() {
+        return "mixed";
+    }
+
+    let has_ui = [
+        "ui",
+        "screenshot",
+        "screen",
+        "stack trace",
+        "terminal",
+        "error",
+    ]
+    .iter()
+    .any(|k| text.contains(k));
+    if has_ui {
+        return "ui_error_reading";
+    }
+
+    let has_document = [
+        "document", "invoice", "receipt", "form", "page", "scan", "pdf",
+    ]
+    .iter()
+    .any(|k| text.contains(k));
+    if has_document {
+        return "document_scan";
+    }
+
+    let has_text = [
+        "read",
+        "text",
+        "ocr",
+        "extract",
+        "transcribe",
+        "word",
+        "sentence",
+    ]
+    .iter()
+    .any(|k| text.contains(k));
+    let has_scene = [
+        "describe",
+        "scene",
+        "object",
+        "identify",
+        "detect",
+        "count",
+        "analy",
+        "what is in",
+        "see",
+        "look",
+    ]
+    .iter()
+    .any(|k| text.contains(k));
+
+    match (has_text, has_scene) {
+        (true, true) => "mixed",
+        (true, false) => "text_reading",
+        (false, true) => "scene_understanding",
+        (false, false) => "mixed",
+    }
+}
+
+fn build_image_llm_user_content(
+    user_text: &str,
+    attachment_path: &str,
+    image_intent: &str,
+    preanalysis_summary: Option<&str>,
+) -> String {
+    let mut content = String::new();
+    content.push_str(user_text);
+    content.push_str("\n\nImage attachment is already included for this turn.");
+    content.push_str("\nInterpret the user's request and answer directly from the uploaded image.");
+    content.push_str(
+        "\nDo not ask the user to re-upload the image, provide a URL, or provide an image path.",
+    );
+    content.push_str(
+        "\nIf detailed OCR/object analysis is needed, use available vision tools automatically.",
+    );
+    content.push_str("\nOnly ask follow-up questions when the request is genuinely ambiguous.");
+    content.push_str("\nPrefer automatic pre-analysis context first, then use the attached image.");
+    content.push_str("\nInferred image-intent hint: ");
+    content.push_str(image_intent);
+    content.push_str("\nAttachment path (available to local tools if needed): ");
+    content.push_str(attachment_path);
+
+    if let Some(summary) = preanalysis_summary {
+        if !summary.trim().is_empty() {
+            content.push_str("\n\nAutomatic pre-analysis context:\n");
+            content.push_str(summary);
+        }
+    }
+
+    content
+}
+
 fn env_truthy(name: &str) -> bool {
     std::env::var(name)
         .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -233,7 +1027,10 @@ fn load_cached_hardware_info(cache_path: &std::path::Path) -> Option<HardwareInf
     serde_json::from_str::<HardwareInfo>(&text).ok()
 }
 
-fn resolve_hardware_info(config: &KriaConfig, cache_path: &std::path::Path) -> (HardwareInfo, String) {
+fn resolve_hardware_info(
+    config: &KriaConfig,
+    cache_path: &std::path::Path,
+) -> (HardwareInfo, String) {
     // Highest precedence: explicit env override.
     if let Ok(env_tier) = std::env::var("KRIA_TIER") {
         let env_tier = env_tier.trim();
@@ -287,7 +1084,7 @@ pub struct AppState {
     pub vectors: Arc<VectorIndex>,
     pub current_session_id: Arc<RwLock<String>>,
     pub voice_active: Arc<std::sync::atomic::AtomicBool>,
-    pub voice_pipeline: Arc<VoicePipeline>,
+    pub voice_pipeline: Arc<RwLock<Arc<VoicePipeline>>>,
     pub health: Arc<HealthRegistry>,
     pub scheduler: Arc<RwLock<AutomationScheduler>>,
     pub macro_recorder: Arc<RwLock<MacroRecorder>>,
@@ -299,6 +1096,31 @@ pub struct AppState {
     /// MCP server manager — kept alive for background health monitoring + dynamic tool registration.
     #[allow(dead_code)]
     pub mcp_manager: Arc<tokio::sync::Mutex<McpServerManager>>,
+    /// Lazy Google Workspace MCP client reference used by gw_* tool handlers.
+    pub gw_client_ref: gw::GwClientRef,
+}
+
+fn build_voice_pipeline(
+    config: &KriaConfig,
+    paths: &kria_core::platform::paths::KriaPaths,
+) -> Arc<VoicePipeline> {
+    let stt_model_path = paths.models_dir.join("stt").join(&config.voice.stt_model);
+    let tts_voice_file = format!("{}.onnx", config.voice.tts_voice);
+    let tts_model_path = paths.models_dir.join("piper").join(&tts_voice_file);
+
+    let whisper_bin = which_binary("whisper-cpp").or_else(|| which_binary("main"));
+    let piper_bin = which_binary("piper");
+
+    let mut stt = SpeechToText::new(stt_model_path, whisper_bin);
+    stt.set_language(&config.voice.language);
+    if config.hardware.threads > 0 {
+        stt.set_threads(config.hardware.threads.clamp(1, 12));
+    }
+    stt.set_command_timeout(std::time::Duration::from_secs(45));
+    let tts = TextToSpeech::new(tts_model_path, piper_bin);
+    let vad_model_path = paths.models_dir.join("vad").join("silero_vad.onnx");
+
+    Arc::new(VoicePipeline::new(config.voice.clone(), stt, tts).with_vad_model(vad_model_path))
 }
 
 /// Initialize the KRIA runtime (called from setup).
@@ -371,6 +1193,14 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
 
     // Health registry (created early so sidecar spawn can update it)
     let health = Arc::new(HealthRegistry::new());
+    health.register("sidecar");
+    health.update("sidecar", ServiceStatus::Starting, None);
+    health.register("ocr_dependency");
+    health.update(
+        "ocr_dependency",
+        ServiceStatus::Starting,
+        Some("Probing OCR dependency readiness".into()),
+    );
 
     // Python sidecar bridge (created early so tools can reference it)
     let venv_path = paths.data_dir.join("python-env");
@@ -386,10 +1216,16 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
                 tracing::info!("Python sidecar started successfully");
                 event_bus_clone.publish(kria_core::infra::event_bus::KriaEvent::SidecarReady);
                 health_sidecar.update("sidecar", ServiceStatus::Healthy, None);
+                refresh_ocr_dependency_health(&health_sidecar, &sidecar_clone).await;
             }
             Err(e) => {
                 tracing::warn!("Python sidecar failed to start (non-fatal): {}", e);
                 health_sidecar.update("sidecar", ServiceStatus::Degraded, Some(format!("{e}")));
+                health_sidecar.update(
+                    "ocr_dependency",
+                    ServiceStatus::Degraded,
+                    Some("OCR unavailable: sidecar failed to start".into()),
+                );
             }
         }
     });
@@ -400,17 +1236,23 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
         EmbeddingModel::load(384).expect("fallback always succeeds")
     }));
     let vectors_path = paths.data_dir.join("vectors.bin");
-    let vectors = Arc::new(VectorIndex::open(&vectors_path, 384).unwrap_or_else(|_| VectorIndex::in_memory(384)));
+    let vectors = Arc::new(
+        VectorIndex::open(&vectors_path, 384).unwrap_or_else(|_| VectorIndex::in_memory(384)),
+    );
 
     // Build the full tool registry (60+ tools + 6 precognitive) with MemoryStore, RAG, and Proactive
     let rag_engine = Arc::new(kria_core::memory::RagEngine::new(
-        memory_store.clone(), vectors.clone(), embeddings.clone(),
+        memory_store.clone(),
+        vectors.clone(),
+        embeddings.clone(),
     ));
     let proactive_engine = Arc::new(kria_core::automation::ProactiveEngine::new(
         kria_core::automation::proactive::HealthThresholds::default(),
     ));
     let tool_registry_inner = registry::build_registry_full(
-        Some(memory_store.clone()), Some(rag_engine.clone()), Some(proactive_engine.clone()),
+        Some(memory_store.clone()),
+        Some(rag_engine.clone()),
+        Some(proactive_engine.clone()),
     );
     kria_core::tools::precognitive::register(&tool_registry_inner, sidecar.clone());
     kria_core::tools::news::register(&tool_registry_inner, sidecar.clone());
@@ -425,16 +1267,21 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
         kria_core::config::load_mcp_servers(&mut cfg);
         config = cfg;
     }
+    sync_telegram_mcp_server_config(&mut config);
     let total_servers = config.mcp.servers.len();
     let enabled_servers = config.mcp.servers.iter().filter(|s| s.enabled).count();
     tracing::info!(
         "[MCP] {} total MCP server(s) configured, {} enabled",
-        total_servers, enabled_servers
+        total_servers,
+        enabled_servers
     );
     for s in &config.mcp.servers {
         tracing::info!(
             "[MCP]   server='{}' enabled={} command='{}' args={:?}",
-            s.name, s.enabled, s.command, s.args
+            s.name,
+            s.enabled,
+            s.command,
+            s.args
         );
     }
 
@@ -459,7 +1306,9 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
         Arc::new(tokio::sync::Mutex::new(McpServerManager::new(mcp_configs)));
 
     // Build tool mount manager (controls which tool groups are visible to the LLM)
-    let mount_mgr = Arc::new(tokio::sync::RwLock::new(mount_manager::build_default_mount_manager()));
+    let mount_mgr = Arc::new(tokio::sync::RwLock::new(
+        mount_manager::build_default_mount_manager(),
+    ));
 
     // Safety subsystems
     let hitl = Arc::new(HitlGateway::new(30));
@@ -477,58 +1326,57 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
 
     // Build the agent loop
     let max_tool_rounds = config.agent.max_tool_rounds.max(1);
-    let agent_loop = Arc::new(AgentLoop::new(
-        model_router.clone(),
-        tool_registry.clone(),
-        mount_mgr,
-        policy_engine,
-        hitl.clone(),
-        audit_logger,
-        rollback_mgr,
-    )
-    .with_max_tool_rounds(max_tool_rounds)
-    .with_hardware_tier(hardware_info.tier.as_str()));
+    let agent_loop = Arc::new(
+        AgentLoop::new(
+            model_router.clone(),
+            tool_registry.clone(),
+            mount_mgr,
+            policy_engine,
+            hitl.clone(),
+            audit_logger,
+            rollback_mgr,
+        )
+        .with_max_tool_rounds(max_tool_rounds)
+        .with_hardware_tier(hardware_info.tier.as_str()),
+    );
 
     tracing::info!("KRIA runtime initialized — agent loop active");
 
     // Build voice pipeline
-    let stt_model_path = paths.models_dir.join("stt").join(&config.voice.stt_model);
-    let tts_voice_file = format!("{}.onnx", config.voice.tts_voice);
-    let tts_model_path = paths.models_dir.join("piper").join(&tts_voice_file);
-
-    // Look for whisper and piper binaries on PATH
-    let whisper_bin = which_binary("whisper-cpp").or_else(|| which_binary("main"));
-    let piper_bin = which_binary("piper");
-
-    let stt = SpeechToText::new(stt_model_path, whisper_bin);
-    let tts = TextToSpeech::new(tts_model_path, piper_bin);
-    let vad_model_path = paths.models_dir.join("vad").join("silero_vad.onnx");
-    let voice_pipeline = Arc::new(
-        VoicePipeline::new(config.voice.clone(), stt, tts)
-            .with_vad_model(vad_model_path)
-    );
+    let voice_pipeline = build_voice_pipeline(&config, &paths);
 
     // Health registry — register all subsystems
     health.register("memory_store");
     health.register("model_router");
     health.register("tool_registry");
     health.register("agent_loop");
-    health.register("sidecar");
     health.register("voice_pipeline");
     health.register("embeddings");
     health.register("vectors");
     // Mark core services as healthy
     health.update("memory_store", ServiceStatus::Healthy, None);
     // model_router: probe the actual LLM server asynchronously
-    health.update("model_router", ServiceStatus::Starting, Some("probing LLM server...".into()));
-    health.update("tool_registry", ServiceStatus::Healthy, Some(format!("{} tools", tool_registry.len())));
+    health.update(
+        "model_router",
+        ServiceStatus::Starting,
+        Some("probing LLM server...".into()),
+    );
+    health.update(
+        "tool_registry",
+        ServiceStatus::Healthy,
+        Some(format!("{} tools", tool_registry.len())),
+    );
     health.update("agent_loop", ServiceStatus::Healthy, None);
     health.update("voice_pipeline", ServiceStatus::Healthy, None);
     health.update("embeddings", ServiceStatus::Healthy, None);
     health.update("vectors", ServiceStatus::Healthy, None);
     // MCP servers start in background — mark as starting
     health.register("mcp_servers");
-    health.update("mcp_servers", ServiceStatus::Starting, Some("connecting to MCP servers...".into()));
+    health.update(
+        "mcp_servers",
+        ServiceStatus::Starting,
+        Some("connecting to MCP servers...".into()),
+    );
 
     // Async probe of the LLM server — updates health once result is known
     // Wrap config in Arc<RwLock> early so both the probe and AppState share it
@@ -548,18 +1396,32 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
                         config_for_probe.write().await.llm.active_model = name.clone();
                         name
                     }
-                    None => status["local_model"].as_str().unwrap_or("unknown").to_string(),
+                    None => status["local_model"]
+                        .as_str()
+                        .unwrap_or("unknown")
+                        .to_string(),
                 };
-                health_mr.update("model_router", ServiceStatus::Healthy,
-                    Some(format!("model: {}", model_name)));
+                health_mr.update(
+                    "model_router",
+                    ServiceStatus::Healthy,
+                    Some(format!("model: {}", model_name)),
+                );
             } else {
-                health_mr.update("model_router", ServiceStatus::Degraded,
-                    Some("LLM server not reachable".into()));
+                health_mr.update(
+                    "model_router",
+                    ServiceStatus::Degraded,
+                    Some("LLM server not reachable".into()),
+                );
             }
         });
     }
-    // Sidecar starts as "starting" — updated when spawn completes or fails
+    // Sidecar/OCR dependency start as "starting" — updated when probes complete.
     health.update("sidecar", ServiceStatus::Starting, None);
+    health.update(
+        "ocr_dependency",
+        ServiceStatus::Starting,
+        Some("Waiting for sidecar OCR capability probe".into()),
+    );
 
     // Automation subsystems
     let automation_dir = paths.data_dir.join("automation");
@@ -579,21 +1441,54 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
     // Store state in Tauri
     let telegram_bridge: Arc<RwLock<Option<TelegramBridge>>> = Arc::new(RwLock::new(None));
 
-    // Auto-start Telegram bridge if configured
-    let telegram_config = config.read().await.telegram.clone();
-    if telegram_config.enabled && !telegram_config.bot_token.is_empty() && telegram_config.auto_start {
-        tracing::info!("Auto-starting Telegram bridge");
-        let bridge = TelegramBridge::spawn(
-            telegram_config,
-            agent_loop.clone(),
-            memory_store.clone(),
-            tool_registry.clone(),
-            embeddings.clone(),
-            vectors.clone(),
-            hardware_info.tier.as_str().to_string(),
-        );
-        *telegram_bridge.write().await = Some(bridge);
+    // Auto-start Telegram bridge if configured.
+    // If an enabled `telegram` MCP server is present, skip the built-in bridge
+    // to avoid competing getUpdates long polls on the same bot token.
+    let (telegram_config, telegram_mcp_enabled) = {
+        let cfg = config.read().await;
+        (
+            cfg.telegram.clone(),
+            cfg.mcp
+                .servers
+                .iter()
+                .any(|s| s.enabled && s.name.eq_ignore_ascii_case("telegram")),
+        )
+    };
+    if telegram_config.enabled
+        && !telegram_config.bot_token.is_empty()
+        && telegram_config.auto_start
+    {
+        if telegram_mcp_enabled {
+            tracing::warn!(
+                "Skipping built-in Telegram bridge auto-start because enabled MCP server 'telegram' already handles polling"
+            );
+        } else {
+            tracing::info!("Auto-starting Telegram bridge");
+            let bridge = TelegramBridge::spawn(
+                telegram_config,
+                agent_loop.clone(),
+                memory_store.clone(),
+                tool_registry.clone(),
+                embeddings.clone(),
+                vectors.clone(),
+                hardware_info.tier.as_str().to_string(),
+            );
+            *telegram_bridge.write().await = Some(bridge);
+        }
     }
+
+    let (local_api_host, local_api_port) = {
+        let cfg = config.read().await;
+        (cfg.server.host.clone(), cfg.server.port)
+    };
+    let local_api_responder: Arc<dyn LocalApiResponder> = Arc::new(AgentLoopLocalApiResponder {
+        agent_loop: agent_loop.clone(),
+        memory_store: memory_store.clone(),
+        tool_registry: tool_registry.clone(),
+        embeddings: embeddings.clone(),
+        vectors: vectors.clone(),
+        hw_tier: hardware_info.tier.as_str().to_string(),
+    });
 
     let state = AppState {
         config,
@@ -608,7 +1503,7 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
         vectors,
         current_session_id: Arc::new(RwLock::new(uuid::Uuid::new_v4().to_string())),
         voice_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        voice_pipeline,
+        voice_pipeline: Arc::new(RwLock::new(voice_pipeline)),
         health: health.clone(),
         scheduler: scheduler_arc,
         macro_recorder: macro_recorder_arc,
@@ -618,6 +1513,7 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
         proactive: proactive_engine,
         telegram_bridge,
         mcp_manager: mcp_manager.clone(),
+        gw_client_ref: gw_client_ref.clone(),
     };
 
     if let Err(_) = handle.state::<AppStateCell>().set(state) {
@@ -625,6 +1521,12 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
     }
 
     tracing::info!("[INIT] AppState set — frontend is now unblocked");
+    start_local_api_bridge(
+        local_api_host,
+        local_api_port,
+        local_api_responder,
+        health.clone(),
+    );
 
     // ── Background MCP server startup (non-blocking) ──────────────────────────
     // MCP servers (especially npx-based ones) can take minutes to start.
@@ -632,7 +1534,7 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
     {
         let tool_reg_bg = tool_registry.clone();
         let mcp_mgr_bg = mcp_manager.clone();
-        let gw_ref_bg = gw_client_ref;
+        let gw_ref_bg = gw_client_ref.clone();
         let health_bg = health.clone();
         let handle_bg = handle.clone();
         tokio::spawn(async move {
@@ -643,7 +1545,9 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
             // Wire GW client if gworkspace server started successfully
             if let Some(live_client) = mgr.get_client("gworkspace") {
                 gw::set_client(&gw_ref_bg, live_client.clone()).await;
-                tracing::info!("[GW] GwClientRef populated — Google Workspace tools are now active");
+                tracing::info!(
+                    "[GW] GwClientRef populated — Google Workspace tools are now active"
+                );
                 let _ = handle_bg.emit("gw:connected", serde_json::json!({}));
             } else {
                 tracing::warn!(
@@ -654,15 +1558,29 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
 
             let statuses = mgr.status().await;
             let running = statuses.iter().filter(|s| s.tool_count > 0).count();
-            health_bg.update("mcp_servers", ServiceStatus::Healthy,
-                Some(format!("{}/{} servers running, {} total tools", running, statuses.len(), tool_reg_bg.len())));
+            health_bg.update(
+                "mcp_servers",
+                ServiceStatus::Healthy,
+                Some(format!(
+                    "{}/{} servers running, {} total tools",
+                    running,
+                    statuses.len(),
+                    tool_reg_bg.len()
+                )),
+            );
 
-            let _ = handle_bg.emit("mcp:ready", serde_json::json!({
-                "running": running,
-                "total": statuses.len(),
-                "tools": tool_reg_bg.len(),
-            }));
-            tracing::info!("[MCP] background startup complete — {} tools available", tool_reg_bg.len());
+            let _ = handle_bg.emit(
+                "mcp:ready",
+                serde_json::json!({
+                    "running": running,
+                    "total": statuses.len(),
+                    "tools": tool_reg_bg.len(),
+                }),
+            );
+            tracing::info!(
+                "[MCP] background startup complete — {} tools available",
+                tool_reg_bg.len()
+            );
 
             // Start MCP health heartbeat (pings servers every 30s, auto-restarts on failure)
             drop(mgr);
@@ -679,7 +1597,9 @@ pub async fn send_message(
     state: State<'_, AppStateCell>,
     app: AppHandle,
 ) -> Result<serde_json::Value, String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
     tracing::info!("User message: {}", &message);
 
     emit_agent_stage(
@@ -691,7 +1611,10 @@ pub async fn send_message(
         })),
     );
 
-    let _ = app.emit("agent:thinking", serde_json::json!({"status": "processing"}));
+    let _ = app.emit(
+        "agent:thinking",
+        serde_json::json!({"status": "processing"}),
+    );
 
     let agent_loop = state.agent_loop.clone();
     let memory_store = state.memory_store.clone();
@@ -709,13 +1632,28 @@ pub async fn send_message(
 
     // Build the system prompt with tool descriptions and user context
     let tool_defs = tool_registry.list_for_tier(hw_tier);
-    let tool_descriptions = tool_defs.iter()
+    let tool_descriptions = tool_defs
+        .iter()
         .map(|d| {
-            let params: Vec<String> = d.parameters.iter()
-                .map(|p| format!("  - {}: {} ({}{})", p.name, p.description, p.param_type,
-                    if p.required { ", required" } else { "" }))
+            let params: Vec<String> = d
+                .parameters
+                .iter()
+                .map(|p| {
+                    format!(
+                        "  - {}: {} ({}{})",
+                        p.name,
+                        p.description,
+                        p.param_type,
+                        if p.required { ", required" } else { "" }
+                    )
+                })
                 .collect();
-            format!("### {}\n{}\nParameters:\n{}", d.name, d.description, params.join("\n"))
+            format!(
+                "### {}\n{}\nParameters:\n{}",
+                d.name,
+                d.description,
+                params.join("\n")
+            )
         })
         .collect::<Vec<_>>()
         .join("\n\n");
@@ -728,7 +1666,8 @@ pub async fn send_message(
     );
 
     // Retrieve user context from memory
-    let user_name = memory_store.get_preference("user_name")
+    let user_name = memory_store
+        .get_preference("user_name")
         .unwrap_or(None)
         .unwrap_or_else(|| "User".to_string());
     let os_name = std::env::consts::OS;
@@ -756,9 +1695,7 @@ pub async fn send_message(
 
     let memory_context = match memory_store.search_facts(&message, 5) {
         Ok(facts) if !facts.is_empty() => {
-            let fact_lines: Vec<String> = facts.iter()
-                .map(|f| format!("- {}", f.text))
-                .collect();
+            let fact_lines: Vec<String> = facts.iter().map(|f| format!("- {}", f.text)).collect();
             format!("Known facts about the user:\n{}", fact_lines.join("\n"))
         }
         _ => String::new(),
@@ -806,7 +1743,8 @@ pub async fn send_message(
     );
 
     // Build conversation messages (system + recent history + current message)
-    let recent_turns = memory_store.get_recent_turns(&session_id, 20)
+    let recent_turns = memory_store
+        .get_recent_turns(&session_id, 20)
         .unwrap_or_default();
 
     let mut messages = Vec::with_capacity(recent_turns.len() + 2);
@@ -859,7 +1797,11 @@ pub async fn send_message(
     // Auto-title: if this is the first message in the session, generate a title
     {
         let title_key = format!("session_title:{}", session_id);
-        if memory_store.get_preference(&title_key).unwrap_or(None).is_none() {
+        if memory_store
+            .get_preference(&title_key)
+            .unwrap_or(None)
+            .is_none()
+        {
             let title = if message.len() > 50 {
                 format!("{}...", &message[..50])
             } else {
@@ -918,7 +1860,35 @@ pub async fn send_message(
             None,
         );
 
-        while let Some(event) = event_rx.recv().await {
+        loop {
+            let event = match tokio::time::timeout(
+                std::time::Duration::from_secs(AGENT_EVENT_IDLE_TIMEOUT_SECS),
+                event_rx.recv(),
+            )
+            .await
+            {
+                Ok(Some(event)) => event,
+                Ok(None) => break,
+                Err(_) => {
+                    emit_agent_stage(
+                        &app_handle,
+                        "timed_out_waiting_for_llm",
+                        "No agent events received within timeout window",
+                        Some(serde_json::json!({
+                            "timeout_secs": AGENT_EVENT_IDLE_TIMEOUT_SECS,
+                        })),
+                    );
+                    full_response = AGENT_TIMEOUT_MESSAGE.to_string();
+                    let _ = app_handle.emit(
+                        "agent:token",
+                        serde_json::json!({
+                            "text": AGENT_TIMEOUT_MESSAGE,
+                        }),
+                    );
+                    break;
+                }
+            };
+
             match event {
                 StreamEvent::Token(text) => {
                     if !saw_first_token {
@@ -931,9 +1901,12 @@ pub async fn send_message(
                         );
                     }
                     full_response.push_str(&text);
-                    let _ = app_handle.emit("agent:token", serde_json::json!({
-                        "text": text,
-                    }));
+                    let _ = app_handle.emit(
+                        "agent:token",
+                        serde_json::json!({
+                            "text": text,
+                        }),
+                    );
                 }
                 StreamEvent::ToolStart { name, params } => {
                     tracing::info!("Tool call: {} with {:?}", name, params);
@@ -945,12 +1918,19 @@ pub async fn send_message(
                             "tool": name.clone(),
                         })),
                     );
-                    let _ = app_handle.emit("agent:tool_call", serde_json::json!({
-                        "name": name,
-                        "params": params,
-                    }));
+                    let _ = app_handle.emit(
+                        "agent:tool_call",
+                        serde_json::json!({
+                            "name": name,
+                            "params": params,
+                        }),
+                    );
                 }
-                StreamEvent::ToolEnd { name, result, success } => {
+                StreamEvent::ToolEnd {
+                    name,
+                    result,
+                    success,
+                } => {
                     tracing::info!("Tool result: {} success={}", name, success);
                     emit_agent_stage(
                         &app_handle,
@@ -964,7 +1944,12 @@ pub async fn send_message(
                     let payload = build_tool_result_event_payload(&name, &result, success);
                     let _ = app_handle.emit("agent:tool_result", payload);
                 }
-                StreamEvent::ApprovalRequired { request_id, action, risk_level, parameters } => {
+                StreamEvent::ApprovalRequired {
+                    request_id,
+                    action,
+                    risk_level,
+                    parameters,
+                } => {
                     emit_agent_stage(
                         &app_handle,
                         "approval_required",
@@ -974,13 +1959,16 @@ pub async fn send_message(
                             "risk_level": risk_level.clone(),
                         })),
                     );
-                    let _ = app_handle.emit("agent:approval_required", serde_json::json!({
-                        "requestId": request_id,
-                        "toolName": action,
-                        "riskLevel": risk_level,
-                        "args": parameters,
-                        "reason": "",
-                    }));
+                    let _ = app_handle.emit(
+                        "agent:approval_required",
+                        serde_json::json!({
+                            "requestId": request_id,
+                            "toolName": action,
+                            "riskLevel": risk_level,
+                            "args": parameters,
+                            "reason": "",
+                        }),
+                    );
                 }
                 StreamEvent::ApprovalResult { action, approved } => {
                     emit_agent_stage(
@@ -992,10 +1980,13 @@ pub async fn send_message(
                             "approved": approved,
                         })),
                     );
-                    let _ = app_handle.emit("agent:approval_result", serde_json::json!({
-                        "action": action,
-                        "approved": approved,
-                    }));
+                    let _ = app_handle.emit(
+                        "agent:approval_result",
+                        serde_json::json!({
+                            "action": action,
+                            "approved": approved,
+                        }),
+                    );
                 }
                 StreamEvent::Plan(plan) => {
                     emit_agent_stage(
@@ -1006,13 +1997,20 @@ pub async fn send_message(
                             "plan": plan.clone(),
                         })),
                     );
-                    let _ = app_handle.emit("agent:thinking", serde_json::json!({
-                        "status": "planning",
-                        "plan": plan,
-                    }));
+                    let _ = app_handle.emit(
+                        "agent:thinking",
+                        serde_json::json!({
+                            "status": "planning",
+                            "plan": plan,
+                        }),
+                    );
                 }
                 StreamEvent::Error(err) => {
                     tracing::error!("Agent error: {}", err);
+                    let user_visible_error = format!("⚠️ {err}");
+                    if full_response.is_empty() {
+                        full_response = user_visible_error.clone();
+                    }
                     emit_agent_stage(
                         &app_handle,
                         "failed",
@@ -1021,9 +2019,12 @@ pub async fn send_message(
                             "error": err.clone(),
                         })),
                     );
-                    let _ = app_handle.emit("agent:token", serde_json::json!({
-                        "text": format!("⚠️ {err}"),
-                    }));
+                    let _ = app_handle.emit(
+                        "agent:token",
+                        serde_json::json!({
+                            "text": user_visible_error,
+                        }),
+                    );
                 }
                 StreamEvent::Done(final_text) => {
                     if !final_text.is_empty() && full_response.is_empty() {
@@ -1105,18 +2106,25 @@ pub async fn send_message(
 pub async fn get_session_history(
     state: State<'_, AppStateCell>,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
     let session_id = state.current_session_id.read().await.clone();
-    let turns = state.memory_store.get_recent_turns(&session_id, 100)
+    let turns = state
+        .memory_store
+        .get_recent_turns(&session_id, 100)
         .map_err(|e| e.to_string())?;
-    let messages: Vec<serde_json::Value> = turns.iter().map(|t| {
-        serde_json::json!({
-            "role": t.role,
-            "content": t.content,
-            "tool_name": t.tool_name,
-            "timestamp": t.timestamp.to_rfc3339(),
+    let messages: Vec<serde_json::Value> = turns
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "role": t.role,
+                "content": t.content,
+                "tool_name": t.tool_name,
+                "timestamp": t.timestamp.to_rfc3339(),
+            })
         })
-    }).collect();
+        .collect();
     Ok(messages)
 }
 
@@ -1125,7 +2133,9 @@ pub async fn create_session(
     title: Option<String>,
     state: State<'_, AppStateCell>,
 ) -> Result<serde_json::Value, String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
     let new_id = uuid::Uuid::new_v4().to_string();
     *state.current_session_id.write().await = new_id.clone();
 
@@ -1145,22 +2155,31 @@ pub async fn create_session(
 pub async fn list_sessions(
     state: State<'_, AppStateCell>,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
-    let sessions = state.memory_store.list_sessions()
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    let sessions = state
+        .memory_store
+        .list_sessions()
         .map_err(|e| e.to_string())?;
     let current = state.current_session_id.read().await.clone();
-    let result: Vec<serde_json::Value> = sessions.into_iter().map(|(id, count, last_active)| {
-        let title = state.memory_store.get_preference(&format!("session_title:{}", id))
-            .unwrap_or(None)
-            .unwrap_or_else(|| format!("Session ({})", &id[..8]));
-        serde_json::json!({
-            "id": id,
-            "title": title,
-            "message_count": count,
-            "last_active": last_active,
-            "is_current": id == current,
+    let result: Vec<serde_json::Value> = sessions
+        .into_iter()
+        .map(|(id, count, last_active)| {
+            let title = state
+                .memory_store
+                .get_preference(&format!("session_title:{}", id))
+                .unwrap_or(None)
+                .unwrap_or_else(|| format!("Session ({})", &id[..8]));
+            serde_json::json!({
+                "id": id,
+                "title": title,
+                "message_count": count,
+                "last_active": last_active,
+                "is_current": id == current,
+            })
         })
-    }).collect();
+        .collect();
     Ok(result)
 }
 
@@ -1169,19 +2188,26 @@ pub async fn switch_session(
     session_id: String,
     state: State<'_, AppStateCell>,
 ) -> Result<serde_json::Value, String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
     *state.current_session_id.write().await = session_id.clone();
     // Load history for the new session
-    let turns = state.memory_store.get_recent_turns(&session_id, 100)
+    let turns = state
+        .memory_store
+        .get_recent_turns(&session_id, 100)
         .map_err(|e| e.to_string())?;
-    let messages: Vec<serde_json::Value> = turns.iter().map(|t| {
-        serde_json::json!({
-            "role": t.role,
-            "content": t.content,
-            "tool_name": t.tool_name,
-            "timestamp": t.timestamp.to_rfc3339(),
+    let messages: Vec<serde_json::Value> = turns
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "role": t.role,
+                "content": t.content,
+                "tool_name": t.tool_name,
+                "timestamp": t.timestamp.to_rfc3339(),
+            })
         })
-    }).collect();
+        .collect();
     Ok(serde_json::json!({
         "session_id": session_id,
         "messages": messages,
@@ -1193,9 +2219,13 @@ pub async fn delete_session(
     session_id: String,
     state: State<'_, AppStateCell>,
 ) -> Result<(), String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
     let current = state.current_session_id.read().await.clone();
-    state.memory_store.delete_session(&session_id)
+    state
+        .memory_store
+        .delete_session(&session_id)
         .map_err(|e| e.to_string())?;
     // If we deleted the current session, create a new one
     if session_id == current {
@@ -1210,9 +2240,13 @@ pub async fn rename_session(
     title: String,
     state: State<'_, AppStateCell>,
 ) -> Result<(), String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
     let key = format!("session_title:{}", session_id);
-    state.memory_store.set_preference(&key, &title)
+    state
+        .memory_store
+        .set_preference(&key, &title)
         .map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -1222,25 +2256,32 @@ pub async fn search_sessions(
     query: String,
     state: State<'_, AppStateCell>,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
-    let results = state.memory_store.search_conversations(&query, 20)
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    let results = state
+        .memory_store
+        .search_conversations(&query, 20)
         .map_err(|e| e.to_string())?;
-    let items: Vec<serde_json::Value> = results.into_iter().map(|t| {
-        serde_json::json!({
-            "session_id": t.session_id,
-            "role": t.role,
-            "content": t.content,
-            "timestamp": t.timestamp.to_rfc3339(),
+    let items: Vec<serde_json::Value> = results
+        .into_iter()
+        .map(|t| {
+            serde_json::json!({
+                "session_id": t.session_id,
+                "role": t.role,
+                "content": t.content,
+                "timestamp": t.timestamp.to_rfc3339(),
+            })
         })
-    }).collect();
+        .collect();
     Ok(items)
 }
 
 #[tauri::command]
-pub async fn cancel_request(
-    state: State<'_, AppStateCell>,
-) -> Result<(), String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+pub async fn cancel_request(state: State<'_, AppStateCell>) -> Result<(), String> {
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
     state.hitl.cancel_all().await;
     Ok(())
 }
@@ -1250,8 +2291,13 @@ pub async fn approve_action(
     request_id: String,
     state: State<'_, AppStateCell>,
 ) -> Result<(), String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
-    state.hitl.respond(&request_id, ApprovalResponse::Approved).await;
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    state
+        .hitl
+        .respond(&request_id, ApprovalResponse::Approved)
+        .await;
     Ok(())
 }
 
@@ -1261,26 +2307,46 @@ pub async fn deny_action(
     _reason: Option<String>,
     state: State<'_, AppStateCell>,
 ) -> Result<(), String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
-    state.hitl.respond(&request_id, ApprovalResponse::Denied).await;
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    state
+        .hitl
+        .respond(&request_id, ApprovalResponse::Denied)
+        .await;
     Ok(())
 }
 
 #[tauri::command]
-pub async fn get_health(
-    state: State<'_, AppStateCell>,
-) -> Result<serde_json::Value, String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+pub async fn get_health(state: State<'_, AppStateCell>) -> Result<serde_json::Value, String> {
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
     // Refresh LLM server health on each call
     let mr_status = state.model_router.status().await;
     let mr_healthy = mr_status["local_healthy"].as_bool().unwrap_or(false);
     let mr_model = mr_status["local_model"].as_str().unwrap_or("unknown");
     if mr_healthy {
-        state.health.update("model_router", ServiceStatus::Healthy,
-            Some(format!("model: {}", mr_model)));
+        state.health.update(
+            "model_router",
+            ServiceStatus::Healthy,
+            Some(format!("model: {}", mr_model)),
+        );
     } else {
-        state.health.update("model_router", ServiceStatus::Degraded,
-            Some("LLM server not reachable".into()));
+        state.health.update(
+            "model_router",
+            ServiceStatus::Degraded,
+            Some("LLM server not reachable".into()),
+        );
+    }
+
+    // Refresh OCR dependency status from sidecar so UI can warn users before first upload.
+    {
+        let health = state.health.clone();
+        let sidecar = state.sidecar.clone();
+        tokio::spawn(async move {
+            refresh_ocr_dependency_health(&health, &sidecar).await;
+        });
     }
 
     let services = state.health.status_all();
@@ -1310,7 +2376,9 @@ pub async fn get_health(
 pub async fn get_hardware_info(
     state: State<'_, AppStateCell>,
 ) -> Result<serde_json::Value, String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
     let hw = &state.hardware_info;
     Ok(serde_json::json!({
         "tier": hw.tier.as_str(),
@@ -1331,12 +2399,24 @@ pub async fn get_hardware_info(
 }
 
 #[tauri::command]
-pub async fn get_settings(
-    state: State<'_, AppStateCell>,
-) -> Result<serde_json::Value, String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+pub async fn get_settings(state: State<'_, AppStateCell>) -> Result<serde_json::Value, String> {
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
     let config = state.config.read().await;
     serde_json::to_value(&*config).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn list_audio_devices() -> Result<serde_json::Value, String> {
+    let inputs = list_input_devices().unwrap_or_default();
+    let outputs = list_output_devices().unwrap_or_default();
+    Ok(serde_json::json!({
+        "inputs": inputs,
+        "outputs": outputs,
+        "default_input": default_input_device_name(),
+        "default_output": default_output_device_name(),
+    }))
 }
 
 #[tauri::command]
@@ -1344,14 +2424,20 @@ pub async fn update_settings(
     settings: serde_json::Value,
     state: State<'_, AppStateCell>,
 ) -> Result<(), String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
-    let new_config: KriaConfig = serde_json::from_value(settings)
-        .map_err(|e| e.to_string())?;
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    let mut new_config: KriaConfig = serde_json::from_value(settings).map_err(|e| e.to_string())?;
+    sync_telegram_mcp_server_config(&mut new_config);
     // Persist to disk first
     new_config.save().map_err(|e| e.to_string())?;
     // Then update in-memory config
     let mut config = state.config.write().await;
     *config = new_config;
+
+    drop(config);
+    let _ = apply_mcp_runtime_from_config(state).await;
+
     Ok(())
 }
 
@@ -1359,35 +2445,46 @@ pub async fn update_settings(
 pub async fn list_knowledge_base(
     state: State<'_, AppStateCell>,
 ) -> Result<serde_json::Value, String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
-    let docs = state.memory_store.list_documents().map_err(|e| e.to_string())?;
-    let items: Vec<serde_json::Value> = docs.iter().map(|(id, name, dtype, chunks)| {
-        serde_json::json!({
-            "doc_id": id,
-            "name": name,
-            "type": dtype,
-            "chunks": chunks,
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    let docs = state
+        .memory_store
+        .list_documents()
+        .map_err(|e| e.to_string())?;
+    let items: Vec<serde_json::Value> = docs
+        .iter()
+        .map(|(id, name, dtype, chunks)| {
+            serde_json::json!({
+                "doc_id": id,
+                "name": name,
+                "type": dtype,
+                "chunks": chunks,
+            })
         })
-    }).collect();
+        .collect();
     Ok(serde_json::json!({ "documents": items, "count": items.len() }))
 }
 
 #[tauri::command]
-pub async fn get_alerts(
-    state: State<'_, AppStateCell>,
-) -> Result<serde_json::Value, String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+pub async fn get_alerts(state: State<'_, AppStateCell>) -> Result<serde_json::Value, String> {
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
     let alerts = state.proactive.get_alerts().await;
-    let items: Vec<serde_json::Value> = alerts.iter().map(|a| {
-        serde_json::json!({
-            "id": a.id,
-            "category": format!("{:?}", a.category).to_lowercase(),
-            "title": a.title,
-            "message": a.message,
-            "suggestion": a.suggestion,
-            "timestamp": a.timestamp.to_rfc3339(),
+    let items: Vec<serde_json::Value> = alerts
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "id": a.id,
+                "category": format!("{:?}", a.category).to_lowercase(),
+                "title": a.title,
+                "message": a.message,
+                "suggestion": a.suggestion,
+                "timestamp": a.timestamp.to_rfc3339(),
+            })
         })
-    }).collect();
+        .collect();
     Ok(serde_json::json!({ "alerts": items, "count": items.len() }))
 }
 
@@ -1408,7 +2505,10 @@ pub async fn save_export_file(
         .dialog()
         .file()
         .set_file_name(&default_name)
-        .add_filter(&filter_name, &extensions.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+        .add_filter(
+            &filter_name,
+            &extensions.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        )
         .blocking_save_file();
 
     let saved_path = match path {
@@ -1440,25 +2540,31 @@ pub async fn open_html_for_print(
 
     // Open with the default system browser using platform-specific command
     #[cfg(target_os = "linux")]
-    std::process::Command::new("xdg-open").arg(&path_str).spawn()
+    std::process::Command::new("xdg-open")
+        .arg(&path_str)
+        .spawn()
         .map_err(|e| format!("Failed to open file: {e}"))?;
 
     #[cfg(target_os = "macos")]
-    std::process::Command::new("open").arg(&path_str).spawn()
+    std::process::Command::new("open")
+        .arg(&path_str)
+        .spawn()
         .map_err(|e| format!("Failed to open file: {e}"))?;
 
     #[cfg(target_os = "windows")]
-    std::process::Command::new("cmd").args(["/c", "start", "", &path_str]).spawn()
+    std::process::Command::new("cmd")
+        .args(["/c", "start", "", &path_str])
+        .spawn()
         .map_err(|e| format!("Failed to open file: {e}"))?;
 
     Ok(())
 }
 
 #[tauri::command]
-pub async fn list_models(
-    state: State<'_, AppStateCell>,
-) -> Result<serde_json::Value, String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+pub async fn list_models(state: State<'_, AppStateCell>) -> Result<serde_json::Value, String> {
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
     let config = state.config.read().await;
     let paths = config.resolve_paths().map_err(|e| e.to_string())?;
     let mgr = kria_core::llm::model_manager::ModelManager::new(paths.models_dir.join("llm"));
@@ -1467,17 +2573,21 @@ pub async fn list_models(
 }
 
 #[tauri::command]
-pub async fn start_voice(
-    state: State<'_, AppStateCell>,
-    app: AppHandle,
-) -> Result<(), String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
-    if state.voice_active.load(std::sync::atomic::Ordering::Relaxed) {
+pub async fn start_voice(state: State<'_, AppStateCell>, app: AppHandle) -> Result<(), String> {
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    if state
+        .voice_active
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
         return Ok(()); // Already active
     }
 
     // Pre-flight checks: verify required binaries and models exist
-    let whisper_available = which_binary("whisper-cpp").or_else(|| which_binary("main")).is_some();
+    let whisper_available = which_binary("whisper-cpp")
+        .or_else(|| which_binary("main"))
+        .is_some();
     if !whisper_available {
         return Err("Voice requires whisper-cpp (or 'main' binary from whisper.cpp) on your PATH. Install it with: sudo apt install whisper.cpp OR build from https://github.com/ggerganov/whisper.cpp".into());
     }
@@ -1487,32 +2597,72 @@ pub async fn start_voice(
         return Err("Voice requires Piper TTS binary on your PATH. Install it from: https://github.com/rhasspy/piper/releases".into());
     }
 
-    // Verify STT model exists
+    // Refresh config from disk on every voice start so external edits in
+    // ~/.kria/config.toml are not stuck behind stale in-memory state.
+    let effective_config = match KriaConfig::load(None) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to reload config from disk for voice start; using in-memory config");
+            state.config.read().await.clone()
+        }
+    };
     {
-        let config = state.config.read().await;
-        let paths = config.resolve_paths().map_err(|e| e.to_string())?;
-        let stt_model = paths.models_dir.join("stt").join(&config.voice.stt_model);
-        if !stt_model.exists() {
-            return Err(format!("STT model not found at: {}. Run 'python scripts/download_models.py' to download models.", stt_model.display()));
-        }
-        let tts_voice_file = format!("{}.onnx", config.voice.tts_voice);
-        let tts_model = paths.models_dir.join("piper").join(&tts_voice_file);
-        if !tts_model.exists() {
-            return Err(format!("TTS voice model not found at: {}. Run 'python scripts/download_models.py' to download models.", tts_model.display()));
-        }
+        let mut cfg_guard = state.config.write().await;
+        *cfg_guard = effective_config.clone();
     }
 
-    state.voice_active.store(true, std::sync::atomic::Ordering::Relaxed);
+    // Verify required models and rebuild pipeline from latest saved settings.
+    let voice_pipeline = {
+        let paths = effective_config
+            .resolve_paths()
+            .map_err(|e| e.to_string())?;
+
+        let stt_model = paths
+            .models_dir
+            .join("stt")
+            .join(&effective_config.voice.stt_model);
+        if !stt_model.exists() {
+            return Err(format!(
+                "STT model not found at: {}. Run 'python scripts/download_models.py' to download models.",
+                stt_model.display()
+            ));
+        }
+
+        let tts_voice_file = format!("{}.onnx", effective_config.voice.tts_voice);
+        let tts_model = paths.models_dir.join("piper").join(&tts_voice_file);
+        if !tts_model.exists() {
+            return Err(format!(
+                "TTS voice model not found at: {}. Run 'python scripts/download_models.py' to download models.",
+                tts_model.display()
+            ));
+        }
+
+        build_voice_pipeline(&effective_config, &paths)
+    };
+
+    {
+        let mut vp_guard = state.voice_pipeline.write().await;
+        *vp_guard = voice_pipeline.clone();
+    }
+
+    state
+        .voice_active
+        .store(true, std::sync::atomic::Ordering::Relaxed);
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<VoicePipelineEvent>();
 
-    state.voice_pipeline.start(event_tx).await.map_err(|e| e.to_string())?;
+    if let Err(e) = voice_pipeline.start(event_tx).await {
+        state
+            .voice_active
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        return Err(e.to_string());
+    }
 
     let _ = app.emit("voice:state", serde_json::json!({ "state": "listening" }));
 
     // Spawn a task that listens for voice pipeline events and forwards them
     let app_handle = app.clone();
-    let voice_pipeline = state.voice_pipeline.clone();
+    let voice_pipeline = voice_pipeline.clone();
     let memory_store = state.memory_store.clone();
     let agent_loop = state.agent_loop.clone();
     let tool_registry = state.tool_registry.clone();
@@ -1533,32 +2683,71 @@ pub async fn start_voice(
                         VoicePipelineState::Processing => "processing",
                         VoicePipelineState::Speaking => "speaking",
                     };
-                    let _ = app_handle.emit("voice:state", serde_json::json!({ "state": state_str }));
+                    let _ =
+                        app_handle.emit("voice:state", serde_json::json!({ "state": state_str }));
                 }
-                VoicePipelineEvent::PartialTranscript(text) => {
-                    let _ = app_handle.emit("voice:partial_transcript", serde_json::json!({ "text": text, "partial": true }));
+                VoicePipelineEvent::PartialTranscript(frame) => {
+                    let _ = app_handle.emit(
+                        "voice:partial_transcript",
+                        serde_json::json!({
+                            "text": frame.text,
+                            "confidence": frame.confidence,
+                            "language": frame.language,
+                            "stability": frame.stability,
+                            "partial": true,
+                        }),
+                    );
                 }
-                VoicePipelineEvent::Transcript(text) => {
-                    tracing::info!(transcript = %text, "voice: transcript received");
-                    let _ = app_handle.emit("voice:transcript", serde_json::json!({ "text": text }));
+                VoicePipelineEvent::Transcript(frame) => {
+                    let text = frame.text;
+                    let language = frame.language;
+                    let confidence = frame.confidence;
+
+                    tracing::info!(transcript = %text, language = %language, confidence, "voice: transcript received");
+                    let _ = app_handle.emit(
+                        "voice:transcript",
+                        serde_json::json!({
+                            "text": text.clone(),
+                            "confidence": confidence,
+                            "language": language.clone(),
+                            "stability": 1.0,
+                        }),
+                    );
 
                     // Feed transcript through the agent loop (same as send_message)
                     let session_id = session_id_lock.read().await.clone();
                     let config_guard = config.read().await;
                     let hw_tier = hw_info_voice.tier.as_str();
 
-                    let tool_descriptions = tool_registry.list_for_tier(hw_tier).iter()
+                    let tool_descriptions = tool_registry
+                        .list_for_tier(hw_tier)
+                        .iter()
                         .map(|d| {
-                            let params: Vec<String> = d.parameters.iter()
-                                .map(|p| format!("  - {}: {} ({}{})", p.name, p.description, p.param_type,
-                                    if p.required { ", required" } else { "" }))
+                            let params: Vec<String> = d
+                                .parameters
+                                .iter()
+                                .map(|p| {
+                                    format!(
+                                        "  - {}: {} ({}{})",
+                                        p.name,
+                                        p.description,
+                                        p.param_type,
+                                        if p.required { ", required" } else { "" }
+                                    )
+                                })
                                 .collect();
-                            format!("### {}\n{}\nParameters:\n{}", d.name, d.description, params.join("\n"))
+                            format!(
+                                "### {}\n{}\nParameters:\n{}",
+                                d.name,
+                                d.description,
+                                params.join("\n")
+                            )
                         })
                         .collect::<Vec<_>>()
                         .join("\n\n");
 
-                    let user_name = memory_store.get_preference("user_name")
+                    let user_name = memory_store
+                        .get_preference("user_name")
                         .unwrap_or(None)
                         .unwrap_or_else(|| "User".to_string());
                     let os_name = std::env::consts::OS;
@@ -1569,44 +2758,81 @@ pub async fn start_voice(
                             [only] => only.as_str().to_string(),
                             [primary, rest @ ..] => {
                                 let alts: Vec<&str> = rest.iter().map(|p| p.as_str()).collect();
-                                format!("{} (also available: {})", primary.as_str(), alts.join(", "))
+                                format!(
+                                    "{} (also available: {})",
+                                    primary.as_str(),
+                                    alts.join(", ")
+                                )
                             }
                         }
                     };
                     let memory_context = match memory_store.search_facts(&text, 5) {
                         Ok(facts) if !facts.is_empty() => {
-                            let lines: Vec<String> = facts.iter().map(|f| format!("- {}", f.text)).collect();
+                            let lines: Vec<String> =
+                                facts.iter().map(|f| format!("- {}", f.text)).collect();
                             format!("Known facts about the user:\n{}", lines.join("\n"))
                         }
                         _ => String::new(),
                     };
 
                     let system_prompt = kria_core::agent::prompts::build_system_prompt(
-                        &tool_descriptions, &user_name, os_name, hw_tier, &pm_string_voice, &memory_context,
+                        &tool_descriptions,
+                        &user_name,
+                        os_name,
+                        hw_tier,
+                        &pm_string_voice,
+                        &memory_context,
                     );
                     drop(config_guard);
 
-                    let recent_turns = memory_store.get_recent_turns(&session_id, 20).unwrap_or_default();
+                    let recent_turns = memory_store
+                        .get_recent_turns(&session_id, 20)
+                        .unwrap_or_default();
                     let mut messages = Vec::with_capacity(recent_turns.len() + 2);
-                    messages.push(ChatMessage { role: "system".into(), content: system_prompt, name: None, images: None });
+                    messages.push(ChatMessage {
+                        role: "system".into(),
+                        content: system_prompt,
+                        name: None,
+                        images: None,
+                    });
                     for turn in &recent_turns {
-                        messages.push(ChatMessage { role: turn.role.clone(), content: turn.content.clone(), name: turn.tool_name.clone(), images: None });
+                        messages.push(ChatMessage {
+                            role: turn.role.clone(),
+                            content: turn.content.clone(),
+                            name: turn.tool_name.clone(),
+                            images: None,
+                        });
                     }
-                    messages.push(ChatMessage { role: "user".into(), content: text.clone(), name: None, images: None });
+                    messages.push(ChatMessage {
+                        role: "user".into(),
+                        content: text.clone(),
+                        name: None,
+                        images: None,
+                    });
 
                     let _ = memory_store.store_turn(&ConversationTurn {
-                        id: None, session_id: session_id.clone(), role: "user".into(),
-                        content: format!("🎤 {}", text), tool_name: None, tool_result: None,
-                        tokens_used: None, timestamp: Utc::now(),
+                        id: None,
+                        session_id: session_id.clone(),
+                        role: "user".into(),
+                        content: format!("🎤 {}", text),
+                        tool_name: None,
+                        tool_result: None,
+                        tokens_used: None,
+                        timestamp: Utc::now(),
                     });
 
                     event_bus.publish(kria_core::infra::event_bus::KriaEvent::MessageReceived {
-                        session_id: session_id.clone(), content: text.clone(),
+                        session_id: session_id.clone(),
+                        content: text.clone(),
                     });
 
-                    let _ = app_handle.emit("agent:thinking", serde_json::json!({"status": "processing"}));
+                    let _ = app_handle.emit(
+                        "agent:thinking",
+                        serde_json::json!({"status": "processing"}),
+                    );
 
-                    let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
+                    let (agent_tx, mut agent_rx) =
+                        tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
 
                     let agent = agent_loop.clone();
                     let sid = session_id.clone();
@@ -1631,23 +2857,45 @@ pub async fn start_voice(
                                 let _ = app2.emit("agent:token", serde_json::json!({"text": t}));
                             }
                             StreamEvent::ToolStart { name, params } => {
-                                let _ = app2.emit("agent:tool_call", serde_json::json!({"name": name, "params": params}));
+                                let _ = app2.emit(
+                                    "agent:tool_call",
+                                    serde_json::json!({"name": name, "params": params}),
+                                );
                             }
-                            StreamEvent::ToolEnd { name, result, success } => {
-                                let payload = build_tool_result_event_payload(&name, &result, success);
+                            StreamEvent::ToolEnd {
+                                name,
+                                result,
+                                success,
+                            } => {
+                                let payload =
+                                    build_tool_result_event_payload(&name, &result, success);
                                 let _ = app2.emit("agent:tool_result", payload);
                             }
-                            StreamEvent::ApprovalRequired { request_id, action, risk_level, parameters } => {
+                            StreamEvent::ApprovalRequired {
+                                request_id,
+                                action,
+                                risk_level,
+                                parameters,
+                            } => {
                                 let _ = app2.emit("agent:approval_required", serde_json::json!({"requestId": request_id, "toolName": action, "riskLevel": risk_level, "args": parameters, "reason": ""}));
                             }
                             StreamEvent::ApprovalResult { action, approved } => {
-                                let _ = app2.emit("agent:approval_result", serde_json::json!({"action": action, "approved": approved}));
+                                let _ = app2.emit(
+                                    "agent:approval_result",
+                                    serde_json::json!({"action": action, "approved": approved}),
+                                );
                             }
                             StreamEvent::Plan(plan) => {
-                                let _ = app2.emit("agent:thinking", serde_json::json!({"status": "planning", "plan": plan}));
+                                let _ = app2.emit(
+                                    "agent:thinking",
+                                    serde_json::json!({"status": "planning", "plan": plan}),
+                                );
                             }
                             StreamEvent::Error(err) => {
-                                let _ = app2.emit("agent:token", serde_json::json!({"text": format!("⚠️ {err}")}));
+                                let _ = app2.emit(
+                                    "agent:token",
+                                    serde_json::json!({"text": format!("⚠️ {err}")}),
+                                );
                             }
                             StreamEvent::Done(final_text) => {
                                 if !final_text.is_empty() && full_response.is_empty() {
@@ -1660,11 +2908,17 @@ pub async fn start_voice(
                     // Persist assistant response
                     if !full_response.is_empty() {
                         let _ = ms2.store_turn(&ConversationTurn {
-                            id: None, session_id: sid2.clone(), role: "assistant".into(),
-                            content: full_response.clone(), tool_name: None, tool_result: None,
-                            tokens_used: None, timestamp: Utc::now(),
+                            id: None,
+                            session_id: sid2.clone(),
+                            role: "assistant".into(),
+                            content: full_response.clone(),
+                            tool_name: None,
+                            tool_result: None,
+                            tokens_used: None,
+                            timestamp: Utc::now(),
                         });
-                        let fact_mgr = kria_core::memory::facts::FactManager::new(&ms2, &vec2, &emb2);
+                        let fact_mgr =
+                            kria_core::memory::facts::FactManager::new(&ms2, &vec2, &emb2);
                         let _ = fact_mgr.extract_from_turn(&text2, &full_response);
 
                         // Speak the response via TTS
@@ -1676,10 +2930,12 @@ pub async fn start_voice(
                     let _ = app2.emit("agent:done", serde_json::json!({}));
                 }
                 VoicePipelineEvent::SpeakingStarted => {
-                    let _ = app_handle.emit("voice:state", serde_json::json!({ "state": "speaking" }));
+                    let _ =
+                        app_handle.emit("voice:state", serde_json::json!({ "state": "speaking" }));
                 }
                 VoicePipelineEvent::SpeakingDone => {
-                    let _ = app_handle.emit("voice:state", serde_json::json!({ "state": "listening" }));
+                    let _ =
+                        app_handle.emit("voice:state", serde_json::json!({ "state": "listening" }));
                 }
                 VoicePipelineEvent::Error(err) => {
                     tracing::warn!("voice pipeline error: {err}");
@@ -1693,23 +2949,26 @@ pub async fn start_voice(
 }
 
 #[tauri::command]
-pub async fn stop_voice(
-    state: State<'_, AppStateCell>,
-    app: AppHandle,
-) -> Result<(), String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
-    state.voice_active.store(false, std::sync::atomic::Ordering::Relaxed);
-    state.voice_pipeline.stop().await;
+pub async fn stop_voice(state: State<'_, AppStateCell>, app: AppHandle) -> Result<(), String> {
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    state
+        .voice_active
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    let voice_pipeline = state.voice_pipeline.read().await.clone();
+    voice_pipeline.stop().await;
     let _ = app.emit("voice:state", serde_json::json!({ "state": "idle" }));
     Ok(())
 }
 
 #[tauri::command]
-pub async fn get_voice_status(
-    state: State<'_, AppStateCell>,
-) -> Result<serde_json::Value, String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
-    let pipeline_state = state.voice_pipeline.state().await;
+pub async fn get_voice_status(state: State<'_, AppStateCell>) -> Result<serde_json::Value, String> {
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    let voice_pipeline = state.voice_pipeline.read().await.clone();
+    let pipeline_state = voice_pipeline.state().await;
     Ok(serde_json::json!({
         "active": state.voice_active.load(std::sync::atomic::Ordering::Relaxed),
         "state": pipeline_state,
@@ -1724,7 +2983,9 @@ pub async fn send_image_message(
     state: State<'_, AppStateCell>,
     app: AppHandle,
 ) -> Result<serde_json::Value, String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
     emit_agent_stage(
         &app,
         "input_received",
@@ -1737,7 +2998,13 @@ pub async fn send_image_message(
     );
 
     // Validate MIME type
-    let allowed = ["image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp"];
+    let allowed = [
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/webp",
+        "image/bmp",
+    ];
     if !allowed.contains(&mime_type.as_str()) {
         return Err(format!("unsupported image type: {}", mime_type));
     }
@@ -1785,19 +3052,14 @@ pub async fn send_image_message(
         })),
     );
 
-    // Encode to base64 for the LLM
-    let b64 = kria_core::preprocessing::image::ImageProcessor::to_base64(&filepath)
-        .map_err(|e| e.to_string())?;
-
-    emit_agent_stage(
-        &app,
-        "image_encoded",
-        "Image encoded for multimodal LLM input",
-        None,
+    let user_text = text.unwrap_or_else(|| "What's in this image?".into());
+    let image_intent = infer_image_intent_from_text(&user_text).to_string();
+    let _ = app.emit(
+        "agent:thinking",
+        serde_json::json!({"status": "processing"}),
     );
 
-    let user_text = text.unwrap_or_else(|| "What's in this image?".into());
-    let _ = app.emit("agent:thinking", serde_json::json!({"status": "processing"}));
+    let image_path_for_llm = filepath.to_string_lossy().to_string();
 
     let agent_loop = state.agent_loop.clone();
     let memory_store = state.memory_store.clone();
@@ -1814,13 +3076,28 @@ pub async fn send_image_message(
     );
 
     let tool_defs = tool_registry.list_for_tier(hw_tier);
-    let tool_descriptions = tool_defs.iter()
+    let tool_descriptions = tool_defs
+        .iter()
         .map(|d| {
-            let params: Vec<String> = d.parameters.iter()
-                .map(|p| format!("  - {}: {} ({}{})", p.name, p.description, p.param_type,
-                    if p.required { ", required" } else { "" }))
+            let params: Vec<String> = d
+                .parameters
+                .iter()
+                .map(|p| {
+                    format!(
+                        "  - {}: {} ({}{})",
+                        p.name,
+                        p.description,
+                        p.param_type,
+                        if p.required { ", required" } else { "" }
+                    )
+                })
                 .collect();
-            format!("### {}\n{}\nParameters:\n{}", d.name, d.description, params.join("\n"))
+            format!(
+                "### {}\n{}\nParameters:\n{}",
+                d.name,
+                d.description,
+                params.join("\n")
+            )
         })
         .collect::<Vec<_>>()
         .join("\n\n");
@@ -1832,7 +3109,104 @@ pub async fn send_image_message(
         Some(serde_json::json!({ "tool_count": tool_defs.len() })),
     );
 
-    let user_name = memory_store.get_preference("user_name")
+    let (preanalysis_summary, llm_images): (Option<String>, Vec<ImageAttachment>) = if let Some(
+        handler,
+    ) =
+        tool_registry.get_handler("analyze_image")
+    {
+        emit_agent_stage(
+            &app,
+            "preanalyzing_image",
+            "Running automatic image pre-analysis",
+            None,
+        );
+
+        let preanalysis_params = serde_json::json!({
+            "path": image_path_for_llm.clone(),
+            "operations": ["metadata", "ocr", "features", "thumbnail"],
+            "intent": image_intent.clone(),
+        });
+
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(IMAGE_PREANALYSIS_TIMEOUT_SECS),
+            handler.execute(preanalysis_params),
+        )
+        .await
+        {
+            Ok(result) if result.success => {
+                let summary = extract_image_preanalysis_summary(&result.data);
+                let images = extract_preprocessed_image_attachments(&result.data, &mime_type)
+                    .unwrap_or_default();
+                let step_status = build_preprocessing_step_status(&result.data, &image_intent);
+                emit_agent_stage(
+                    &app,
+                    "preanalysis_ready",
+                    "Image pre-analysis completed",
+                    Some(serde_json::json!({
+                        "has_summary": summary.is_some(),
+                        "llm_image_count": images.len(),
+                        "step_status": step_status,
+                    })),
+                );
+
+                if images.is_empty() {
+                    emit_agent_stage(
+                        &app,
+                        "preanalysis_invalid",
+                        "Pre-analysis returned no image payload; aborting request",
+                        None,
+                    );
+                    return Err("Image preprocessing produced no usable image payload. Please check sidecar OCR/vision dependencies and try again.".into());
+                }
+
+                (summary, images)
+            }
+            Ok(result) => {
+                emit_agent_stage(
+                    &app,
+                    "preanalysis_failed",
+                    "Image pre-analysis failed; aborting before LLM call",
+                    Some(serde_json::json!({
+                        "error": result.error,
+                    })),
+                );
+                return Err("Image preprocessing failed before LLM dispatch. Please verify sidecar/OCR dependencies and try again.".into());
+            }
+            Err(_) => {
+                emit_agent_stage(
+                    &app,
+                    "preanalysis_timeout",
+                    "Image pre-analysis timed out; aborting before LLM call",
+                    Some(serde_json::json!({
+                        "timeout_secs": IMAGE_PREANALYSIS_TIMEOUT_SECS,
+                    })),
+                );
+                return Err("Image preprocessing timed out before LLM dispatch. Please retry after the sidecar is healthy.".into());
+            }
+        }
+    } else {
+        emit_agent_stage(
+            &app,
+            "preanalysis_unavailable",
+            "Image pre-analysis tool is unavailable; aborting request",
+            None,
+        );
+        return Err(
+            "Image preprocessing tool is unavailable. Please restart KRIA and try again.".into(),
+        );
+    };
+
+    emit_agent_stage(
+        &app,
+        "image_encoded",
+        "Preprocessed image payload encoded for multimodal LLM input",
+        Some(serde_json::json!({
+            "image_count": llm_images.len(),
+        })),
+    );
+
+    let user_name = memory_store
+        .get_preference("user_name")
         .unwrap_or(None)
         .unwrap_or_else(|| "User".to_string());
     let os_name = std::env::consts::OS;
@@ -1852,9 +3226,7 @@ pub async fn send_image_message(
 
     let memory_context = match memory_store.search_facts(&user_text, 5) {
         Ok(facts) if !facts.is_empty() => {
-            let fact_lines: Vec<String> = facts.iter()
-                .map(|f| format!("- {}", f.text))
-                .collect();
+            let fact_lines: Vec<String> = facts.iter().map(|f| format!("- {}", f.text)).collect();
             format!("Known facts about the user:\n{}", fact_lines.join("\n"))
         }
         _ => String::new(),
@@ -1870,7 +3242,12 @@ pub async fn send_image_message(
     );
 
     let system_prompt = kria_core::agent::prompts::build_system_prompt(
-        &tool_descriptions, &user_name, os_name, hw_tier, &pm_string_img, &memory_context,
+        &tool_descriptions,
+        &user_name,
+        os_name,
+        hw_tier,
+        &pm_string_img,
+        &memory_context,
     );
 
     emit_agent_stage(
@@ -1894,7 +3271,9 @@ pub async fn send_image_message(
         })),
     );
 
-    let recent_turns = memory_store.get_recent_turns(&session_id, 20).unwrap_or_default();
+    let recent_turns = memory_store
+        .get_recent_turns(&session_id, 20)
+        .unwrap_or_default();
 
     let mut messages = Vec::with_capacity(recent_turns.len() + 2);
     messages.push(ChatMessage {
@@ -1913,12 +3292,14 @@ pub async fn send_image_message(
     }
     messages.push(ChatMessage {
         role: "user".into(),
-        content: user_text.clone(),
+        content: build_image_llm_user_content(
+            &user_text,
+            &image_path_for_llm,
+            &image_intent,
+            preanalysis_summary.as_deref(),
+        ),
         name: None,
-        images: Some(vec![ImageAttachment {
-            data: b64,
-            mime_type: mime_type.clone(),
-        }]),
+        images: Some(llm_images),
     });
 
     // Persist user turn (content only, images stored in attachments/)
@@ -1945,7 +3326,11 @@ pub async fn send_image_message(
     // Auto-title
     {
         let title_key = format!("session_title:{}", session_id);
-        if memory_store.get_preference(&title_key).unwrap_or(None).is_none() {
+        if memory_store
+            .get_preference(&title_key)
+            .unwrap_or(None)
+            .is_none()
+        {
             let title = if user_text.len() > 50 {
                 format!("{}...", &user_text[..50])
             } else {
@@ -2000,7 +3385,35 @@ pub async fn send_image_message(
             None,
         );
 
-        while let Some(event) = event_rx.recv().await {
+        loop {
+            let event = match tokio::time::timeout(
+                std::time::Duration::from_secs(AGENT_EVENT_IDLE_TIMEOUT_SECS),
+                event_rx.recv(),
+            )
+            .await
+            {
+                Ok(Some(event)) => event,
+                Ok(None) => break,
+                Err(_) => {
+                    emit_agent_stage(
+                        &app_handle,
+                        "timed_out_waiting_for_llm",
+                        "No agent events received within timeout window",
+                        Some(serde_json::json!({
+                            "timeout_secs": AGENT_EVENT_IDLE_TIMEOUT_SECS,
+                        })),
+                    );
+                    full_response = AGENT_TIMEOUT_MESSAGE.to_string();
+                    let _ = app_handle.emit(
+                        "agent:token",
+                        serde_json::json!({
+                            "text": AGENT_TIMEOUT_MESSAGE,
+                        }),
+                    );
+                    break;
+                }
+            };
+
             match event {
                 StreamEvent::Token(text) => {
                     if !saw_first_token {
@@ -2022,9 +3435,16 @@ pub async fn send_image_message(
                         "Tool execution started",
                         Some(serde_json::json!({ "tool": name.clone() })),
                     );
-                    let _ = app_handle.emit("agent:tool_call", serde_json::json!({ "name": name, "params": params }));
+                    let _ = app_handle.emit(
+                        "agent:tool_call",
+                        serde_json::json!({ "name": name, "params": params }),
+                    );
                 }
-                StreamEvent::ToolEnd { name, result, success } => {
+                StreamEvent::ToolEnd {
+                    name,
+                    result,
+                    success,
+                } => {
                     emit_agent_stage(
                         &app_handle,
                         "tool_finished",
@@ -2037,7 +3457,12 @@ pub async fn send_image_message(
                     let payload = build_tool_result_event_payload(&name, &result, success);
                     let _ = app_handle.emit("agent:tool_result", payload);
                 }
-                StreamEvent::ApprovalRequired { request_id, action, risk_level, parameters } => {
+                StreamEvent::ApprovalRequired {
+                    request_id,
+                    action,
+                    risk_level,
+                    parameters,
+                } => {
                     emit_agent_stage(
                         &app_handle,
                         "approval_required",
@@ -2059,7 +3484,10 @@ pub async fn send_image_message(
                             "approved": approved,
                         })),
                     );
-                    let _ = app_handle.emit("agent:approval_result", serde_json::json!({ "action": action, "approved": approved }));
+                    let _ = app_handle.emit(
+                        "agent:approval_result",
+                        serde_json::json!({ "action": action, "approved": approved }),
+                    );
                 }
                 StreamEvent::Plan(plan) => {
                     emit_agent_stage(
@@ -2068,16 +3496,26 @@ pub async fn send_image_message(
                         "Agent is updating execution plan",
                         Some(serde_json::json!({ "plan": plan.clone() })),
                     );
-                    let _ = app_handle.emit("agent:thinking", serde_json::json!({ "status": "planning", "plan": plan }));
+                    let _ = app_handle.emit(
+                        "agent:thinking",
+                        serde_json::json!({ "status": "planning", "plan": plan }),
+                    );
                 }
                 StreamEvent::Error(err) => {
+                    let user_visible_error = format!("⚠️ {err}");
+                    if full_response.is_empty() {
+                        full_response = user_visible_error.clone();
+                    }
                     emit_agent_stage(
                         &app_handle,
                         "failed",
                         "Agent stream reported an error",
                         Some(serde_json::json!({ "error": err.clone() })),
                     );
-                    let _ = app_handle.emit("agent:token", serde_json::json!({ "text": format!("⚠️ {err}") }));
+                    let _ = app_handle.emit(
+                        "agent:token",
+                        serde_json::json!({ "text": user_visible_error }),
+                    );
                 }
                 StreamEvent::Done(final_text) => {
                     if !final_text.is_empty() && full_response.is_empty() {
@@ -2117,11 +3555,16 @@ pub async fn send_image_message(
             );
 
             let fact_mgr = kria_core::memory::facts::FactManager::new(
-                &memory_store_clone, &vectors_clone, &embeddings_clone,
+                &memory_store_clone,
+                &vectors_clone,
+                &embeddings_clone,
             );
             match fact_mgr.extract_from_turn(&user_message_clone, &full_response) {
                 Ok(ids) if !ids.is_empty() => {
-                    tracing::info!(count = ids.len(), "auto-extracted facts from image conversation");
+                    tracing::info!(
+                        count = ids.len(),
+                        "auto-extracted facts from image conversation"
+                    );
                     emit_agent_stage(
                         &app_handle,
                         "facts_extracted",
@@ -2152,30 +3595,169 @@ pub async fn send_image_message(
     }))
 }
 
+// ── MCP Runtime Helpers ──────────────────────────────────────────────
+
+fn mcp_state_name(state: McpServerState) -> &'static str {
+    match state {
+        McpServerState::Stopped => "stopped",
+        McpServerState::Starting => "starting",
+        McpServerState::Running => "running",
+        McpServerState::Error => "error",
+    }
+}
+
+fn mcp_status_to_json(status: &McpServerStatus) -> serde_json::Value {
+    serde_json::json!({
+        "name": status.name.clone(),
+        "command": status.command.clone(),
+        "enabled": status.enabled,
+        "state": mcp_state_name(status.state),
+        "tool_count": status.tool_count,
+        "error": status.error.clone(),
+    })
+}
+
+async fn sync_google_workspace_client_ref(
+    state: &AppState,
+    gw_client: Option<Arc<kria_core::mcp::McpClient>>,
+) {
+    if let Some(client) = gw_client {
+        gw::set_client(&state.gw_client_ref, client).await;
+    } else {
+        *state.gw_client_ref.write().await = None;
+    }
+}
+
+async fn update_mcp_health_status(state: &AppState, statuses: &[McpServerStatus]) {
+    let total = statuses.len();
+    let running = statuses
+        .iter()
+        .filter(|s| s.state == McpServerState::Running)
+        .count();
+    let total_tools: usize = statuses.iter().map(|s| s.tool_count).sum();
+
+    let unhealthy_enabled: Vec<&str> = statuses
+        .iter()
+        .filter(|s| s.enabled && s.state != McpServerState::Running)
+        .map(|s| s.name.as_str())
+        .collect();
+
+    let (service, detail) = if total == 0 {
+        (
+            ServiceStatus::Healthy,
+            "no MCP servers configured".to_string(),
+        )
+    } else if unhealthy_enabled.is_empty() {
+        (
+            ServiceStatus::Healthy,
+            format!("{running}/{total} servers running, {total_tools} tools"),
+        )
+    } else {
+        (
+            ServiceStatus::Degraded,
+            format!(
+                "{running}/{total} servers running, {total_tools} tools; degraded: {}",
+                unhealthy_enabled.join(", ")
+            ),
+        )
+    };
+
+    state.health.update("mcp_servers", service, Some(detail));
+}
+
+async fn apply_mcp_runtime_from_config(state: &AppState) -> serde_json::Value {
+    let desired = { state.config.read().await.mcp.servers.clone() };
+
+    let mut manager = state.mcp_manager.lock().await;
+    let report = manager.reconcile(desired, &state.tool_registry).await;
+    let statuses = manager.status().await;
+    let gw_client = manager.get_client("gworkspace").cloned();
+    drop(manager);
+
+    sync_google_workspace_client_ref(state, gw_client).await;
+    update_mcp_health_status(state, &statuses).await;
+
+    let status_json: Vec<serde_json::Value> = statuses.iter().map(mcp_status_to_json).collect();
+    serde_json::json!({
+        "report": report,
+        "servers": status_json,
+    })
+}
+
 // ── MCP Server Management Commands ──────────────────────────────────
 
 #[tauri::command]
-pub async fn list_mcp_servers(
-    state: State<'_, AppStateCell>,
-) -> Result<serde_json::Value, String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
-    let config = state.config.read().await;
-    // Return configured servers plus their runtime status
-    let servers: Vec<serde_json::Value> = config
-        .mcp
-        .servers
+pub async fn list_mcp_servers(state: State<'_, AppStateCell>) -> Result<serde_json::Value, String> {
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    let configured_servers = { state.config.read().await.mcp.servers.clone() };
+    let runtime_statuses = {
+        let manager = state.mcp_manager.lock().await;
+        manager.status().await
+    };
+
+    let runtime_by_name: std::collections::HashMap<String, McpServerStatus> = runtime_statuses
+        .into_iter()
+        .map(|s| (s.name.clone(), s))
+        .collect();
+
+    let servers: Vec<serde_json::Value> = configured_servers
         .iter()
         .map(|s| {
+            let runtime = runtime_by_name.get(&s.name);
             serde_json::json!({
-                "name": s.name,
-                "command": s.command,
-                "args": s.args,
+                "name": s.name.clone(),
+                "command": s.command.clone(),
+                "args": s.args.clone(),
                 "enabled": s.enabled,
-                "trust_level": s.trust_level,
+                "trust_level": s.trust_level.clone(),
+                "runtime_state": runtime.map(|r| mcp_state_name(r.state)).unwrap_or("stopped"),
+                "runtime_tool_count": runtime.map(|r| r.tool_count).unwrap_or(0),
+                "runtime_error": runtime.and_then(|r| r.error.clone()),
             })
         })
         .collect();
     Ok(serde_json::json!(servers))
+}
+
+#[tauri::command]
+pub async fn reconcile_mcp_runtime(
+    state: State<'_, AppStateCell>,
+) -> Result<serde_json::Value, String> {
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    Ok(apply_mcp_runtime_from_config(state).await)
+}
+
+#[tauri::command]
+pub async fn restart_mcp_server_runtime(
+    name: String,
+    state: State<'_, AppStateCell>,
+) -> Result<serde_json::Value, String> {
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+
+    let mut manager = state.mcp_manager.lock().await;
+    manager
+        .restart_server(&name, &state.tool_registry)
+        .await
+        .map_err(|e| e.to_string())?;
+    let statuses = manager.status().await;
+    let gw_client = manager.get_client("gworkspace").cloned();
+    drop(manager);
+
+    sync_google_workspace_client_ref(state, gw_client).await;
+    update_mcp_health_status(state, &statuses).await;
+
+    let servers: Vec<serde_json::Value> = statuses.iter().map(mcp_status_to_json).collect();
+    Ok(serde_json::json!({
+        "status": "restarted",
+        "name": name,
+        "servers": servers,
+    }))
 }
 
 #[tauri::command]
@@ -2186,7 +3768,9 @@ pub async fn add_mcp_server(
     trust_level: Option<String>,
     state: State<'_, AppStateCell>,
 ) -> Result<(), String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
     use kria_core::config::McpServerConfig;
 
     let server = McpServerConfig {
@@ -2206,15 +3790,18 @@ pub async fn add_mcp_server(
     }
     config.mcp.servers.push(server);
     config.save().map_err(|e| e.to_string())?;
+
+    drop(config);
+    let _ = apply_mcp_runtime_from_config(state).await;
+
     Ok(())
 }
 
 #[tauri::command]
-pub async fn remove_mcp_server(
-    name: String,
-    state: State<'_, AppStateCell>,
-) -> Result<(), String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+pub async fn remove_mcp_server(name: String, state: State<'_, AppStateCell>) -> Result<(), String> {
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
     let mut config = state.config.write().await;
     let before = config.mcp.servers.len();
     config.mcp.servers.retain(|s| s.name != name);
@@ -2222,6 +3809,10 @@ pub async fn remove_mcp_server(
         return Err(format!("MCP server '{}' not found", name));
     }
     config.save().map_err(|e| e.to_string())?;
+
+    drop(config);
+    let _ = apply_mcp_runtime_from_config(state).await;
+
     Ok(())
 }
 
@@ -2231,11 +3822,21 @@ pub async fn toggle_mcp_server(
     enabled: bool,
     state: State<'_, AppStateCell>,
 ) -> Result<(), String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
     let mut config = state.config.write().await;
     if let Some(server) = config.mcp.servers.iter_mut().find(|s| s.name == name) {
         server.enabled = enabled;
+        if name.eq_ignore_ascii_case("telegram") {
+            config.telegram.enabled = enabled;
+            sync_telegram_mcp_server_config(&mut config);
+        }
         config.save().map_err(|e| e.to_string())?;
+
+        drop(config);
+        let _ = apply_mcp_runtime_from_config(state).await;
+
         Ok(())
     } else {
         Err(format!("MCP server '{}' not found", name))
@@ -2248,7 +3849,9 @@ pub async fn toggle_mcp_server(
 pub async fn get_telegram_config(
     state: State<'_, AppStateCell>,
 ) -> Result<serde_json::Value, String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
     let config = state.config.read().await;
     Ok(serde_json::json!({
         "enabled": config.telegram.enabled,
@@ -2266,13 +3869,19 @@ pub async fn update_telegram_config(
     auto_start: bool,
     state: State<'_, AppStateCell>,
 ) -> Result<(), String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
     let mut config = state.config.write().await;
     config.telegram.enabled = enabled;
     config.telegram.bot_token = bot_token;
     config.telegram.allowed_chat_ids = allowed_chat_ids;
     config.telegram.auto_start = auto_start;
+    sync_telegram_mcp_server_config(&mut config);
     config.save().map_err(|e| e.to_string())?;
+    drop(config);
+
+    let _ = apply_mcp_runtime_from_config(state).await;
     Ok(())
 }
 
@@ -2280,13 +3889,52 @@ pub async fn update_telegram_config(
 pub async fn start_telegram_mcp(
     state: State<'_, AppStateCell>,
 ) -> Result<serde_json::Value, String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
-    let config = state.config.read().await;
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    let mut config = state.config.write().await;
+    config.telegram.enabled = true;
+    sync_telegram_mcp_server_config(&mut config);
     let tg_config = config.telegram.clone();
+    let telegram_mcp_configured = config
+        .mcp
+        .servers
+        .iter()
+        .any(|s| s.name.eq_ignore_ascii_case("telegram"));
+    config.save().map_err(|e| e.to_string())?;
     drop(config);
 
     if tg_config.bot_token.is_empty() {
         return Err("Telegram bot token is not configured".into());
+    }
+
+    if telegram_mcp_configured {
+        let runtime = apply_mcp_runtime_from_config(state).await;
+        let telegram_status = runtime["servers"]
+            .as_array()
+            .and_then(|servers| {
+                servers.iter().find(|server| {
+                    server["name"]
+                        .as_str()
+                        .map(|name| name.eq_ignore_ascii_case("telegram"))
+                        .unwrap_or(false)
+                })
+            })
+            .cloned()
+            .unwrap_or_default();
+
+        if telegram_status["state"] == "running" {
+            return Ok(serde_json::json!({
+                "status": "running",
+                "message": "Telegram MCP server is running and can now forward messages into KRIA.",
+                "runtime": runtime,
+            }));
+        }
+
+        return Err(format!(
+            "Telegram MCP server failed to start: {}",
+            telegram_status["error"].as_str().unwrap_or("unknown error")
+        ));
     }
 
     // Stop existing bridge if running
@@ -2317,10 +3965,10 @@ pub async fn start_telegram_mcp(
 }
 
 #[tauri::command]
-pub async fn stop_telegram_mcp(
-    state: State<'_, AppStateCell>,
-) -> Result<(), String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+pub async fn stop_telegram_mcp(state: State<'_, AppStateCell>) -> Result<(), String> {
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
     // Stop the bridge
     {
         let mut guard = state.telegram_bridge.write().await;
@@ -2333,24 +3981,29 @@ pub async fn stop_telegram_mcp(
     // Update config
     let mut config = state.config.write().await;
     config.telegram.enabled = false;
+    sync_telegram_mcp_server_config(&mut config);
     config.save().map_err(|e| e.to_string())?;
+    drop(config);
+
+    let _ = apply_mcp_runtime_from_config(state).await;
     Ok(())
 }
 
 #[tauri::command]
-pub async fn test_telegram_connection(
-    bot_token: String,
-) -> Result<serde_json::Value, String> {
+pub async fn test_telegram_connection(bot_token: String) -> Result<serde_json::Value, String> {
     // Test the bot token by calling getMe
     let url = format!("https://api.telegram.org/bot{}/getMe", bot_token);
     let client = reqwest::Client::new();
-    let resp: reqwest::Response = client.get(&url)
+    let resp: reqwest::Response = client
+        .get(&url)
         .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
         .map_err(|e| format!("Connection failed: {e}"))?;
 
-    let body: serde_json::Value = resp.json::<serde_json::Value>().await
+    let body: serde_json::Value = resp
+        .json::<serde_json::Value>()
+        .await
         .map_err(|e| format!("Invalid response: {e}"))?;
 
     if body["ok"].as_bool() == Some(true) {
@@ -2362,7 +4015,8 @@ pub async fn test_telegram_connection(
             "bot_id": result["id"],
         }))
     } else {
-        let desc = body.get("description")
+        let desc = body
+            .get("description")
             .and_then(|d: &serde_json::Value| d.as_str())
             .unwrap_or("unknown error");
         Err(format!("Invalid token: {}", desc))
@@ -2375,7 +4029,9 @@ pub async fn test_telegram_connection(
 pub async fn list_scheduled_tasks(
     state: State<'_, AppStateCell>,
 ) -> Result<serde_json::Value, String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
     let scheduler = state.scheduler.read().await;
     let tasks: Vec<serde_json::Value> = scheduler
         .list_tasks()
@@ -2400,7 +4056,9 @@ pub async fn add_scheduled_task(
     prompt: String,
     state: State<'_, AppStateCell>,
 ) -> Result<serde_json::Value, String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
     use kria_core::automation::scheduler::ScheduledTask;
 
     let id = uuid::Uuid::new_v4().to_string();
@@ -2422,17 +4080,19 @@ pub async fn remove_scheduled_task(
     task_id: String,
     state: State<'_, AppStateCell>,
 ) -> Result<(), String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
     let mut scheduler = state.scheduler.write().await;
     scheduler.remove_task(&task_id);
     Ok(())
 }
 
 #[tauri::command]
-pub async fn list_macros(
-    state: State<'_, AppStateCell>,
-) -> Result<serde_json::Value, String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+pub async fn list_macros(state: State<'_, AppStateCell>) -> Result<serde_json::Value, String> {
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
     let recorder = state.macro_recorder.read().await;
     let macros: Vec<serde_json::Value> = recorder
         .list()
@@ -2454,7 +4114,9 @@ pub async fn start_macro_recording(
     name: String,
     state: State<'_, AppStateCell>,
 ) -> Result<(), String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
     let mut recorder = state.macro_recorder.write().await;
     recorder.start_recording(&name);
     Ok(())
@@ -2465,7 +4127,9 @@ pub async fn stop_macro_recording(
     description: String,
     state: State<'_, AppStateCell>,
 ) -> Result<serde_json::Value, String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
     let mut recorder = state.macro_recorder.write().await;
     match recorder.stop_recording(&description) {
         Some(m) => Ok(serde_json::json!({
@@ -2477,11 +4141,10 @@ pub async fn stop_macro_recording(
 }
 
 #[tauri::command]
-pub async fn delete_macro(
-    name: String,
-    state: State<'_, AppStateCell>,
-) -> Result<(), String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+pub async fn delete_macro(name: String, state: State<'_, AppStateCell>) -> Result<(), String> {
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
     let mut recorder = state.macro_recorder.write().await;
     if recorder.delete(&name) {
         Ok(())
@@ -2491,10 +4154,10 @@ pub async fn delete_macro(
 }
 
 #[tauri::command]
-pub async fn list_workflows(
-    state: State<'_, AppStateCell>,
-) -> Result<serde_json::Value, String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+pub async fn list_workflows(state: State<'_, AppStateCell>) -> Result<serde_json::Value, String> {
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
     let engine = state.workflow_engine.read().await;
     let workflows: Vec<serde_json::Value> = engine
         .list()
@@ -2517,7 +4180,9 @@ pub async fn delete_workflow(
     workflow_id: String,
     state: State<'_, AppStateCell>,
 ) -> Result<(), String> {
-    let state = state.get().ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
     let mut engine = state.workflow_engine.write().await;
     if engine.delete(&workflow_id) {
         Ok(())
@@ -2528,12 +4193,88 @@ pub async fn delete_workflow(
 
 // ── Google Workspace Commands ────────────────────────────────────────────────
 
-/// Return the OAuth connection status for a Google Workspace account.
-/// Checks whether credentials.json and the account token file exist on disk.
+#[derive(Debug, Clone)]
+struct GoogleWorkspaceRuntimeSnapshot {
+    configured_enabled: bool,
+    mcp_state: String,
+    mcp_tool_count: usize,
+    mcp_error: Option<String>,
+    mcp_running: bool,
+    gw_client_wired: bool,
+}
+
+fn build_google_workspace_status_payload(
+    account: &str,
+    credentials_configured: bool,
+    token_present: bool,
+    runtime: GoogleWorkspaceRuntimeSnapshot,
+) -> serde_json::Value {
+    let auth_ready = token_present && credentials_configured;
+    let runtime_ready = runtime.mcp_running && runtime.gw_client_wired;
+    let connected = auth_ready && runtime_ready;
+
+    let mut warnings: Vec<String> = Vec::new();
+    if !credentials_configured {
+        warnings.push("credentials.json missing at ~/.google-mcp/credentials.json".into());
+    }
+    if !token_present {
+        warnings.push(format!("OAuth token missing for account '{account}'"));
+    }
+    if !runtime.configured_enabled {
+        warnings.push("gworkspace MCP server is disabled in config".into());
+    }
+    if !runtime.mcp_running {
+        warnings.push(format!(
+            "gworkspace MCP runtime is not running (state={})",
+            runtime.mcp_state
+        ));
+    }
+    if runtime.mcp_running && !runtime.gw_client_wired {
+        warnings.push("Google tool bridge not yet wired to active MCP client".into());
+    }
+
+    serde_json::json!({
+        "connected": connected,
+        "legacy_connected": token_present,
+        "account": account,
+        "credentials_configured": credentials_configured,
+        "token_present": token_present,
+        "auth_ready": auth_ready,
+        "runtime_ready": runtime_ready,
+        "gw_client_wired": runtime.gw_client_wired,
+        "mcp": {
+            "configured_enabled": runtime.configured_enabled,
+            "state": runtime.mcp_state,
+            "tool_count": runtime.mcp_tool_count,
+            "error": runtime.mcp_error,
+        },
+        "capabilities": {
+            "gmail": true,
+            "drive": true,
+            "calendar": true,
+            "docs": true,
+            "sheets": true,
+            "slides": true,
+            "meet": false,
+            "meet_via_calendar": true,
+        },
+        "meet_support_mode": "calendar_conference_link",
+        "warnings": warnings,
+    })
+}
+
+/// Return Google Workspace status with separate auth/runtime/capability signals.
+///
+/// `connected` is true only when OAuth artifacts are present and the
+/// gworkspace MCP runtime is currently usable.
 #[tauri::command]
 pub async fn get_google_workspace_status(
     account: Option<String>,
+    state: State<'_, AppStateCell>,
 ) -> Result<serde_json::Value, String> {
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
     let account = account
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| std::env::var("KRIA_GW_ACCOUNT").unwrap_or_else(|_| "personal".into()));
@@ -2542,19 +4283,66 @@ pub async fn get_google_workspace_status(
     let token_path = config_dir.join("tokens").join(format!("{}.json", account));
     let credentials_path = config_dir.join("credentials.json");
 
-    let connected = token_path.exists();
+    let token_present = token_path.exists();
     let credentials_configured = credentials_path.exists();
 
-    tracing::debug!(
-        "[GW] status check: account='{}' connected={} creds={}",
-        account, connected, credentials_configured
+    let gworkspace_runtime = {
+        let manager = state.mcp_manager.lock().await;
+        manager
+            .status()
+            .await
+            .into_iter()
+            .find(|s| s.name == "gworkspace")
+    };
+
+    let configured_enabled = {
+        let config = state.config.read().await;
+        config
+            .mcp
+            .servers
+            .iter()
+            .find(|s| s.name == "gworkspace")
+            .map(|s| s.enabled)
+            .unwrap_or(false)
+    };
+
+    let (mcp_state, mcp_tool_count, mcp_error, mcp_running) =
+        if let Some(status) = gworkspace_runtime {
+            (
+                mcp_state_name(status.state).to_string(),
+                status.tool_count,
+                status.error,
+                status.state == McpServerState::Running,
+            )
+        } else {
+            ("not_configured".to_string(), 0usize, None, false)
+        };
+
+    let gw_client_wired = state.gw_client_ref.read().await.is_some();
+    let payload = build_google_workspace_status_payload(
+        &account,
+        credentials_configured,
+        token_present,
+        GoogleWorkspaceRuntimeSnapshot {
+            configured_enabled,
+            mcp_state: mcp_state.clone(),
+            mcp_tool_count,
+            mcp_error,
+            mcp_running,
+            gw_client_wired,
+        },
     );
 
-    Ok(serde_json::json!({
-        "connected": connected,
-        "account": account,
-        "credentials_configured": credentials_configured,
-    }))
+    tracing::debug!(
+        "[GW] status check: account='{}' connected={} auth_ready={} runtime_ready={} state={}",
+        account,
+        payload["connected"].as_bool().unwrap_or(false),
+        payload["auth_ready"].as_bool().unwrap_or(false),
+        payload["runtime_ready"].as_bool().unwrap_or(false),
+        mcp_state
+    );
+
+    Ok(payload)
 }
 
 /// Launch the Google OAuth flow in the system browser.
@@ -2592,7 +4380,13 @@ pub async fn connect_google_workspace(
     tokio::spawn(async move {
         tracing::info!("[GW] Starting OAuth flow for account '{}'", account_clone);
         let result = tokio::process::Command::new("npx")
-            .args(["-y", "google-workspace-mcp", "accounts", "add", &account_clone])
+            .args([
+                "-y",
+                "google-workspace-mcp",
+                "accounts",
+                "add",
+                &account_clone,
+            ])
             .env("GOOGLE_MCP_CONFIG_DIR", &config_dir)
             // inherit stdio so the process can open the browser
             .status()
@@ -2601,7 +4395,10 @@ pub async fn connect_google_workspace(
         match result {
             Ok(status) if status.success() => {
                 tracing::info!("[GW] OAuth completed successfully for '{}'", account_clone);
-                let _ = app_handle.emit("gw:connected", serde_json::json!({ "account": account_clone }));
+                let _ = app_handle.emit(
+                    "gw:connected",
+                    serde_json::json!({ "account": account_clone }),
+                );
             }
             Ok(status) => {
                 let msg = format!("OAuth process exited with: {status}");
@@ -2625,9 +4422,7 @@ pub async fn connect_google_workspace(
 
 /// Remove the OAuth token for a Google Workspace account (sign out).
 #[tauri::command]
-pub async fn disconnect_google_workspace(
-    account: Option<String>,
-) -> Result<(), String> {
+pub async fn disconnect_google_workspace(account: Option<String>) -> Result<(), String> {
     let account = account
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| std::env::var("KRIA_GW_ACCOUNT").unwrap_or_else(|_| "personal".into()));
@@ -2638,8 +4433,7 @@ pub async fn disconnect_google_workspace(
         .join(format!("{}.json", account));
 
     if token_path.exists() {
-        std::fs::remove_file(&token_path)
-            .map_err(|e| format!("Failed to remove token: {e}"))?;
+        std::fs::remove_file(&token_path).map_err(|e| format!("Failed to remove token: {e}"))?;
         tracing::info!("[GW] Disconnected Google account '{}'", account);
     }
     Ok(())
@@ -2647,7 +4441,14 @@ pub async fn disconnect_google_workspace(
 
 #[cfg(test)]
 mod tests {
-    use super::build_tool_result_event_payload;
+    use super::{
+        build_google_workspace_status_payload, build_image_llm_user_content,
+        build_tool_result_event_payload, extract_image_preanalysis_summary,
+        extract_preprocessed_image_attachments, infer_image_intent_from_text, local_api_chat,
+        sync_telegram_mcp_server_config, GoogleWorkspaceRuntimeSnapshot, LocalApiBridgeState,
+        LocalApiChatRequest, LocalApiResponder, OCR_HEALTH_PROBE_IMAGE_BYTES,
+    };
+    use async_trait::async_trait;
 
     fn assert_confidence_range(metadata: &serde_json::Value) {
         let confidence = metadata
@@ -2658,6 +4459,69 @@ mod tests {
             (0.0..=1.0).contains(&confidence),
             "metadata.confidence should be in [0, 1], got {confidence}"
         );
+    }
+
+    fn has_warning(payload: &serde_json::Value, needle: &str) -> bool {
+        payload["warnings"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .any(|w| w.as_str().map(|s| s.contains(needle)).unwrap_or(false))
+            })
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn google_status_requires_auth_and_runtime_readiness() {
+        let payload = build_google_workspace_status_payload(
+            "personal",
+            true,
+            true,
+            GoogleWorkspaceRuntimeSnapshot {
+                configured_enabled: true,
+                mcp_state: "running".into(),
+                mcp_tool_count: 22,
+                mcp_error: None,
+                mcp_running: true,
+                gw_client_wired: false,
+            },
+        );
+
+        assert_eq!(payload["token_present"], serde_json::json!(true));
+        assert_eq!(payload["auth_ready"], serde_json::json!(true));
+        assert_eq!(payload["runtime_ready"], serde_json::json!(false));
+        assert_eq!(payload["connected"], serde_json::json!(false));
+        assert!(has_warning(&payload, "not yet wired"));
+    }
+
+    #[test]
+    fn google_status_includes_meet_fallback_capabilities_and_runtime_warnings() {
+        let payload = build_google_workspace_status_payload(
+            "work",
+            true,
+            false,
+            GoogleWorkspaceRuntimeSnapshot {
+                configured_enabled: false,
+                mcp_state: "stopped".into(),
+                mcp_tool_count: 0,
+                mcp_error: Some("process exited".into()),
+                mcp_running: false,
+                gw_client_wired: false,
+            },
+        );
+
+        assert_eq!(
+            payload["meet_support_mode"],
+            serde_json::json!("calendar_conference_link")
+        );
+        assert_eq!(payload["capabilities"]["meet"], serde_json::json!(false));
+        assert_eq!(
+            payload["capabilities"]["meet_via_calendar"],
+            serde_json::json!(true)
+        );
+        assert!(has_warning(&payload, "OAuth token missing"));
+        assert!(has_warning(&payload, "disabled in config"));
+        assert!(has_warning(&payload, "runtime is not running"));
     }
 
     #[test]
@@ -2749,5 +4613,267 @@ mod tests {
             serde_json::Value::Null,
             "web region_match should be null"
         );
+    }
+
+    #[test]
+    fn image_user_content_includes_path_and_instruction() {
+        let content = build_image_llm_user_content(
+            "Analyze this image",
+            "/home/test/.kria/attachments/demo.png",
+            "mixed",
+            Some("Summary: screenshot with text"),
+        );
+
+        assert!(content.contains("Analyze this image"));
+        assert!(content.contains("Image attachment is already included for this turn."));
+        assert!(content.contains("Do not ask the user to re-upload the image"));
+        assert!(content.contains("Inferred image-intent hint: mixed"));
+        assert!(content.contains("/home/test/.kria/attachments/demo.png"));
+        assert!(content.contains("Automatic pre-analysis context"));
+        assert!(content.contains("Summary: screenshot with text"));
+    }
+
+    #[test]
+    fn extract_preprocessed_attachments_prefers_selected_images() {
+        let tool_data = serde_json::json!({
+            "analysis": {
+                "selected_images": [
+                    {
+                        "kind": "global",
+                        "mime_type": "image/jpeg",
+                        "data_base64": "abc123"
+                    },
+                    {
+                        "mime_type": "image/png",
+                        "data_base64": "xyz789"
+                    }
+                ],
+                "thumbnail_base64": "thumb-data"
+            }
+        });
+
+        let attachments = extract_preprocessed_image_attachments(&tool_data, "image/png")
+            .expect("attachments should be extracted");
+
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[0].mime_type, "image/jpeg");
+        assert_eq!(attachments[0].data, "abc123");
+        assert_eq!(attachments[1].mime_type, "image/png");
+        assert_eq!(attachments[1].data, "xyz789");
+    }
+
+    #[test]
+    fn extract_preprocessed_attachments_adds_thumbnail_for_roi_only() {
+        let tool_data = serde_json::json!({
+            "analysis": {
+                "selected_images": [
+                    {
+                        "kind": "roi",
+                        "mime_type": "image/jpeg",
+                        "data_base64": "roi-only"
+                    }
+                ],
+                "thumbnail_base64": "global-thumb",
+                "thumbnail_mime_type": "image/png"
+            }
+        });
+
+        let attachments = extract_preprocessed_image_attachments(&tool_data, "image/webp")
+            .expect("attachments should be extracted");
+
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[0].data, "roi-only");
+        assert_eq!(attachments[1].data, "global-thumb");
+        assert_eq!(attachments[1].mime_type, "image/png");
+    }
+
+    #[test]
+    fn extract_preprocessed_attachments_uses_thumbnail_fallback() {
+        let tool_data = serde_json::json!({
+            "analysis": {
+                "selected_images": [],
+                "thumbnail_base64": "thumb-data"
+            }
+        });
+
+        let attachments = extract_preprocessed_image_attachments(&tool_data, "image/webp")
+            .expect("thumbnail fallback should produce one attachment");
+
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].mime_type, "image/webp");
+        assert_eq!(attachments[0].data, "thumb-data");
+    }
+
+    #[test]
+    fn extract_preprocessed_attachments_falls_back_to_native_thumbnail_from_path() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("kria_native_preprocessed_{suffix}.ppm"));
+        std::fs::write(&path, OCR_HEALTH_PROBE_IMAGE_BYTES)
+            .expect("probe image should be writable");
+
+        let tool_data = serde_json::json!({
+            "path": path.to_string_lossy().to_string(),
+        });
+
+        let attachments = extract_preprocessed_image_attachments(&tool_data, "image/jpeg")
+            .expect("native thumbnail fallback should produce one attachment");
+
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].mime_type, "image/png");
+        assert!(!attachments[0].data.is_empty());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn extract_image_preanalysis_summary_reads_nested_analysis() {
+        let tool_data = serde_json::json!({
+            "analysis": {
+                "summary": "A terminal screenshot with a stack trace.",
+                "metadata": {
+                    "width": 1280,
+                    "height": 720,
+                    "format": "png"
+                },
+                "features": {
+                    "scene_type": "screenshot_or_document"
+                },
+                "ocr_text": "Error: connection failed on line 42"
+            }
+        });
+
+        let summary =
+            extract_image_preanalysis_summary(&tool_data).expect("summary should be extracted");
+
+        assert!(summary.contains("Summary:"));
+        assert!(summary.contains("Resolution: 1280x720"));
+        assert!(summary.contains("Scene type: screenshot_or_document"));
+        assert!(summary.contains("OCR excerpt:"));
+    }
+
+    #[test]
+    fn infer_image_intent_handles_varied_prompts() {
+        assert_eq!(
+            infer_image_intent_from_text("Analyze this image"),
+            "scene_understanding"
+        );
+        assert_eq!(
+            infer_image_intent_from_text("Read all text from this screenshot"),
+            "ui_error_reading"
+        );
+        assert_eq!(
+            infer_image_intent_from_text("Extract text from this invoice"),
+            "document_scan"
+        );
+        assert_eq!(
+            infer_image_intent_from_text("How many objects are in this photo?"),
+            "scene_understanding"
+        );
+        assert_eq!(
+            infer_image_intent_from_text("What do you see and what text is there?"),
+            "mixed"
+        );
+    }
+
+    #[test]
+    fn syncs_telegram_mcp_server_env_from_primary_telegram_config() {
+        let mut config = crate::commands::KriaConfig::default();
+        config.server.host = "127.0.0.1".into();
+        config.server.port = 3001;
+        config.telegram.enabled = true;
+        config.telegram.bot_token = "secret-token".into();
+        config.telegram.allowed_chat_ids = "123,456".into();
+        config.mcp.servers.push(kria_core::config::McpServerConfig {
+            name: "telegram".into(),
+            command: "kria-telegram-mcp".into(),
+            args: vec![],
+            env: std::collections::HashMap::new(),
+            enabled: false,
+            trust_level: "YELLOW".into(),
+            tool_overrides: std::collections::HashMap::new(),
+        });
+
+        let changed = sync_telegram_mcp_server_config(&mut config);
+        assert!(changed);
+
+        let server = config
+            .mcp
+            .servers
+            .iter()
+            .find(|s| s.name == "telegram")
+            .expect("telegram server should exist");
+        assert!(server.enabled);
+        assert_eq!(
+            server.env.get("TELEGRAM_BOT_TOKEN").map(String::as_str),
+            Some("secret-token")
+        );
+        assert_eq!(
+            server.env.get("TELEGRAM_CHAT_IDS").map(String::as_str),
+            Some("123,456")
+        );
+        assert_eq!(
+            server.env.get("KRIA_API_URL").map(String::as_str),
+            Some("http://127.0.0.1:3001")
+        );
+    }
+
+    struct EchoLocalApiResponder;
+
+    #[async_trait]
+    impl LocalApiResponder for EchoLocalApiResponder {
+        async fn respond(&self, request: &LocalApiChatRequest) -> serde_json::Value {
+            serde_json::json!({
+                "reply": format!("echo: {}", request.message),
+                "source": request.source.clone().unwrap_or_else(|| "api".into()),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn local_api_chat_rejects_empty_messages() {
+        let state = LocalApiBridgeState {
+            responder: std::sync::Arc::new(EchoLocalApiResponder),
+        };
+
+        let (status, body) = local_api_chat(
+            axum::extract::State(state),
+            axum::Json(LocalApiChatRequest {
+                message: "   ".into(),
+                session_id: None,
+                source: Some("telegram".into()),
+                chat_id: Some(42),
+                from_user: Some("Tester".into()),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(body.0["status"], "error");
+    }
+
+    #[tokio::test]
+    async fn local_api_chat_uses_responder_payload() {
+        let state = LocalApiBridgeState {
+            responder: std::sync::Arc::new(EchoLocalApiResponder),
+        };
+
+        let (status, body) = local_api_chat(
+            axum::extract::State(state),
+            axum::Json(LocalApiChatRequest {
+                message: "hello".into(),
+                session_id: None,
+                source: Some("telegram".into()),
+                chat_id: Some(42),
+                from_user: Some("Tester".into()),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(body.0["reply"], "echo: hello");
+        assert_eq!(body.0["source"], "telegram");
     }
 }

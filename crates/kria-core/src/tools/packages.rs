@@ -10,16 +10,24 @@
 //!   install_package         → actually install  (RED — requires HITL approval)
 //!   uninstall_package       → actually remove   (RED — requires HITL approval)
 
-use std::sync::Arc;
-use async_trait::async_trait;
-use tracing::{info, warn, error};
 use crate::infra::ToolResult;
+use crate::platform::detect::{
+    get_available_package_managers, get_package_manager, PackageManager,
+};
 use crate::safety::RiskLevel;
-use crate::tools::registry::{ToolRegistry, ToolDef, ToolHandler, ParamDef};
-use crate::platform::detect::{PackageManager, get_package_manager, get_available_package_managers};
+use crate::tools::registry::{ParamDef, ToolDef, ToolHandler, ToolRegistry};
+use async_trait::async_trait;
+use std::sync::Arc;
+use tracing::{error, info, warn};
 
 fn param(name: &str, ty: &str, desc: &str, required: bool) -> ParamDef {
-    ParamDef { name: name.into(), param_type: ty.into(), description: desc.into(), required, default: None }
+    ParamDef {
+        name: name.into(),
+        param_type: ty.into(),
+        description: desc.into(),
+        required,
+        default: None,
+    }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -29,7 +37,10 @@ fn validate_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("package name is required".into());
     }
-    if !name.chars().all(|c| c.is_alphanumeric() || "-._+/@:".contains(c)) {
+    if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || "-._+/@:".contains(c))
+    {
         return Err("invalid package name: only alphanumeric and - . _ + / @ : are allowed".into());
     }
     Ok(())
@@ -95,7 +106,10 @@ enum PrivEsc {
 /// Priority: None (for PMs that don't need it) → pkexec → sudo -n.
 async fn get_priv_esc(pm: PackageManager) -> Result<PrivEsc, String> {
     // Managers that don't need root at all.
-    if matches!(pm, PackageManager::Brew | PackageManager::Winget | PackageManager::Flatpak) {
+    if matches!(
+        pm,
+        PackageManager::Brew | PackageManager::Winget | PackageManager::Flatpak
+    ) {
         info!("[packages] PM {:?} needs no privilege escalation", pm);
         return Ok(PrivEsc::None);
     }
@@ -135,11 +149,7 @@ async fn get_priv_esc(pm: PackageManager) -> Result<PrivEsc, String> {
 }
 
 /// Build a command that runs `program args` with the given privilege escalation.
-fn priv_cmd(
-    priv_esc: PrivEsc,
-    program: &str,
-    args: &[&str],
-) -> tokio::process::Command {
+fn priv_cmd(priv_esc: PrivEsc, program: &str, args: &[&str]) -> tokio::process::Command {
     match priv_esc {
         PrivEsc::None => {
             let mut cmd = tokio::process::Command::new(program);
@@ -165,11 +175,7 @@ fn priv_cmd(
 }
 
 /// Run a privileged command and return stdout, logging all details.
-async fn run_priv_cmd(
-    priv_esc: PrivEsc,
-    program: &str,
-    args: &[&str],
-) -> Result<String, String> {
+async fn run_priv_cmd(priv_esc: PrivEsc, program: &str, args: &[&str]) -> Result<String, String> {
     let display_cmd = format!("{program} {}", args.join(" "));
     info!("[packages] Running (priv={priv_esc:?}): {display_cmd}");
 
@@ -206,7 +212,8 @@ struct SearchPackage;
 #[async_trait]
 impl ToolHandler for SearchPackage {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
-        let query = params.get("query")
+        let query = params
+            .get("query")
             .and_then(|v| v.as_str())
             .or_else(|| params.get("name").and_then(|v| v.as_str()))
             .map(str::trim)
@@ -249,66 +256,65 @@ impl ToolHandler for SearchPackage {
 async fn search_with_pm(pm: PackageManager, query: &str) -> Vec<serde_json::Value> {
     let source = pm.as_str();
     match pm {
-        PackageManager::Apt => {
-            match run_cmd("apt-cache", &["search", query]).await {
-                Ok(out) => out.lines()
-                    .filter(|l| !l.is_empty())
-                    .take(20)
-                    .map(|line| {
-                        let parts: Vec<&str> = line.splitn(2, " - ").collect();
-                        serde_json::json!({
-                            "name": parts.first().unwrap_or(&"").trim(),
-                            "description": parts.get(1).unwrap_or(&"").trim(),
-                            "source": source,
-                        })
+        PackageManager::Apt => match run_cmd("apt-cache", &["search", query]).await {
+            Ok(out) => out
+                .lines()
+                .filter(|l| !l.is_empty())
+                .take(20)
+                .map(|line| {
+                    let parts: Vec<&str> = line.splitn(2, " - ").collect();
+                    serde_json::json!({
+                        "name": parts.first().unwrap_or(&"").trim(),
+                        "description": parts.get(1).unwrap_or(&"").trim(),
+                        "source": source,
                     })
-                    .collect(),
-                Err(_) => vec![],
-            }
-        }
-        PackageManager::Dnf => {
-            match run_cmd("dnf", &["search", query]).await {
-                Ok(out) => out.lines()
-                    .filter(|l| l.contains('.') && !l.starts_with('=') && !l.starts_with(' '))
-                    .take(20)
-                    .map(|line| {
-                        let parts: Vec<&str> = line.splitn(2, " : ").collect();
-                        serde_json::json!({
-                            "name": parts.first().unwrap_or(&"").trim()
-                                .split_once('.').map(|(n,_)| n).unwrap_or(parts.first().unwrap_or(&"")),
-                            "description": parts.get(1).unwrap_or(&"").trim(),
-                            "source": source,
-                        })
+                })
+                .collect(),
+            Err(_) => vec![],
+        },
+        PackageManager::Dnf => match run_cmd("dnf", &["search", query]).await {
+            Ok(out) => out
+                .lines()
+                .filter(|l| l.contains('.') && !l.starts_with('=') && !l.starts_with(' '))
+                .take(20)
+                .map(|line| {
+                    let parts: Vec<&str> = line.splitn(2, " : ").collect();
+                    serde_json::json!({
+                        "name": parts.first().unwrap_or(&"").trim()
+                            .split_once('.').map(|(n,_)| n).unwrap_or(parts.first().unwrap_or(&"")),
+                        "description": parts.get(1).unwrap_or(&"").trim(),
+                        "source": source,
                     })
-                    .collect(),
-                Err(_) => vec![],
-            }
-        }
-        PackageManager::Pacman => {
-            match run_cmd("pacman", &["-Ss", query]).await {
-                Ok(out) => {
-                    let mut results = Vec::new();
-                    let mut lines = out.lines();
-                    while let Some(pkg_line) = lines.next() {
-                        let desc = lines.next().map(|l| l.trim()).unwrap_or("");
-                        if let Some(name_part) = pkg_line.split_whitespace().next() {
-                            let name = name_part.split('/').last().unwrap_or(name_part);
-                            results.push(serde_json::json!({
-                                "name": name,
-                                "description": desc,
-                                "source": source,
-                            }));
-                        }
-                        if results.len() >= 20 { break; }
+                })
+                .collect(),
+            Err(_) => vec![],
+        },
+        PackageManager::Pacman => match run_cmd("pacman", &["-Ss", query]).await {
+            Ok(out) => {
+                let mut results = Vec::new();
+                let mut lines = out.lines();
+                while let Some(pkg_line) = lines.next() {
+                    let desc = lines.next().map(|l| l.trim()).unwrap_or("");
+                    if let Some(name_part) = pkg_line.split_whitespace().next() {
+                        let name = name_part.split('/').last().unwrap_or(name_part);
+                        results.push(serde_json::json!({
+                            "name": name,
+                            "description": desc,
+                            "source": source,
+                        }));
                     }
-                    results
+                    if results.len() >= 20 {
+                        break;
+                    }
                 }
-                Err(_) => vec![],
+                results
             }
-        }
+            Err(_) => vec![],
+        },
         PackageManager::Zypper => {
             match run_cmd("zypper", &["search", query]).await {
-                Ok(out) => out.lines()
+                Ok(out) => out
+                    .lines()
                     .filter(|l| l.starts_with('|') || l.starts_with('+'))
                     .skip(1) // header
                     .take(20)
@@ -328,25 +334,31 @@ async fn search_with_pm(pm: PackageManager, query: &str) -> Vec<serde_json::Valu
             // brew search returns formulae and casks separated by headers
             match run_cmd("brew", &["search", "--formula", query]).await {
                 Ok(formula_out) => {
-                    let mut results: Vec<serde_json::Value> = formula_out.lines()
+                    let mut results: Vec<serde_json::Value> = formula_out
+                        .lines()
                         .filter(|l| !l.is_empty() && !l.starts_with('='))
                         .take(10)
-                        .map(|name| serde_json::json!({
-                            "name": name.trim(),
-                            "description": "",
-                            "source": "brew-formula",
-                        }))
+                        .map(|name| {
+                            serde_json::json!({
+                                "name": name.trim(),
+                                "description": "",
+                                "source": "brew-formula",
+                            })
+                        })
                         .collect();
                     // also check casks
                     if let Ok(cask_out) = run_cmd("brew", &["search", "--cask", query]).await {
-                        let casks: Vec<serde_json::Value> = cask_out.lines()
+                        let casks: Vec<serde_json::Value> = cask_out
+                            .lines()
                             .filter(|l| !l.is_empty() && !l.starts_with('='))
                             .take(10)
-                            .map(|name| serde_json::json!({
-                                "name": name.trim(),
-                                "description": "",
-                                "source": "brew-cask",
-                            }))
+                            .map(|name| {
+                                serde_json::json!({
+                                    "name": name.trim(),
+                                    "description": "",
+                                    "source": "brew-cask",
+                                })
+                            })
                             .collect();
                         results.extend(casks);
                     }
@@ -357,7 +369,8 @@ async fn search_with_pm(pm: PackageManager, query: &str) -> Vec<serde_json::Valu
         }
         PackageManager::Winget => {
             match run_cmd("winget", &["search", query, "--accept-source-agreements"]).await {
-                Ok(out) => out.lines()
+                Ok(out) => out
+                    .lines()
                     .skip(2) // skip header + separator
                     .filter(|l| !l.is_empty() && !l.chars().all(|c| c == '-' || c == ' '))
                     .take(20)
@@ -373,26 +386,28 @@ async fn search_with_pm(pm: PackageManager, query: &str) -> Vec<serde_json::Valu
                 Err(_) => vec![],
             }
         }
-        PackageManager::Choco => {
-            match run_cmd("choco", &["search", query]).await {
-                Ok(out) => out.lines()
-                    .filter(|l| !l.is_empty() && !l.starts_with("Chocolatey") && !l.contains("packages found"))
-                    .take(20)
-                    .map(|line| {
-                        let parts: Vec<&str> = line.splitn(2, ' ').collect();
-                        serde_json::json!({
-                            "name": parts.first().unwrap_or(&"").trim(),
-                            "description": parts.get(1).unwrap_or(&"").trim(),
-                            "source": source,
-                        })
+        PackageManager::Choco => match run_cmd("choco", &["search", query]).await {
+            Ok(out) => out
+                .lines()
+                .filter(|l| {
+                    !l.is_empty() && !l.starts_with("Chocolatey") && !l.contains("packages found")
+                })
+                .take(20)
+                .map(|line| {
+                    let parts: Vec<&str> = line.splitn(2, ' ').collect();
+                    serde_json::json!({
+                        "name": parts.first().unwrap_or(&"").trim(),
+                        "description": parts.get(1).unwrap_or(&"").trim(),
+                        "source": source,
                     })
-                    .collect(),
-                Err(_) => vec![],
-            }
-        }
+                })
+                .collect(),
+            Err(_) => vec![],
+        },
         PackageManager::Snap => {
             match run_cmd("snap", &["find", query]).await {
-                Ok(out) => out.lines()
+                Ok(out) => out
+                    .lines()
                     .skip(1) // skip header
                     .filter(|l| !l.is_empty())
                     .take(20)
@@ -410,8 +425,14 @@ async fn search_with_pm(pm: PackageManager, query: &str) -> Vec<serde_json::Valu
             }
         }
         PackageManager::Flatpak => {
-            match run_cmd("flatpak", &["search", "--columns=name,application,description", query]).await {
-                Ok(out) => out.lines()
+            match run_cmd(
+                "flatpak",
+                &["search", "--columns=name,application,description", query],
+            )
+            .await
+            {
+                Ok(out) => out
+                    .lines()
                     .skip(1)
                     .filter(|l| !l.is_empty())
                     .take(20)
@@ -470,18 +491,19 @@ impl ToolHandler for CheckPackageInstalled {
         }
 
         // Final fallback: which/where
-        let in_path = tokio::process::Command::new(if cfg!(windows) { "where.exe" } else { "which" })
-            .arg(&name)
-            .output()
-            .await
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+        let in_path =
+            tokio::process::Command::new(if cfg!(windows) { "where.exe" } else { "which" })
+                .arg(&name)
+                .output()
+                .await
+                .map(|o| o.status.success())
+                .unwrap_or(false);
 
         ToolResult::ok(serde_json::json!({
             "name": name,
             "installed": in_path,
             "version": null,
-"source": if in_path { serde_json::Value::String("PATH".into()) } else { serde_json::Value::Null },
+        "source": if in_path { serde_json::Value::String("PATH".into()) } else { serde_json::Value::Null },
         }))
     }
 }
@@ -489,7 +511,9 @@ impl ToolHandler for CheckPackageInstalled {
 async fn check_installed_with_pm(pm: PackageManager, name: &str) -> Option<serde_json::Value> {
     match pm {
         PackageManager::Apt => {
-            let out = run_cmd("dpkg-query", &["-W", "-f=${Status} ${Version}", name]).await.ok()?;
+            let out = run_cmd("dpkg-query", &["-W", "-f=${Status} ${Version}", name])
+                .await
+                .ok()?;
             if out.contains("install ok installed") {
                 let version = out.split_whitespace().last().map(|s| s.to_string());
                 Some(serde_json::json!({
@@ -505,7 +529,8 @@ async fn check_installed_with_pm(pm: PackageManager, name: &str) -> Option<serde
         PackageManager::Dnf => {
             let out = run_cmd("dnf", &["list", "installed", name]).await.ok()?;
             if out.lines().any(|l| l.starts_with(name)) {
-                let version = out.lines()
+                let version = out
+                    .lines()
                     .find(|l| l.starts_with(name))
                     .and_then(|l| l.split_whitespace().nth(1))
                     .map(|s| s.to_string());
@@ -562,7 +587,11 @@ async fn check_installed_with_pm(pm: PackageManager, name: &str) -> Option<serde
         }
         PackageManager::Winget => {
             let out = run_cmd("winget", &["list", name]).await.ok()?;
-            if out.lines().skip(2).any(|l| l.to_lowercase().contains(&name.to_lowercase())) {
+            if out
+                .lines()
+                .skip(2)
+                .any(|l| l.to_lowercase().contains(&name.to_lowercase()))
+            {
                 Some(serde_json::json!({
                     "name": name,
                     "installed": true,
@@ -574,9 +603,15 @@ async fn check_installed_with_pm(pm: PackageManager, name: &str) -> Option<serde
             }
         }
         PackageManager::Choco => {
-            let out = run_cmd("choco", &["list", "--local-only", name]).await.ok()?;
-            if out.lines().any(|l| l.to_lowercase().starts_with(&name.to_lowercase())) {
-                let version = out.lines()
+            let out = run_cmd("choco", &["list", "--local-only", name])
+                .await
+                .ok()?;
+            if out
+                .lines()
+                .any(|l| l.to_lowercase().starts_with(&name.to_lowercase()))
+            {
+                let version = out
+                    .lines()
                     .find(|l| l.to_lowercase().starts_with(&name.to_lowercase()))
                     .and_then(|l| l.split_whitespace().nth(1))
                     .map(|s| s.to_string());
@@ -593,7 +628,9 @@ async fn check_installed_with_pm(pm: PackageManager, name: &str) -> Option<serde
         PackageManager::Snap => {
             let out = run_cmd("snap", &["list", name]).await.ok()?;
             if out.lines().skip(1).any(|l| l.starts_with(name)) {
-                let version = out.lines().nth(1)
+                let version = out
+                    .lines()
+                    .nth(1)
                     .and_then(|l| l.split_whitespace().nth(1))
                     .map(|s| s.to_string());
                 Some(serde_json::json!({
@@ -607,8 +644,12 @@ async fn check_installed_with_pm(pm: PackageManager, name: &str) -> Option<serde
             }
         }
         PackageManager::Flatpak => {
-            let out = run_cmd("flatpak", &["list", "--columns=name,version"]).await.ok()?;
-            let found = out.lines().find(|l| l.to_lowercase().contains(&name.to_lowercase()));
+            let out = run_cmd("flatpak", &["list", "--columns=name,version"])
+                .await
+                .ok()?;
+            let found = out
+                .lines()
+                .find(|l| l.to_lowercase().contains(&name.to_lowercase()));
             if let Some(line) = found {
                 let cols: Vec<&str> = line.splitn(2, '\t').collect();
                 Some(serde_json::json!({
@@ -654,13 +695,17 @@ async fn check_updates_with_pm(pm: PackageManager, name: &str) -> serde_json::Va
     match pm {
         PackageManager::Apt => {
             // apt list --upgradable shows packages with available upgrades
-            let upgradable = run_cmd("apt", &["list", "--upgradable"]).await.unwrap_or_default();
+            let upgradable = run_cmd("apt", &["list", "--upgradable"])
+                .await
+                .unwrap_or_default();
             let line = upgradable.lines().find(|l| l.starts_with(name));
             if let Some(l) = line {
                 // format: "name/repo version arch [upgradable from: old_ver]"
                 let parts: Vec<&str> = l.split_whitespace().collect();
                 let latest = parts.get(1).map(|s| s.to_string());
-                let installed = l.split("upgradable from: ").nth(1)
+                let installed = l
+                    .split("upgradable from: ")
+                    .nth(1)
                     .and_then(|s| s.strip_suffix(']'))
                     .map(|s| s.to_string());
                 serde_json::json!({
@@ -673,7 +718,9 @@ async fn check_updates_with_pm(pm: PackageManager, name: &str) -> serde_json::Va
             } else {
                 // Package is up to date (or not installed)
                 let installed = run_cmd("dpkg-query", &["-W", "-f=${Version}", name])
-                    .await.ok().filter(|s| !s.is_empty());
+                    .await
+                    .ok()
+                    .filter(|s| !s.is_empty());
                 serde_json::json!({
                     "name": name,
                     "update_available": false,
@@ -684,10 +731,14 @@ async fn check_updates_with_pm(pm: PackageManager, name: &str) -> serde_json::Va
             }
         }
         PackageManager::Dnf => {
-            let out = run_cmd("dnf", &["check-update", name]).await.unwrap_or_default();
+            let out = run_cmd("dnf", &["check-update", name])
+                .await
+                .unwrap_or_default();
             let update_line = out.lines().find(|l| l.starts_with(name));
             let update_available = update_line.is_some();
-            let latest = update_line.and_then(|l| l.split_whitespace().nth(1)).map(|s| s.to_string());
+            let latest = update_line
+                .and_then(|l| l.split_whitespace().nth(1))
+                .map(|s| s.to_string());
             serde_json::json!({
                 "name": name,
                 "update_available": update_available,
@@ -704,7 +755,10 @@ async fn check_updates_with_pm(pm: PackageManager, name: &str) -> serde_json::Va
             // pacman -Qu: "name old_ver -> new_ver"
             let (installed, latest) = if let Some(l) = update_line {
                 let parts: Vec<&str> = l.split_whitespace().collect();
-                (parts.get(1).map(|s| s.to_string()), parts.get(3).map(|s| s.to_string()))
+                (
+                    parts.get(1).map(|s| s.to_string()),
+                    parts.get(3).map(|s| s.to_string()),
+                )
             } else {
                 (None, None)
             };
@@ -717,7 +771,9 @@ async fn check_updates_with_pm(pm: PackageManager, name: &str) -> serde_json::Va
             })
         }
         PackageManager::Zypper => {
-            let out = run_cmd("zypper", &["list-updates"]).await.unwrap_or_default();
+            let out = run_cmd("zypper", &["list-updates"])
+                .await
+                .unwrap_or_default();
             let update_line = out.lines().find(|l| l.contains(name));
             let update_available = update_line.is_some();
             serde_json::json!({
@@ -729,11 +785,17 @@ async fn check_updates_with_pm(pm: PackageManager, name: &str) -> serde_json::Va
             })
         }
         PackageManager::Brew => {
-            let out = run_cmd("brew", &["outdated", "--verbose"]).await.unwrap_or_default();
+            let out = run_cmd("brew", &["outdated", "--verbose"])
+                .await
+                .unwrap_or_default();
             let update_line = out.lines().find(|l| l.starts_with(name));
             if let Some(l) = update_line {
                 // "name (installed_ver) < latest_ver"
-                let installed = l.split('(').nth(1).and_then(|s| s.split(')').next()).map(|s| s.to_string());
+                let installed = l
+                    .split('(')
+                    .nth(1)
+                    .and_then(|s| s.split(')').next())
+                    .map(|s| s.to_string());
                 let latest = l.split("< ").nth(1).map(|s| s.trim().to_string());
                 serde_json::json!({
                     "name": name,
@@ -753,8 +815,11 @@ async fn check_updates_with_pm(pm: PackageManager, name: &str) -> serde_json::Va
             }
         }
         PackageManager::Winget => {
-            let out = run_cmd("winget", &["upgrade", name]).await.unwrap_or_default();
-            let update_available = !out.contains("No applicable upgrade found") && out.lines().count() > 3;
+            let out = run_cmd("winget", &["upgrade", name])
+                .await
+                .unwrap_or_default();
+            let update_available =
+                !out.contains("No applicable upgrade found") && out.lines().count() > 3;
             serde_json::json!({
                 "name": name,
                 "update_available": update_available,
@@ -765,11 +830,16 @@ async fn check_updates_with_pm(pm: PackageManager, name: &str) -> serde_json::Va
         }
         PackageManager::Choco => {
             let out = run_cmd("choco", &["outdated"]).await.unwrap_or_default();
-            let update_line = out.lines().find(|l| l.to_lowercase().starts_with(&name.to_lowercase()));
+            let update_line = out
+                .lines()
+                .find(|l| l.to_lowercase().starts_with(&name.to_lowercase()));
             let update_available = update_line.is_some();
             let (installed, latest) = if let Some(l) = update_line {
                 let cols: Vec<&str> = l.split('|').collect();
-                (cols.get(1).map(|s| s.trim().to_string()), cols.get(2).map(|s| s.trim().to_string()))
+                (
+                    cols.get(1).map(|s| s.trim().to_string()),
+                    cols.get(2).map(|s| s.trim().to_string()),
+                )
             } else {
                 (None, None)
             };
@@ -782,7 +852,9 @@ async fn check_updates_with_pm(pm: PackageManager, name: &str) -> serde_json::Va
             })
         }
         PackageManager::Snap => {
-            let out = run_cmd("snap", &["refresh", "--list"]).await.unwrap_or_default();
+            let out = run_cmd("snap", &["refresh", "--list"])
+                .await
+                .unwrap_or_default();
             let update_available = out.lines().any(|l| l.starts_with(name));
             serde_json::json!({
                 "name": name,
@@ -793,8 +865,12 @@ async fn check_updates_with_pm(pm: PackageManager, name: &str) -> serde_json::Va
             })
         }
         PackageManager::Flatpak => {
-            let out = run_cmd("flatpak", &["remote-ls", "--updates"]).await.unwrap_or_default();
-            let update_available = out.lines().any(|l| l.to_lowercase().contains(&name.to_lowercase()));
+            let out = run_cmd("flatpak", &["remote-ls", "--updates"])
+                .await
+                .unwrap_or_default();
+            let update_available = out
+                .lines()
+                .any(|l| l.to_lowercase().contains(&name.to_lowercase()));
             serde_json::json!({
                 "name": name,
                 "update_available": update_available,
@@ -836,12 +912,15 @@ impl ToolHandler for GetPackageInfo {
 async fn get_info_with_pm(pm: PackageManager, name: &str) -> serde_json::Value {
     match pm {
         PackageManager::Apt => {
-            let out = run_cmd("apt-cache", &["show", name]).await.unwrap_or_default();
+            let out = run_cmd("apt-cache", &["show", name])
+                .await
+                .unwrap_or_default();
             if out.is_empty() {
                 return serde_json::json!({"name": name, "found": false, "source": "apt"});
             }
             let field = |key: &str| -> Option<String> {
-                out.lines().find(|l| l.starts_with(key))
+                out.lines()
+                    .find(|l| l.starts_with(key))
                     .map(|l| l.splitn(2, ": ").nth(1).unwrap_or("").trim().to_string())
             };
             serde_json::json!({
@@ -862,7 +941,8 @@ async fn get_info_with_pm(pm: PackageManager, name: &str) -> serde_json::Value {
                 return serde_json::json!({"name": name, "found": false, "source": "dnf"});
             }
             let field = |key: &str| -> Option<String> {
-                out.lines().find(|l| l.starts_with(key))
+                out.lines()
+                    .find(|l| l.starts_with(key))
                     .map(|l| l.splitn(2, ": ").nth(1).unwrap_or("").trim().to_string())
             };
             serde_json::json!({
@@ -876,7 +956,8 @@ async fn get_info_with_pm(pm: PackageManager, name: &str) -> serde_json::Value {
             })
         }
         PackageManager::Pacman => {
-            let out = run_cmd("pacman", &["-Si", name]).await
+            let out = run_cmd("pacman", &["-Si", name])
+                .await
                 .unwrap_or_else(|_e| String::new());
             let out = if out.is_empty() {
                 run_cmd("pacman", &["-Qi", name]).await.unwrap_or_default()
@@ -887,7 +968,8 @@ async fn get_info_with_pm(pm: PackageManager, name: &str) -> serde_json::Value {
                 return serde_json::json!({"name": name, "found": false, "source": "pacman"});
             }
             let field = |key: &str| -> Option<String> {
-                out.lines().find(|l| l.starts_with(key))
+                out.lines()
+                    .find(|l| l.starts_with(key))
                     .map(|l| l.splitn(2, ": ").nth(1).unwrap_or("").trim().to_string())
             };
             serde_json::json!({
@@ -902,7 +984,8 @@ async fn get_info_with_pm(pm: PackageManager, name: &str) -> serde_json::Value {
         PackageManager::Zypper => {
             let out = run_cmd("zypper", &["info", name]).await.unwrap_or_default();
             let field = |key: &str| -> Option<String> {
-                out.lines().find(|l| l.contains(key))
+                out.lines()
+                    .find(|l| l.contains(key))
                     .map(|l| l.splitn(2, ": ").nth(1).unwrap_or("").trim().to_string())
             };
             serde_json::json!({
@@ -915,10 +998,13 @@ async fn get_info_with_pm(pm: PackageManager, name: &str) -> serde_json::Value {
             })
         }
         PackageManager::Brew => {
-            let out = run_cmd("brew", &["info", "--json=v2", name]).await.unwrap_or_default();
+            let out = run_cmd("brew", &["info", "--json=v2", name])
+                .await
+                .unwrap_or_default();
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&out) {
                 // Try formulae first, then casks
-                let formula = json["formulae"].as_array()
+                let formula = json["formulae"]
+                    .as_array()
                     .and_then(|a| a.first())
                     .or_else(|| json["casks"].as_array().and_then(|a| a.first()));
                 if let Some(f) = formula {
@@ -955,7 +1041,8 @@ async fn get_info_with_pm(pm: PackageManager, name: &str) -> serde_json::Value {
         PackageManager::Snap => {
             let out = run_cmd("snap", &["info", name]).await.unwrap_or_default();
             let field = |key: &str| -> Option<String> {
-                out.lines().find(|l| l.starts_with(key))
+                out.lines()
+                    .find(|l| l.starts_with(key))
                     .map(|l| l.splitn(2, ": ").nth(1).unwrap_or("").trim().to_string())
             };
             serde_json::json!({
@@ -969,8 +1056,20 @@ async fn get_info_with_pm(pm: PackageManager, name: &str) -> serde_json::Value {
             })
         }
         PackageManager::Flatpak => {
-            let out = run_cmd("flatpak", &["search", "--columns=name,application,version,description", name]).await.unwrap_or_default();
-            let line = out.lines().skip(1).find(|l| l.to_lowercase().contains(&name.to_lowercase()));
+            let out = run_cmd(
+                "flatpak",
+                &[
+                    "search",
+                    "--columns=name,application,version,description",
+                    name,
+                ],
+            )
+            .await
+            .unwrap_or_default();
+            let line = out
+                .lines()
+                .skip(1)
+                .find(|l| l.to_lowercase().contains(&name.to_lowercase()));
             if let Some(l) = line {
                 let cols: Vec<&str> = l.splitn(4, '\t').collect();
                 serde_json::json!({
@@ -1010,7 +1109,10 @@ impl ToolHandler for InstallPackage {
             Err(e) => return ToolResult::err(e),
         };
 
-        info!("[packages] install_package: name={name} source={source:?} pm={:?}", pm);
+        info!(
+            "[packages] install_package: name={name} source={source:?} pm={:?}",
+            pm
+        );
 
         let priv_esc = match get_priv_esc(pm).await {
             Ok(p) => p,
@@ -1042,18 +1144,12 @@ impl ToolHandler for InstallPackage {
 async fn run_install(pm: PackageManager, name: &str, priv_esc: PrivEsc) -> Result<String, String> {
     info!("[packages] run_install: pm={pm:?} name={name} priv_esc={priv_esc:?}");
     match pm {
-        PackageManager::Apt => {
-            run_priv_cmd(priv_esc, "apt-get", &["install", "-y", name]).await
-        }
-        PackageManager::Dnf => {
-            run_priv_cmd(priv_esc, "dnf", &["install", "-y", name]).await
-        }
+        PackageManager::Apt => run_priv_cmd(priv_esc, "apt-get", &["install", "-y", name]).await,
+        PackageManager::Dnf => run_priv_cmd(priv_esc, "dnf", &["install", "-y", name]).await,
         PackageManager::Pacman => {
             run_priv_cmd(priv_esc, "pacman", &["-S", "--noconfirm", name]).await
         }
-        PackageManager::Zypper => {
-            run_priv_cmd(priv_esc, "zypper", &["install", "-y", name]).await
-        }
+        PackageManager::Zypper => run_priv_cmd(priv_esc, "zypper", &["install", "-y", name]).await,
         PackageManager::Brew => {
             info!("[packages] brew install: trying formula first");
             match run_cmd("brew", &["install", name]).await {
@@ -1065,11 +1161,18 @@ async fn run_install(pm: PackageManager, name: &str, priv_esc: PrivEsc) -> Resul
             }
         }
         PackageManager::Winget => {
-            run_cmd("winget", &["install", "--accept-source-agreements", "--accept-package-agreements", name]).await
+            run_cmd(
+                "winget",
+                &[
+                    "install",
+                    "--accept-source-agreements",
+                    "--accept-package-agreements",
+                    name,
+                ],
+            )
+            .await
         }
-        PackageManager::Choco => {
-            run_cmd("choco", &["install", "-y", name]).await
-        }
+        PackageManager::Choco => run_cmd("choco", &["install", "-y", name]).await,
         PackageManager::Snap => {
             // snapd may allow install without root via the snapd socket;
             // try without sudo first, fall back to privileged if it fails.
@@ -1118,7 +1221,10 @@ impl ToolHandler for UninstallPackage {
             Err(e) => return ToolResult::err(e),
         };
 
-        info!("[packages] uninstall_package: name={name} source={source:?} pm={:?}", pm);
+        info!(
+            "[packages] uninstall_package: name={name} source={source:?} pm={:?}",
+            pm
+        );
 
         let priv_esc = match get_priv_esc(pm).await {
             Ok(p) => p,
@@ -1147,36 +1253,28 @@ impl ToolHandler for UninstallPackage {
     }
 }
 
-async fn run_uninstall(pm: PackageManager, name: &str, priv_esc: PrivEsc) -> Result<String, String> {
+async fn run_uninstall(
+    pm: PackageManager,
+    name: &str,
+    priv_esc: PrivEsc,
+) -> Result<String, String> {
     info!("[packages] run_uninstall: pm={pm:?} name={name} priv_esc={priv_esc:?}");
     match pm {
-        PackageManager::Apt => {
-            run_priv_cmd(priv_esc, "apt-get", &["remove", "-y", name]).await
-        }
-        PackageManager::Dnf => {
-            run_priv_cmd(priv_esc, "dnf", &["remove", "-y", name]).await
-        }
+        PackageManager::Apt => run_priv_cmd(priv_esc, "apt-get", &["remove", "-y", name]).await,
+        PackageManager::Dnf => run_priv_cmd(priv_esc, "dnf", &["remove", "-y", name]).await,
         PackageManager::Pacman => {
             run_priv_cmd(priv_esc, "pacman", &["-R", "--noconfirm", name]).await
         }
-        PackageManager::Zypper => {
-            run_priv_cmd(priv_esc, "zypper", &["remove", "-y", name]).await
-        }
-        PackageManager::Brew => {
-            match run_cmd("brew", &["uninstall", name]).await {
-                Ok(out) => Ok(out),
-                Err(e) => {
-                    warn!("[packages] brew uninstall formula failed ({e}), retrying as cask");
-                    run_cmd("brew", &["uninstall", "--cask", name]).await
-                }
+        PackageManager::Zypper => run_priv_cmd(priv_esc, "zypper", &["remove", "-y", name]).await,
+        PackageManager::Brew => match run_cmd("brew", &["uninstall", name]).await {
+            Ok(out) => Ok(out),
+            Err(e) => {
+                warn!("[packages] brew uninstall formula failed ({e}), retrying as cask");
+                run_cmd("brew", &["uninstall", "--cask", name]).await
             }
-        }
-        PackageManager::Winget => {
-            run_cmd("winget", &["uninstall", name]).await
-        }
-        PackageManager::Choco => {
-            run_cmd("choco", &["uninstall", "-y", name]).await
-        }
+        },
+        PackageManager::Winget => run_cmd("winget", &["uninstall", name]).await,
+        PackageManager::Choco => run_cmd("choco", &["uninstall", "-y", name]).await,
         PackageManager::Snap => {
             // snap exits 0 even when the package is not installed, writing
             // "snap '<name>' is not installed" to stderr. After our run_cmd

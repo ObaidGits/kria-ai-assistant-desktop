@@ -1,17 +1,18 @@
+use kria_core::config::VoiceConfig;
 /// Phase 5 — Voice Pipeline tests
 ///
 /// Validates: AudioChunk, VAD state machine, VadResult, VoicePipelineState,
 /// VoicePipelineEvent, SpeechToText struct, TextToSpeech struct,
 /// AudioPlayer, VoicePipeline construction, VoiceConfig defaults,
 /// Silero VAD fallback, WAV writing, energy RMS.
-
 use kria_core::voice::capture::AudioChunk;
-use kria_core::voice::vad::{VoiceActivityDetector, VadResult};
+use kria_core::voice::playback::AudioPlayer;
 use kria_core::voice::stt::SpeechToText;
 use kria_core::voice::tts::TextToSpeech;
-use kria_core::voice::playback::AudioPlayer;
-use kria_core::voice::{VoicePipeline, VoicePipelineState, VoicePipelineEvent};
-use kria_core::config::VoiceConfig;
+use kria_core::voice::vad::{VadResult, VoiceActivityDetector};
+use kria_core::voice::{
+    VoicePipeline, VoicePipelineEvent, VoicePipelineState, VoiceTranscriptFrame,
+};
 use std::path::PathBuf;
 
 // ── 5.1: AudioChunk ─────────────────────────────────────────────
@@ -95,6 +96,23 @@ fn phase5_vad_speech_start_after_threshold() {
     let r3 = vad.process(&chunk);
     assert_eq!(r3, VadResult::SpeechStart); // 3rd chunk triggers
     assert!(vad.is_speaking());
+}
+
+#[test]
+fn phase5_vad_legacy_threshold_is_normalized() {
+    // Legacy configs used int16-style thresholds (e.g. 2000), which should
+    // now be normalized automatically for float samples in [-1, 1].
+    let mut vad = VoiceActivityDetector::new(2000.0);
+    let loud_samples: Vec<f32> = (0..1600).map(|i| 0.5 * (i as f32 * 0.1).sin()).collect();
+    let chunk = AudioChunk {
+        samples: loud_samples,
+        sample_rate: 16000,
+        channels: 1,
+    };
+
+    assert_eq!(vad.process(&chunk), VadResult::Silence);
+    assert_eq!(vad.process(&chunk), VadResult::Silence);
+    assert_eq!(vad.process(&chunk), VadResult::SpeechStart);
 }
 
 #[test]
@@ -218,7 +236,10 @@ fn phase5_pipeline_state_serialization() {
 fn phase5_pipeline_state_equality() {
     assert_eq!(VoicePipelineState::Idle, VoicePipelineState::Idle);
     assert_ne!(VoicePipelineState::Idle, VoicePipelineState::Listening);
-    assert_ne!(VoicePipelineState::Listening, VoicePipelineState::Processing);
+    assert_ne!(
+        VoicePipelineState::Listening,
+        VoicePipelineState::Processing
+    );
 }
 
 // ── 5.6: VoicePipelineEvent ──────────────────────────────────────
@@ -236,10 +257,18 @@ fn phase5_pipeline_event_state_changed() {
 
 #[test]
 fn phase5_pipeline_event_transcript() {
-    let event = VoicePipelineEvent::Transcript("hello world".into());
+    let event = VoicePipelineEvent::Transcript(VoiceTranscriptFrame {
+        text: "hello world".into(),
+        confidence: 0.87,
+        language: "en".into(),
+        stability: 1.0,
+    });
     match event {
-        VoicePipelineEvent::Transcript(text) => {
-            assert_eq!(text, "hello world");
+        VoicePipelineEvent::Transcript(frame) => {
+            assert_eq!(frame.text, "hello world");
+            assert!((frame.confidence - 0.87).abs() < f32::EPSILON);
+            assert_eq!(frame.language, "en");
+            assert!((frame.stability - 1.0).abs() < f32::EPSILON);
         }
         _ => panic!("expected Transcript"),
     }
@@ -311,7 +340,10 @@ fn phase5_stt_construction() {
         PathBuf::from("/models/stt/ggml-base.en.bin"),
         Some(PathBuf::from("/usr/bin/whisper-cpp")),
     );
-    assert_eq!(stt.model_path(), &PathBuf::from("/models/stt/ggml-base.en.bin"));
+    assert_eq!(
+        stt.model_path(),
+        &PathBuf::from("/models/stt/ggml-base.en.bin")
+    );
 }
 
 #[test]
@@ -359,6 +391,14 @@ fn phase5_voice_config_defaults() {
     assert_eq!(config.mic_device, "auto");
     assert_eq!(config.speaker_device, "auto");
     assert_eq!(config.push_to_talk_key, "ctrl+space");
+    assert_eq!(config.language, "auto");
+    assert_eq!(config.partial_update_ms, 2000);
+    assert!((config.confidence_threshold - 0.30).abs() < f32::EPSILON);
+    assert_eq!(config.noise_suppression_mode, "light");
+    assert!(config.follow_system_default_mic);
+    assert!(config.follow_system_default_speaker);
+    assert!(config.persist_transcripts);
+    assert!(!config.persist_raw_audio);
 }
 
 #[test]
@@ -367,7 +407,9 @@ fn phase5_voice_config_serialization() {
     let json = serde_json::to_string(&config).unwrap();
     assert!(json.contains("push_to_talk"));
     assert!(json.contains("ggml-base.en.bin"));
+    assert!(json.contains("partial_update_ms"));
     let deserialized: VoiceConfig = serde_json::from_str(&json).unwrap();
     assert_eq!(deserialized.mode, config.mode);
     assert_eq!(deserialized.energy_threshold, config.energy_threshold);
+    assert_eq!(deserialized.language, config.language);
 }

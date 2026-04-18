@@ -24,12 +24,8 @@ impl SidecarHealth {
 
     /// Start the health-check loop. Calls `ping_fn` every `interval`.
     /// If `max_failures` consecutive pings fail, calls `restart_fn`.
-    pub fn start<P, R>(
-        &self,
-        interval: std::time::Duration,
-        ping_fn: P,
-        restart_fn: R,
-    ) where
+    pub fn start<P, R>(&self, interval: std::time::Duration, ping_fn: P, restart_fn: R)
+    where
         P: Fn() -> tokio::task::JoinHandle<bool> + Send + Sync + 'static,
         R: Fn() + Send + Sync + 'static,
     {

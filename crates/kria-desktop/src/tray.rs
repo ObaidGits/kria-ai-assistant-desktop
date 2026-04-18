@@ -1,8 +1,7 @@
 use tauri::{
-    AppHandle, Emitter,
-    tray::{TrayIconBuilder, MouseButton, MouseButtonState, TrayIconEvent},
     menu::{MenuBuilder, MenuItemBuilder},
-    Manager,
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Emitter, Manager,
 };
 
 pub fn create_tray(app: &AppHandle) -> anyhow::Result<()> {
@@ -23,32 +22,31 @@ pub fn create_tray(app: &AppHandle) -> anyhow::Result<()> {
     let _tray = TrayIconBuilder::new()
         .menu(&menu)
         .tooltip("K.R.I.A. — Desktop AI Assistant")
-        .on_menu_event(move |app, event| {
-            match event.id().as_ref() {
-                "show" => {
-                    if let Some(window) = app.get_webview_window("main") {
-                        let _ = window.show();
-                        let _ = window.set_focus();
-                    }
+        .on_menu_event(move |app, event| match event.id().as_ref() {
+            "show" => {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
                 }
-                "voice" => {
-                    let _ = app.emit("tray:toggle-voice", ());
-                }
-                "settings" => {
-                    let _ = app.emit("tray:open-settings", ());
-                }
-                "quit" => {
-                    app.exit(0);
-                }
-                _ => {}
             }
+            "voice" => {
+                let _ = app.emit("tray:toggle-voice", ());
+            }
+            "settings" => {
+                let _ = app.emit("tray:open-settings", ());
+            }
+            "quit" => {
+                app.exit(0);
+            }
+            _ => {}
         })
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::Click {
                 button: MouseButton::Left,
                 button_state: MouseButtonState::Up,
                 ..
-            } = event {
+            } = event
+            {
                 let app = tray.app_handle();
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.show();

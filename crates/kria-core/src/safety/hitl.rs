@@ -1,10 +1,10 @@
-use tokio::sync::mpsc;
-use tokio::sync::oneshot;
+use crate::safety::RiskLevel;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use std::time::Duration;
-use crate::safety::RiskLevel;
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+use tokio::sync::Mutex;
 
 /// Represents a pending HITL approval request.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -89,10 +89,13 @@ impl HitlGateway {
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().await;
-            pending.insert(id.clone(), PendingRequest {
-                request: request.clone(),
-                responder: tx,
-            });
+            pending.insert(
+                id.clone(),
+                PendingRequest {
+                    request: request.clone(),
+                    responder: tx,
+                },
+            );
         }
 
         // Notify frontends
@@ -123,7 +126,15 @@ impl HitlGateway {
         rollback_available: bool,
     ) -> ApprovalResponse {
         let id = Self::generate_request_id();
-        self.request_approval_with_id(&id, action, parameters, risk_level, description, rollback_available).await
+        self.request_approval_with_id(
+            &id,
+            action,
+            parameters,
+            risk_level,
+            description,
+            rollback_available,
+        )
+        .await
     }
 
     /// Respond to a pending request (called by GUI/voice handler).

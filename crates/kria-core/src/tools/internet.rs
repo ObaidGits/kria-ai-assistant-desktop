@@ -1,10 +1,10 @@
-use std::sync::Arc;
-use std::net::IpAddr;
-use std::time::Duration;
-use async_trait::async_trait;
 use crate::infra::ToolResult;
 use crate::safety::RiskLevel;
-use crate::tools::registry::{ToolRegistry, ToolDef, ToolHandler, ParamDef};
+use crate::tools::registry::{ParamDef, ToolDef, ToolHandler, ToolRegistry};
+use async_trait::async_trait;
+use std::net::IpAddr;
+use std::sync::Arc;
+use std::time::Duration;
 
 const WEB_RETRY_ATTEMPTS: usize = 3;
 
@@ -36,8 +36,7 @@ fn is_private_or_sensitive_ip(ip: IpAddr) -> bool {
 }
 
 fn validate_safe_url(raw_url: &str) -> Result<reqwest::Url, String> {
-    let parsed = reqwest::Url::parse(raw_url)
-        .map_err(|e| format!("invalid url: {e}"))?;
+    let parsed = reqwest::Url::parse(raw_url).map_err(|e| format!("invalid url: {e}"))?;
 
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err("unsupported URL scheme (only http/https allowed)".to_string());
@@ -69,74 +68,84 @@ fn validate_safe_url(raw_url: &str) -> Result<reqwest::Url, String> {
     Ok(parsed)
 }
 
-fn param(name: &str, ty: &str, desc: &str, required: bool) -> ParamDef {
-    ParamDef { name: name.into(), param_type: ty.into(), description: desc.into(), required, default: None }
-}
+async fn search_duckduckgo_lite(query: &str, max_results: usize) -> Result<Vec<String>, String> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|e| format!("web_search client init failed: {e}"))?;
 
-struct WebSearch;
-#[async_trait] impl ToolHandler for WebSearch {
-    async fn execute(&self, params: serde_json::Value) -> ToolResult {
-        let query = params["query"].as_str().unwrap_or("").trim();
-        let max_results = params["max_results"].as_u64().unwrap_or(5);
-        if query.is_empty() {
-            return ToolResult::err("query is required".to_string());
-        }
+    let mut last_err = String::new();
+    for attempt in 0..WEB_RETRY_ATTEMPTS {
+        let resp = client
+            .get("https://lite.duckduckgo.com/lite/")
+            .query(&[("q", query)])
+            .header("User-Agent", "KRIA/0.1")
+            .send()
+            .await;
 
-        // Uses DuckDuckGo lite HTML (no API key required)
-        let client = match reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(12))
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => return ToolResult::err(format!("web_search client init failed: {e}")),
-        };
-
-        let mut last_err = String::new();
-        for attempt in 0..WEB_RETRY_ATTEMPTS {
-            let resp = client
-                .get("https://lite.duckduckgo.com/lite/")
-                .query(&[("q", query)])
-                .header("User-Agent", "KRIA/0.1")
-                .send()
-                .await;
-
-            match resp {
-                Ok(r) if r.status().is_success() => {
+        match resp {
+            Ok(r) if r.status().is_success() => {
                 let text = r.text().await.unwrap_or_default();
-                // Parse results from HTML (simplified)
                 let doc = scraper::Html::parse_document(&text);
                 let selector = scraper::Selector::parse("a.result-link, .result-snippet").ok();
                 let mut results = Vec::new();
                 if let Some(sel) = selector {
-                    for el in doc.select(&sel).take(max_results as usize) {
+                    for el in doc.select(&sel).take(max_results) {
                         results.push(el.text().collect::<String>().trim().to_string());
                     }
                 }
-                return ToolResult::ok(serde_json::json!({
-                    "query": query,
-                    "results": results,
-                }));
-                }
-                Ok(r) => {
-                    last_err = format!("duckduckgo returned status {}", r.status());
-                }
-                Err(e) => {
-                    last_err = e.to_string();
-                }
+                return Ok(results);
             }
-
-            if attempt + 1 < WEB_RETRY_ATTEMPTS {
-                tokio::time::sleep(backoff_delay(attempt)).await;
+            Ok(r) => {
+                last_err = format!("duckduckgo returned status {}", r.status());
+            }
+            Err(e) => {
+                last_err = e.to_string();
             }
         }
 
-        ToolResult::err(format!("web_search failed after retries: {last_err}"))
+        if attempt + 1 < WEB_RETRY_ATTEMPTS {
+            tokio::time::sleep(backoff_delay(attempt)).await;
+        }
+    }
+
+    Err(format!("web_search failed after retries: {last_err}"))
+}
+
+fn param(name: &str, ty: &str, desc: &str, required: bool) -> ParamDef {
+    ParamDef {
+        name: name.into(),
+        param_type: ty.into(),
+        description: desc.into(),
+        required,
+        default: None,
+    }
+}
+
+struct WebSearch;
+#[async_trait]
+impl ToolHandler for WebSearch {
+    async fn execute(&self, params: serde_json::Value) -> ToolResult {
+        let query = params["query"].as_str().unwrap_or("").trim();
+        let max_results = params["max_results"].as_u64().unwrap_or(5) as usize;
+        if query.is_empty() {
+            return ToolResult::err("query is required".to_string());
+        }
+
+        match search_duckduckgo_lite(query, max_results).await {
+            Ok(results) => ToolResult::ok(serde_json::json!({
+                "query": query,
+                "results": results,
+            })),
+            Err(e) => ToolResult::err(e),
+        }
     }
 }
 
 struct FetchWebpage;
-#[async_trait] impl ToolHandler for FetchWebpage {
+#[async_trait]
+impl ToolHandler for FetchWebpage {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
         let url = params["url"].as_str().unwrap_or("").trim();
         let max_chars = params["max_chars"].as_u64().unwrap_or(20000) as usize;
@@ -148,7 +157,8 @@ struct FetchWebpage;
             Err(e) => return ToolResult::err(format!("unsafe url: {e}")),
         };
 
-        let content_limit = ((max_chars as u64).saturating_mul(8)).clamp(128 * 1024, 3 * 1024 * 1024);
+        let content_limit =
+            ((max_chars as u64).saturating_mul(8)).clamp(128 * 1024, 3 * 1024 * 1024);
 
         let client = match reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
@@ -182,7 +192,9 @@ struct FetchWebpage;
                         && !content_type.contains("xml")
                         && !content_type.contains("json")
                     {
-                        return ToolResult::err(format!("unsupported content type: {content_type}"));
+                        return ToolResult::err(format!(
+                            "unsupported content type: {content_type}"
+                        ));
                     }
 
                     if let Some(len) = resp.content_length() {
@@ -194,24 +206,28 @@ struct FetchWebpage;
                         }
                     }
 
-                let text = resp.text().await.unwrap_or_default();
-                // Strip HTML tags for text content
-                let doc = scraper::Html::parse_document(&text);
-                let body_sel = scraper::Selector::parse("body").ok();
-                let body_text = body_sel.and_then(|sel| {
-                    doc.select(&sel).next().map(|el| el.text().collect::<String>())
-                }).unwrap_or(text);
+                    let text = resp.text().await.unwrap_or_default();
+                    // Strip HTML tags for text content
+                    let doc = scraper::Html::parse_document(&text);
+                    let body_sel = scraper::Selector::parse("body").ok();
+                    let body_text = body_sel
+                        .and_then(|sel| {
+                            doc.select(&sel)
+                                .next()
+                                .map(|el| el.text().collect::<String>())
+                        })
+                        .unwrap_or(text);
 
-                let content = if body_text.len() > max_chars {
-                    &body_text[..max_chars]
-                } else {
-                    &body_text
-                };
-                return ToolResult::ok(serde_json::json!({
-                    "url": url,
-                    "content": content.trim(),
-                    "truncated": body_text.len() > max_chars,
-                }));
+                    let content = if body_text.len() > max_chars {
+                        &body_text[..max_chars]
+                    } else {
+                        &body_text
+                    };
+                    return ToolResult::ok(serde_json::json!({
+                        "url": url,
+                        "content": content.trim(),
+                        "truncated": body_text.len() > max_chars,
+                    }));
                 }
                 Ok(resp) => {
                     last_err = format!("status {}", resp.status());
@@ -231,7 +247,8 @@ struct FetchWebpage;
 }
 
 struct CheckUrlStatus;
-#[async_trait] impl ToolHandler for CheckUrlStatus {
+#[async_trait]
+impl ToolHandler for CheckUrlStatus {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
         let url = params["url"].as_str().unwrap_or("").trim();
         let safe_url = match validate_safe_url(url) {
@@ -289,7 +306,8 @@ struct CheckUrlStatus;
 }
 
 struct GetPublicIp;
-#[async_trait] impl ToolHandler for GetPublicIp {
+#[async_trait]
+impl ToolHandler for GetPublicIp {
     async fn execute(&self, _params: serde_json::Value) -> ToolResult {
         let client = reqwest::Client::new();
         match client.get("https://api.ipify.org?format=json").send().await {
@@ -297,50 +315,57 @@ struct GetPublicIp;
                 let body: serde_json::Value = resp.json().await.unwrap_or_default();
                 ToolResult::ok(body)
             }
-            Err(e) => ToolResult::err(format!("get_public_ip failed: {e}"))
+            Err(e) => ToolResult::err(format!("get_public_ip failed: {e}")),
         }
     }
 }
 
 struct PingHost;
-#[async_trait] impl ToolHandler for PingHost {
+#[async_trait]
+impl ToolHandler for PingHost {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
         let host = params["host"].as_str().unwrap_or("");
         let count = params["count"].as_u64().unwrap_or(4).to_string();
         let output = tokio::process::Command::new("ping")
             .args(["-c", &count, host])
-            .output().await;
+            .output()
+            .await;
         match output {
             Ok(o) => ToolResult::ok(serde_json::json!({
                 "host": host,
                 "success": o.status.success(),
                 "output": String::from_utf8_lossy(&o.stdout).to_string(),
             })),
-            Err(e) => ToolResult::err(format!("ping failed: {e}"))
+            Err(e) => ToolResult::err(format!("ping failed: {e}")),
         }
     }
 }
 
 struct DnsLookup;
-#[async_trait] impl ToolHandler for DnsLookup {
+#[async_trait]
+impl ToolHandler for DnsLookup {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
         let domain = params["domain"].as_str().unwrap_or("");
         let output = tokio::process::Command::new("dig")
             .args(["+short", domain])
-            .output().await;
+            .output()
+            .await;
         match output {
             Ok(o) => {
                 let records: Vec<String> = String::from_utf8_lossy(&o.stdout)
-                    .lines().map(String::from).collect();
+                    .lines()
+                    .map(String::from)
+                    .collect();
                 ToolResult::ok(serde_json::json!({ "domain": domain, "records": records }))
             }
-            Err(e) => ToolResult::err(format!("dns_lookup failed: {e}"))
+            Err(e) => ToolResult::err(format!("dns_lookup failed: {e}")),
         }
     }
 }
 
 struct DownloadFile;
-#[async_trait] impl ToolHandler for DownloadFile {
+#[async_trait]
+impl ToolHandler for DownloadFile {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
         let url = params["url"].as_str().unwrap_or("").trim();
         let dest = params["destination"].as_str().unwrap_or("");
@@ -392,7 +417,10 @@ struct DownloadFile;
 
         if let Some(len) = resp.content_length() {
             if len > max_mb * 1024 * 1024 {
-                return ToolResult::err(format!("file too large: {} MB (max {max_mb} MB)", len / (1024*1024)));
+                return ToolResult::err(format!(
+                    "file too large: {} MB (max {max_mb} MB)",
+                    len / (1024 * 1024)
+                ));
             }
         }
 
@@ -417,13 +445,14 @@ struct DownloadFile;
                 "destination": dest,
                 "size_bytes": bytes.len(),
             })),
-            Err(e) => ToolResult::err(format!("write failed: {e}"))
+            Err(e) => ToolResult::err(format!("write failed: {e}")),
         }
     }
 }
 
 struct SpeedTest;
-#[async_trait] impl ToolHandler for SpeedTest {
+#[async_trait]
+impl ToolHandler for SpeedTest {
     async fn execute(&self, _params: serde_json::Value) -> ToolResult {
         // Simple download speed test: download a 1MB test file and measure time
         let url = "https://speed.cloudflare.com/__down?bytes=1048576";
@@ -440,7 +469,7 @@ struct SpeedTest;
                     "elapsed_seconds": format!("{:.2}", elapsed),
                 }))
             }
-            Err(e) => ToolResult::err(format!("speed test failed: {e}"))
+            Err(e) => ToolResult::err(format!("speed test failed: {e}")),
         }
     }
 }
@@ -448,21 +477,31 @@ struct SpeedTest;
 // ── Phase 2 tools ───────────────────────────────────────────────────
 
 struct SearxngSearch;
-#[async_trait] impl ToolHandler for SearxngSearch {
+#[async_trait]
+impl ToolHandler for SearxngSearch {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
-        let query = params["query"].as_str().unwrap_or("");
+        let query = params["query"].as_str().unwrap_or("").trim();
         let max_results = params["max_results"].as_u64().unwrap_or(5) as usize;
-        let instance = params["instance_url"].as_str().unwrap_or("http://localhost:8888");
+        let instance = params["instance_url"]
+            .as_str()
+            .unwrap_or("http://localhost:8888");
+
+        if query.is_empty() {
+            return ToolResult::err("query is required".to_string());
+        }
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
-            .build().unwrap_or_default();
+            .build()
+            .unwrap_or_default();
 
         let url = format!("{}/search", instance.trim_end_matches('/'));
-        let resp = client.get(&url)
+        let resp = client
+            .get(&url)
             .query(&[("q", query), ("format", "json"), ("language", "en")])
             .header("User-Agent", "KRIA/0.1")
-            .send().await;
+            .send()
+            .await;
 
         match resp {
             Ok(r) if r.status().is_success() => {
@@ -472,23 +511,87 @@ struct SearxngSearch;
                     .unwrap_or(&Vec::new())
                     .iter()
                     .take(max_results)
-                    .map(|r| serde_json::json!({
-                        "title": r["title"],
-                        "url": r["url"],
-                        "snippet": r["content"],
-                        "engine": r["engine"],
-                    }))
+                    .map(|r| {
+                        serde_json::json!({
+                            "title": r["title"],
+                            "url": r["url"],
+                            "snippet": r["content"],
+                            "engine": r["engine"],
+                        })
+                    })
                     .collect();
-                ToolResult::ok(serde_json::json!({ "query": query, "results": results, "count": results.len() }))
+                ToolResult::ok(
+                    serde_json::json!({ "query": query, "results": results, "count": results.len() }),
+                )
             }
-            Ok(r) => ToolResult::err(format!("searxng returned status {}", r.status())),
-            Err(e) => ToolResult::err(format!("searxng_search failed: {e}. Is SearXNG running at {instance}?"))
+            Ok(r) => {
+                let searx_err = format!("searxng returned status {}", r.status());
+                tracing::warn!(instance, %searx_err, "searxng_search failed, falling back to DuckDuckGo");
+                match search_duckduckgo_lite(query, max_results).await {
+                    Ok(fallback_rows) => {
+                        let results: Vec<serde_json::Value> = fallback_rows
+                            .into_iter()
+                            .map(|row| {
+                                serde_json::json!({
+                                    "title": row,
+                                    "url": serde_json::Value::Null,
+                                    "snippet": serde_json::Value::Null,
+                                    "engine": "duckduckgo-lite",
+                                })
+                            })
+                            .collect();
+                        ToolResult::ok(serde_json::json!({
+                            "query": query,
+                            "results": results,
+                            "count": results.len(),
+                            "backend": "duckduckgo-lite",
+                            "fallback_from": "searxng",
+                            "fallback_reason": searx_err,
+                        }))
+                    }
+                    Err(fallback_err) => ToolResult::err(format!(
+                        "searxng_search failed ({searx_err}) and fallback web_search failed: {fallback_err}"
+                    )),
+                }
+            }
+            Err(e) => {
+                let searx_err =
+                    format!("searxng_search failed: {e}. Is SearXNG running at {instance}?");
+                tracing::warn!(instance, %searx_err, "searxng_search failed, falling back to DuckDuckGo");
+                match search_duckduckgo_lite(query, max_results).await {
+                    Ok(fallback_rows) => {
+                        let results: Vec<serde_json::Value> = fallback_rows
+                            .into_iter()
+                            .map(|row| {
+                                serde_json::json!({
+                                    "title": row,
+                                    "url": serde_json::Value::Null,
+                                    "snippet": serde_json::Value::Null,
+                                    "engine": "duckduckgo-lite",
+                                })
+                            })
+                            .collect();
+                        ToolResult::ok(serde_json::json!({
+                            "query": query,
+                            "results": results,
+                            "count": results.len(),
+                            "backend": "duckduckgo-lite",
+                            "fallback_from": "searxng",
+                            "fallback_reason": searx_err,
+                        }))
+                    }
+                    Err(fallback_err) => ToolResult::err(format!(
+                        "{searx_err}; fallback web_search failed: {fallback_err}"
+                    )),
+                }
+            }
         }
     }
 }
 
 struct GetCurrentTime;
-#[async_trait] impl ToolHandler for GetCurrentTime {
+#[async_trait]
+impl ToolHandler for GetCurrentTime {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
         let tz_name = params["timezone"].as_str().unwrap_or("UTC");
         let now = chrono::Utc::now();
@@ -498,47 +601,100 @@ struct GetCurrentTime;
             "UTC" | "GMT" => (now.format("%Y-%m-%d %H:%M:%S").to_string(), "UTC"),
             "EST" | "US/EASTERN" => {
                 let offset = chrono::FixedOffset::west_opt(5 * 3600).unwrap();
-                (now.with_timezone(&offset).format("%Y-%m-%d %H:%M:%S").to_string(), "EST (UTC-5)")
+                (
+                    now.with_timezone(&offset)
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string(),
+                    "EST (UTC-5)",
+                )
             }
             "CST" | "US/CENTRAL" => {
                 let offset = chrono::FixedOffset::west_opt(6 * 3600).unwrap();
-                (now.with_timezone(&offset).format("%Y-%m-%d %H:%M:%S").to_string(), "CST (UTC-6)")
+                (
+                    now.with_timezone(&offset)
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string(),
+                    "CST (UTC-6)",
+                )
             }
             "MST" | "US/MOUNTAIN" => {
                 let offset = chrono::FixedOffset::west_opt(7 * 3600).unwrap();
-                (now.with_timezone(&offset).format("%Y-%m-%d %H:%M:%S").to_string(), "MST (UTC-7)")
+                (
+                    now.with_timezone(&offset)
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string(),
+                    "MST (UTC-7)",
+                )
             }
             "PST" | "US/PACIFIC" => {
                 let offset = chrono::FixedOffset::west_opt(8 * 3600).unwrap();
-                (now.with_timezone(&offset).format("%Y-%m-%d %H:%M:%S").to_string(), "PST (UTC-8)")
+                (
+                    now.with_timezone(&offset)
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string(),
+                    "PST (UTC-8)",
+                )
             }
             "CET" | "EUROPE/BERLIN" | "EUROPE/PARIS" => {
                 let offset = chrono::FixedOffset::east_opt(1 * 3600).unwrap();
-                (now.with_timezone(&offset).format("%Y-%m-%d %H:%M:%S").to_string(), "CET (UTC+1)")
+                (
+                    now.with_timezone(&offset)
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string(),
+                    "CET (UTC+1)",
+                )
             }
             "JST" | "ASIA/TOKYO" => {
                 let offset = chrono::FixedOffset::east_opt(9 * 3600).unwrap();
-                (now.with_timezone(&offset).format("%Y-%m-%d %H:%M:%S").to_string(), "JST (UTC+9)")
+                (
+                    now.with_timezone(&offset)
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string(),
+                    "JST (UTC+9)",
+                )
             }
             "IST" | "ASIA/KOLKATA" => {
                 let offset = chrono::FixedOffset::east_opt(5 * 3600 + 1800).unwrap();
-                (now.with_timezone(&offset).format("%Y-%m-%d %H:%M:%S").to_string(), "IST (UTC+5:30)")
+                (
+                    now.with_timezone(&offset)
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string(),
+                    "IST (UTC+5:30)",
+                )
             }
             "PKT" | "ASIA/KARACHI" => {
                 let offset = chrono::FixedOffset::east_opt(5 * 3600).unwrap();
-                (now.with_timezone(&offset).format("%Y-%m-%d %H:%M:%S").to_string(), "PKT (UTC+5)")
+                (
+                    now.with_timezone(&offset)
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string(),
+                    "PKT (UTC+5)",
+                )
             }
             "AEST" | "AUSTRALIA/SYDNEY" => {
                 let offset = chrono::FixedOffset::east_opt(10 * 3600).unwrap();
-                (now.with_timezone(&offset).format("%Y-%m-%d %H:%M:%S").to_string(), "AEST (UTC+10)")
+                (
+                    now.with_timezone(&offset)
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string(),
+                    "AEST (UTC+10)",
+                )
             }
             _ => {
                 // Try parsing as UTC offset like "+5" or "-8"
                 if let Ok(hours) = tz_name.parse::<i32>() {
                     let offset = chrono::FixedOffset::east_opt(hours * 3600).unwrap();
-                    (now.with_timezone(&offset).format("%Y-%m-%d %H:%M:%S").to_string(), tz_name)
+                    (
+                        now.with_timezone(&offset)
+                            .format("%Y-%m-%d %H:%M:%S")
+                            .to_string(),
+                        tz_name,
+                    )
                 } else {
-                    (now.format("%Y-%m-%d %H:%M:%S").to_string(), "UTC (unknown timezone, defaulting)")
+                    (
+                        now.format("%Y-%m-%d %H:%M:%S").to_string(),
+                        "UTC (unknown timezone, defaulting)",
+                    )
                 }
             }
         };
@@ -554,18 +710,22 @@ struct GetCurrentTime;
 }
 
 struct GetWeather;
-#[async_trait] impl ToolHandler for GetWeather {
+#[async_trait]
+impl ToolHandler for GetWeather {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
         let location = params["location"].as_str().unwrap_or("Berlin");
 
         // Step 1: Geocode location name → lat/lon via Open-Meteo geocoding API
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
-            .build().unwrap_or_default();
+            .build()
+            .unwrap_or_default();
 
-        let geo_resp = client.get("https://geocoding-api.open-meteo.com/v1/search")
+        let geo_resp = client
+            .get("https://geocoding-api.open-meteo.com/v1/search")
             .query(&[("name", location), ("count", "1"), ("language", "en")])
-            .send().await;
+            .send()
+            .await;
 
         let (lat, lon, resolved_name) = match geo_resp {
             Ok(r) => {
@@ -584,16 +744,26 @@ struct GetWeather;
         };
 
         // Step 2: Get weather from Open-Meteo (free, no API key)
-        let weather_resp = client.get("https://api.open-meteo.com/v1/forecast")
+        let weather_resp = client
+            .get("https://api.open-meteo.com/v1/forecast")
             .query(&[
                 ("latitude", &lat.to_string()),
                 ("longitude", &lon.to_string()),
-                ("current", &"temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code,is_day".to_string()),
-                ("daily", &"temperature_2m_max,temperature_2m_min,precipitation_sum,weather_code".to_string()),
+                (
+                    "current",
+                    &"temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code,is_day"
+                        .to_string(),
+                ),
+                (
+                    "daily",
+                    &"temperature_2m_max,temperature_2m_min,precipitation_sum,weather_code"
+                        .to_string(),
+                ),
                 ("timezone", &"auto".to_string()),
                 ("forecast_days", &"3".to_string()),
             ])
-            .send().await;
+            .send()
+            .await;
 
         match weather_resp {
             Ok(r) => {
@@ -602,11 +772,19 @@ struct GetWeather;
 
                 // Decode WMO weather codes to descriptions
                 let weather_desc = match current["weather_code"].as_u64().unwrap_or(0) {
-                    0 => "Clear sky", 1 => "Mainly clear", 2 => "Partly cloudy",
-                    3 => "Overcast", 45 | 48 => "Foggy", 51..=55 => "Drizzle",
-                    61..=65 => "Rain", 71..=75 => "Snow", 80..=82 => "Rain showers",
-                    85 | 86 => "Snow showers", 95 => "Thunderstorm",
-                    96 | 99 => "Thunderstorm with hail", _ => "Unknown",
+                    0 => "Clear sky",
+                    1 => "Mainly clear",
+                    2 => "Partly cloudy",
+                    3 => "Overcast",
+                    45 | 48 => "Foggy",
+                    51..=55 => "Drizzle",
+                    61..=65 => "Rain",
+                    71..=75 => "Snow",
+                    80..=82 => "Rain showers",
+                    85 | 86 => "Snow showers",
+                    95 => "Thunderstorm",
+                    96 | 99 => "Thunderstorm with hail",
+                    _ => "Unknown",
                 };
 
                 ToolResult::ok(serde_json::json!({
@@ -628,17 +806,25 @@ struct GetWeather;
 }
 
 struct GetNews;
-#[async_trait] impl ToolHandler for GetNews {
+#[async_trait]
+impl ToolHandler for GetNews {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
-        let feed_url = params["feed_url"].as_str()
+        let feed_url = params["feed_url"]
+            .as_str()
             .unwrap_or("https://hnrss.org/frontpage");
         let max_items = params["max_items"].as_u64().unwrap_or(10) as usize;
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
-            .build().unwrap_or_default();
+            .build()
+            .unwrap_or_default();
 
-        match client.get(feed_url).header("User-Agent", "KRIA/0.1").send().await {
+        match client
+            .get(feed_url)
+            .header("User-Agent", "KRIA/0.1")
+            .send()
+            .await
+        {
             Ok(resp) => {
                 let xml = resp.text().await.unwrap_or_default();
                 // Simple RSS/Atom parsing: extract <item>/<entry> titles and links
@@ -652,15 +838,18 @@ struct GetNews;
                     let desc_sel = scraper::Selector::parse("description").ok();
 
                     for item in doc.select(&item_sel).take(max_items) {
-                        let title = title_sel.as_ref()
+                        let title = title_sel
+                            .as_ref()
                             .and_then(|s| item.select(s).next())
                             .map(|e| e.text().collect::<String>())
                             .unwrap_or_default();
-                        let link = link_sel.as_ref()
+                        let link = link_sel
+                            .as_ref()
                             .and_then(|s| item.select(s).next())
                             .map(|e| e.text().collect::<String>())
                             .unwrap_or_default();
-                        let desc = desc_sel.as_ref()
+                        let desc = desc_sel
+                            .as_ref()
                             .and_then(|s| item.select(s).next())
                             .map(|e| e.text().collect::<String>())
                             .unwrap_or_default();
@@ -680,11 +869,13 @@ struct GetNews;
                         let link_sel = scraper::Selector::parse("link").ok();
 
                         for entry in doc.select(&entry_sel).take(max_items) {
-                            let title = title_sel.as_ref()
+                            let title = title_sel
+                                .as_ref()
                                 .and_then(|s| entry.select(s).next())
                                 .map(|e| e.text().collect::<String>())
                                 .unwrap_or_default();
-                            let link = link_sel.as_ref()
+                            let link = link_sel
+                                .as_ref()
                                 .and_then(|s| entry.select(s).next())
                                 .and_then(|e| e.value().attr("href").map(String::from))
                                 .unwrap_or_default();
@@ -709,16 +900,24 @@ struct GetNews;
 }
 
 struct GetExchangeRate;
-#[async_trait] impl ToolHandler for GetExchangeRate {
+#[async_trait]
+impl ToolHandler for GetExchangeRate {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
-        let base = params["base_currency"].as_str().unwrap_or("USD").to_uppercase();
-        let target = params["target_currency"].as_str().unwrap_or("EUR").to_uppercase();
+        let base = params["base_currency"]
+            .as_str()
+            .unwrap_or("USD")
+            .to_uppercase();
+        let target = params["target_currency"]
+            .as_str()
+            .unwrap_or("EUR")
+            .to_uppercase();
         let amount = params["amount"].as_f64().unwrap_or(1.0);
 
         // Use ECB exchange rates via open API (free, no key)
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
-            .build().unwrap_or_default();
+            .build()
+            .unwrap_or_default();
 
         let url = format!("https://open.er-api.com/v6/latest/{}", base);
         match client.get(&url).send().await {
@@ -744,7 +943,8 @@ struct GetExchangeRate;
 }
 
 struct Calculate;
-#[async_trait] impl ToolHandler for Calculate {
+#[async_trait]
+impl ToolHandler for Calculate {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
         let expression = params["expression"].as_str().unwrap_or("");
 
@@ -782,8 +982,14 @@ fn eval_expr(chars: &mut std::iter::Peekable<std::str::Chars>) -> Result<f64, St
     loop {
         skip_spaces(chars);
         match chars.peek() {
-            Some(&'+') => { chars.next(); result += eval_term(chars)?; }
-            Some(&'-') => { chars.next(); result -= eval_term(chars)?; }
+            Some(&'+') => {
+                chars.next();
+                result += eval_term(chars)?;
+            }
+            Some(&'-') => {
+                chars.next();
+                result -= eval_term(chars)?;
+            }
             _ => break,
         }
     }
@@ -795,17 +1001,24 @@ fn eval_term(chars: &mut std::iter::Peekable<std::str::Chars>) -> Result<f64, St
     loop {
         skip_spaces(chars);
         match chars.peek() {
-            Some(&'*') => { chars.next(); result *= eval_power(chars)?; }
+            Some(&'*') => {
+                chars.next();
+                result *= eval_power(chars)?;
+            }
             Some(&'/') => {
                 chars.next();
                 let divisor = eval_power(chars)?;
-                if divisor == 0.0 { return Err("division by zero".into()); }
+                if divisor == 0.0 {
+                    return Err("division by zero".into());
+                }
                 result /= divisor;
             }
             Some(&'%') => {
                 chars.next();
                 let divisor = eval_power(chars)?;
-                if divisor == 0.0 { return Err("modulo by zero".into()); }
+                if divisor == 0.0 {
+                    return Err("modulo by zero".into());
+                }
                 result %= divisor;
             }
             _ => break,
@@ -873,7 +1086,9 @@ fn eval_atom(chars: &mut std::iter::Peekable<std::str::Chars>) -> Result<f64, St
                     chars.next();
                     let arg = eval_expr(chars)?;
                     skip_spaces(chars);
-                    if chars.peek() == Some(&')') { chars.next(); }
+                    if chars.peek() == Some(&')') {
+                        chars.next();
+                    }
                     return match name_lower.as_str() {
                         "sqrt" => Ok(arg.sqrt()),
                         "abs" => Ok(arg.abs()),
@@ -909,11 +1124,15 @@ fn eval_atom(chars: &mut std::iter::Peekable<std::str::Chars>) -> Result<f64, St
     if num_str.is_empty() {
         return Err("expected number".into());
     }
-    num_str.parse::<f64>().map_err(|_| format!("invalid number: {num_str}"))
+    num_str
+        .parse::<f64>()
+        .map_err(|_| format!("invalid number: {num_str}"))
 }
 
 fn skip_spaces(chars: &mut std::iter::Peekable<std::str::Chars>) {
-    while chars.peek() == Some(&' ') { chars.next(); }
+    while chars.peek() == Some(&' ') {
+        chars.next();
+    }
 }
 
 pub fn register(reg: &ToolRegistry) {
@@ -1028,7 +1247,9 @@ pub fn register(reg: &ToolRegistry) {
             ],
         }, Arc::new(Calculate)),
     ];
-    for (def, handler) in tools { reg.register(def, handler); }
+    for (def, handler) in tools {
+        reg.register(def, handler);
+    }
 }
 
 #[cfg(test)]

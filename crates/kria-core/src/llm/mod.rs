@@ -1,15 +1,15 @@
-pub mod local;
 pub mod cloud;
-pub mod model_router;
+pub mod local;
 pub mod model_manager;
+pub mod model_router;
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use futures::Stream;
+use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 
-pub use model_router::ModelRouter;
 pub use model_manager::ModelManager;
+pub use model_router::ModelRouter;
 
 /// A chat message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +91,75 @@ pub struct ToolSchema {
     pub parameters: serde_json::Value,
 }
 
+/// Extract human-readable text from OpenAI-compatible `content` values.
+/// Handles string, object, and array-part formats returned by different providers.
+pub fn extract_openai_content_text(content: &serde_json::Value) -> String {
+    match content {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(parts) => {
+            let mut chunks: Vec<String> = Vec::new();
+            for part in parts {
+                let piece = extract_openai_content_text(part);
+                if !piece.trim().is_empty() {
+                    chunks.push(piece);
+                }
+            }
+            chunks.join("\n")
+        }
+        serde_json::Value::Object(map) => {
+            if let Some(v) = map.get("text") {
+                return extract_openai_content_text(v);
+            }
+            if let Some(v) = map.get("content") {
+                return extract_openai_content_text(v);
+            }
+            if let Some(v) = map.get("value") {
+                return extract_openai_content_text(v);
+            }
+            if let Some(v) = map.get("output_text") {
+                return extract_openai_content_text(v);
+            }
+            if let Some(v) = map.get("input_text") {
+                return extract_openai_content_text(v);
+            }
+            String::new()
+        }
+        _ => String::new(),
+    }
+}
+
+/// Extract text from `choice.message` object across provider variants.
+pub fn extract_openai_message_text(message: &serde_json::Value) -> String {
+    extract_openai_content_text(&message["content"])
+}
+
+/// Extract tool calls from `choice.message` across provider variants.
+/// Supports modern `tool_calls` and legacy `function_call` fields.
+pub fn extract_openai_tool_calls(message: &serde_json::Value) -> Option<Vec<serde_json::Value>> {
+    if let Some(arr) = message.get("tool_calls").and_then(|v| v.as_array()) {
+        if !arr.is_empty() {
+            return Some(arr.clone());
+        }
+    }
+
+    if let Some(fc) = message.get("function_call") {
+        let name = fc.get("name").and_then(|v| v.as_str())?;
+        let args = fc
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!("{}"));
+        return Some(vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": args,
+            }
+        })]);
+    }
+
+    None
+}
+
 /// Trait for all LLM backends (local and cloud).
 #[async_trait]
 pub trait LlmBackend: Send + Sync {
@@ -127,32 +196,172 @@ pub const TOOL_RESULT_MAX_CHARS: usize = 3000;
 
 /// Trim messages to fit context window.
 ///
-/// Attempt 0: compress tool-result messages to 500 chars.
-/// Attempt 1+: drop 2 oldest non-system messages.
+/// Attempt 0: compress tool-result and very large messages.
+/// Attempt 1: keep only the latest 8 non-system messages and shorten the system prompt.
+/// Attempt 2+: keep only the latest 3 non-system messages and a minimal system prompt.
 pub fn trim_messages_for_context(messages: &[ChatMessage], attempt: usize) -> Vec<ChatMessage> {
-    let mut result = messages.to_vec();
-
-    if attempt == 0 {
-        // Stage 1: compress large tool results
-        for msg in &mut result {
-            if msg.role == "tool" && msg.content.len() > 500 {
-                msg.content = format!("{}...<truncated>", &msg.content[..500]);
-            }
-        }
-    } else {
-        // Stage 2: drop oldest non-system messages
-        let system_count = result.iter().filter(|m| m.role == "system").count();
-        let drop_count = 2.min(result.len().saturating_sub(system_count + 2));
-        let mut dropped = 0;
-        result.retain(|m| {
-            if m.role == "system" || dropped >= drop_count {
-                true
-            } else {
-                dropped += 1;
-                false
-            }
-        });
+    if messages.is_empty() {
+        return Vec::new();
     }
 
-    result
+    match attempt {
+        0 => {
+            // Stage 1: compress large tool results and oversized messages while
+            // preserving full turn history shape.
+            messages
+                .iter()
+                .map(|m| {
+                    let mut msg = m.clone();
+                    if msg.role == "tool" {
+                        msg.content =
+                            truncate_with_suffix(&msg.content, 500, "...<tool-truncated>");
+                    } else {
+                        msg.content = truncate_with_suffix(&msg.content, 1800, "...<truncated>");
+                    }
+                    msg
+                })
+                .collect()
+        }
+        1 => {
+            // Stage 2: keep the latest conversation turns and compact the system prompt.
+            let mut systems: Vec<ChatMessage> = messages
+                .iter()
+                .filter(|m| m.role == "system")
+                .cloned()
+                .collect();
+            if let Some(first) = systems.first_mut() {
+                first.content = minimal_system_prompt();
+            }
+
+            let mut non_system: Vec<ChatMessage> = messages
+                .iter()
+                .filter(|m| m.role != "system")
+                .cloned()
+                .collect();
+            if non_system.len() > 8 {
+                non_system = non_system.split_off(non_system.len() - 8);
+            }
+            for msg in &mut non_system {
+                let max_chars = if msg.role == "tool" { 350 } else { 900 };
+                let suffix = if msg.role == "tool" {
+                    "...<tool-truncated>"
+                } else {
+                    "...<truncated>"
+                };
+                msg.content = truncate_with_suffix(&msg.content, max_chars, suffix);
+            }
+
+            systems.into_iter().chain(non_system.into_iter()).collect()
+        }
+        _ => {
+            // Stage 3: emergency context fit — keep minimal instruction and only
+            // the newest few turns.
+            let mut out = Vec::new();
+            out.push(ChatMessage {
+                role: "system".into(),
+                content: minimal_system_prompt(),
+                name: None,
+                images: None,
+            });
+
+            let mut non_system: Vec<ChatMessage> = messages
+                .iter()
+                .filter(|m| m.role != "system")
+                .cloned()
+                .collect();
+            if non_system.len() > 3 {
+                non_system = non_system.split_off(non_system.len() - 3);
+            }
+            for msg in &mut non_system {
+                let max_chars = if msg.role == "tool" { 240 } else { 700 };
+                let suffix = if msg.role == "tool" {
+                    "...<tool-truncated>"
+                } else {
+                    "...<truncated>"
+                };
+                msg.content = truncate_with_suffix(&msg.content, max_chars, suffix);
+            }
+            out.extend(non_system);
+            out
+        }
+    }
+}
+
+fn truncate_with_suffix(text: &str, max_chars: usize, suffix: &str) -> String {
+    let len = text.chars().count();
+    if len <= max_chars {
+        return text.to_string();
+    }
+
+    let suffix_chars = suffix.chars().count();
+    let keep = max_chars.saturating_sub(suffix_chars).max(1);
+    let mut s: String = text.chars().take(keep).collect();
+    s.push_str(suffix);
+    s
+}
+
+fn minimal_system_prompt() -> String {
+    "You are KRIA. Be concise, accurate, and safe. Use available tools when the user asks for live/current information (especially news or web lookup) instead of claiming no real-time access. Avoid repeating unchanged context.".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        extract_openai_content_text, extract_openai_tool_calls, trim_messages_for_context,
+    };
+    use crate::llm::ChatMessage;
+
+    #[test]
+    fn extract_content_text_handles_string_and_parts() {
+        let plain = serde_json::json!("hello world");
+        assert_eq!(extract_openai_content_text(&plain), "hello world");
+
+        let parts = serde_json::json!([
+            {"type": "text", "text": "first"},
+            {"type": "text", "text": "second"}
+        ]);
+        assert_eq!(extract_openai_content_text(&parts), "first\nsecond");
+    }
+
+    #[test]
+    fn extract_tool_calls_supports_legacy_function_call() {
+        let msg = serde_json::json!({
+            "function_call": {
+                "name": "analyze_image",
+                "arguments": "{\"path\":\"/tmp/a.png\"}"
+            }
+        });
+
+        let calls = extract_openai_tool_calls(&msg).expect("tool calls expected");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "analyze_image");
+    }
+
+    #[test]
+    fn trim_attempt_two_keeps_minimal_context() {
+        let mut msgs = Vec::new();
+        msgs.push(ChatMessage {
+            role: "system".into(),
+            content: "very long system prompt".repeat(40),
+            name: None,
+            images: None,
+        });
+        for i in 0..8 {
+            msgs.push(ChatMessage {
+                role: if i % 2 == 0 {
+                    "user".into()
+                } else {
+                    "assistant".into()
+                },
+                content: format!("message {i} {}", "x".repeat(1200)),
+                name: None,
+                images: None,
+            });
+        }
+
+        let trimmed = trim_messages_for_context(&msgs, 2);
+        assert_eq!(trimmed[0].role, "system");
+        assert!(trimmed.len() <= 4, "should keep system + latest few turns");
+        assert!(trimmed[0].content.contains("You are KRIA"));
+    }
 }

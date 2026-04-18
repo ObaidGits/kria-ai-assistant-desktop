@@ -1,10 +1,13 @@
+use crate::llm::{
+    extract_openai_content_text, extract_openai_message_text, extract_openai_tool_calls,
+    ChatMessage, LlmBackend, LlmResponse, TokenUsage, ToolSchema,
+};
 use async_trait::async_trait;
 use futures::Stream;
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use std::collections::VecDeque;
-use crate::llm::{ChatMessage, LlmResponse, LlmBackend, ToolSchema, TokenUsage};
 
 /// Cloud LLM backend via OpenAI-compatible API (Gemini, GPT, Claude, Groq, OpenRouter).
 pub struct CloudBackend {
@@ -113,16 +116,19 @@ impl LlmBackend for CloudBackend {
 
         if let Some(t) = tools {
             if !t.is_empty() {
-                let tool_defs: Vec<serde_json::Value> = t.iter().map(|ts| {
-                    serde_json::json!({
-                        "type": "function",
-                        "function": {
-                            "name": ts.name,
-                            "description": ts.description,
-                            "parameters": ts.parameters,
-                        }
+                let tool_defs: Vec<serde_json::Value> = t
+                    .iter()
+                    .map(|ts| {
+                        serde_json::json!({
+                            "type": "function",
+                            "function": {
+                                "name": ts.name,
+                                "description": ts.description,
+                                "parameters": ts.parameters,
+                            }
+                        })
                     })
-                }).collect();
+                    .collect();
                 payload["tools"] = serde_json::Value::Array(tool_defs);
             }
         }
@@ -130,7 +136,8 @@ impl LlmBackend for CloudBackend {
         let url = format!("{}/chat/completions", self.endpoint);
 
         for attempt in 0..3 {
-            let resp = self.client
+            let resp = self
+                .client
                 .post(&url)
                 .bearer_auth(&self.api_key)
                 .json(&payload)
@@ -148,11 +155,9 @@ impl LlmBackend for CloudBackend {
             let body: serde_json::Value = resp.error_for_status()?.json().await?;
 
             let choice = &body["choices"][0];
-            let content = choice["message"]["content"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-            let tool_calls = choice["message"]["tool_calls"].as_array().cloned();
+            let message = &choice["message"];
+            let content = extract_openai_message_text(message);
+            let tool_calls = extract_openai_tool_calls(message);
 
             let usage = body["usage"].as_object().map(|u| TokenUsage {
                 prompt_tokens: u["prompt_tokens"].as_u64().unwrap_or(0) as u32,
@@ -192,22 +197,26 @@ impl LlmBackend for CloudBackend {
 
         if let Some(t) = tools {
             if !t.is_empty() {
-                let tool_defs: Vec<serde_json::Value> = t.iter().map(|ts| {
-                    serde_json::json!({
-                        "type": "function",
-                        "function": {
-                            "name": ts.name,
-                            "description": ts.description,
-                            "parameters": ts.parameters,
-                        }
+                let tool_defs: Vec<serde_json::Value> = t
+                    .iter()
+                    .map(|ts| {
+                        serde_json::json!({
+                            "type": "function",
+                            "function": {
+                                "name": ts.name,
+                                "description": ts.description,
+                                "parameters": ts.parameters,
+                            }
+                        })
                     })
-                }).collect();
+                    .collect();
                 payload["tools"] = serde_json::Value::Array(tool_defs);
             }
         }
 
         let url = format!("{}/chat/completions", self.endpoint);
-        let resp = self.client
+        let resp = self
+            .client
             .post(&url)
             .bearer_auth(&self.api_key)
             .json(&payload)
@@ -222,10 +231,14 @@ impl LlmBackend for CloudBackend {
                     let mut tokens = String::new();
                     for line in text.lines() {
                         if let Some(data) = line.strip_prefix("data: ") {
-                            if data == "[DONE]" { continue; }
+                            if data == "[DONE]" {
+                                continue;
+                            }
                             if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
-                                if let Some(tok) = v["choices"][0]["delta"]["content"].as_str() {
-                                    tokens.push_str(tok);
+                                let delta_content = &v["choices"][0]["delta"]["content"];
+                                let tok = extract_openai_content_text(delta_content);
+                                if !tok.is_empty() {
+                                    tokens.push_str(&tok);
                                 }
                             }
                         }

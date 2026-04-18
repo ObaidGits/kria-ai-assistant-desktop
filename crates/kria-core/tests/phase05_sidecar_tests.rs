@@ -1,10 +1,10 @@
 //! Phase 0.5 integration tests — Sidecar Bridge & Pre-Cognitive tools.
 
-use kria_core::sidecar::protocol::{JsonRpcRequest, JsonRpcResponse};
 use kria_core::sidecar::health::SidecarHealth;
+use kria_core::sidecar::protocol::{JsonRpcRequest, JsonRpcResponse};
 use kria_core::sidecar::SidecarBridge;
-use kria_core::tools::registry;
 use kria_core::tools::precognitive;
+use kria_core::tools::registry;
 use std::sync::Arc;
 
 // ── Protocol Tests ──────────────────────────────────────────
@@ -96,7 +96,11 @@ fn precognitive_tools_register_into_registry() {
     let bridge = Arc::new(SidecarBridge::new("python3", None));
     precognitive::register(&mut registry, bridge);
 
-    assert_eq!(registry.len(), base_count + 6, "Should add 6 precognitive tools");
+    assert_eq!(
+        registry.len(),
+        base_count + 6,
+        "Should add 6 precognitive tools"
+    );
 
     // Verify each tool exists
     assert!(registry.get_def("image_analyze").is_some());
@@ -139,14 +143,18 @@ fn precognitive_tools_generate_function_schemas() {
 
     let schemas = registry.function_schemas("standard");
     let precog_names: Vec<&str> = vec![
-        "image_analyze", "document_extract", "code_analyze_ast",
-        "web_extract_article", "embeddings_generate", "audio_preprocess",
+        "image_analyze",
+        "document_extract",
+        "code_analyze_ast",
+        "web_extract_article",
+        "embeddings_generate",
+        "audio_preprocess",
     ];
 
     for name in precog_names {
-        let found = schemas.iter().any(|s| {
-            s["function"]["name"].as_str() == Some(name)
-        });
+        let found = schemas
+            .iter()
+            .any(|s| s["function"]["name"].as_str() == Some(name));
         assert!(found, "Schema missing for {}", name);
     }
 }
@@ -160,10 +168,19 @@ fn precognitive_tools_tier_filtering() {
     // "lite" tier should see document_extract and code_analyze_ast (min_tier: "lite")
     let lite_tools = registry.list_for_tier("lite");
     let lite_names: Vec<&str> = lite_tools.iter().map(|d| d.name.as_str()).collect();
-    assert!(lite_names.contains(&"document_extract"), "document_extract should be available on lite");
-    assert!(lite_names.contains(&"code_analyze_ast"), "code_analyze_ast should be available on lite");
+    assert!(
+        lite_names.contains(&"document_extract"),
+        "document_extract should be available on lite"
+    );
+    assert!(
+        lite_names.contains(&"code_analyze_ast"),
+        "code_analyze_ast should be available on lite"
+    );
     // image_analyze requires "standard"
-    assert!(!lite_names.contains(&"image_analyze"), "image_analyze should NOT be on lite");
+    assert!(
+        !lite_names.contains(&"image_analyze"),
+        "image_analyze should NOT be on lite"
+    );
 
     // "standard" tier should see all 6
     let standard_tools = registry.list_for_tier("standard");

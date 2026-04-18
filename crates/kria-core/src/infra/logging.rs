@@ -1,11 +1,12 @@
 use std::path::Path;
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use tracing_appender::rolling;
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 /// Initialize logging with console + rotating JSON file output.
 pub fn setup_logging(log_dir: &Path) {
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,kria_core=debug,kria_desktop=debug,kria_server=debug"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new("info,kria_core=debug,kria_desktop=debug,kria_server=debug")
+    });
 
     // Console layer: compact single-line
     let console_layer = fmt::layer()

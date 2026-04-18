@@ -1,7 +1,7 @@
 pub mod bridge;
-pub mod protocol;
 pub mod health;
+pub mod protocol;
 
 pub use bridge::SidecarBridge;
-pub use protocol::{JsonRpcRequest, JsonRpcResponse};
 pub use health::SidecarHealth;
+pub use protocol::{JsonRpcRequest, JsonRpcResponse};

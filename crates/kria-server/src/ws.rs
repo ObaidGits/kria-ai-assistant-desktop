@@ -1,19 +1,18 @@
+use crate::ServerState;
 use axum::{
-    Router,
     extract::{
-        State,
         ws::{Message, WebSocket, WebSocketUpgrade},
+        State,
     },
     response::IntoResponse,
     routing::get,
+    Router,
 };
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
-use crate::ServerState;
 
 pub fn ws_routes() -> Router<Arc<ServerState>> {
-    Router::new()
-        .route("/ws", get(ws_handler))
+    Router::new().route("/ws", get(ws_handler))
 }
 
 async fn ws_handler(
@@ -31,7 +30,11 @@ async fn handle_socket(socket: WebSocket, _state: Arc<ServerState>) {
         "type": "connected",
         "version": env!("CARGO_PKG_VERSION"),
     });
-    if sender.send(Message::Text(welcome.to_string().into())).await.is_err() {
+    if sender
+        .send(Message::Text(welcome.to_string().into()))
+        .await
+        .is_err()
+    {
         return;
     }
 
@@ -42,15 +45,15 @@ async fn handle_socket(socket: WebSocket, _state: Arc<ServerState>) {
                 let parsed: Result<serde_json::Value, _> = serde_json::from_str(&text);
                 match parsed {
                     Ok(val) => {
-                        let msg_type = val.get("type")
+                        let msg_type = val
+                            .get("type")
                             .and_then(|t| t.as_str())
                             .unwrap_or("unknown");
 
                         match msg_type {
                             "chat" => {
-                                let user_msg = val.get("message")
-                                    .and_then(|m| m.as_str())
-                                    .unwrap_or("");
+                                let user_msg =
+                                    val.get("message").and_then(|m| m.as_str()).unwrap_or("");
 
                                 // Stream agent response events
                                 let ack = serde_json::json!({

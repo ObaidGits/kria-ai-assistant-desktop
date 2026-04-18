@@ -1,27 +1,38 @@
-use std::sync::Arc;
-use async_trait::async_trait;
 use crate::infra::ToolResult;
 use crate::safety::RiskLevel;
-use crate::tools::registry::{ToolRegistry, ToolDef, ToolHandler, ParamDef};
+use crate::tools::registry::{ParamDef, ToolDef, ToolHandler, ToolRegistry};
+use async_trait::async_trait;
+use std::sync::Arc;
 
 fn param(name: &str, ty: &str, desc: &str, required: bool) -> ParamDef {
-    ParamDef { name: name.into(), param_type: ty.into(), description: desc.into(), required, default: None }
+    ParamDef {
+        name: name.into(),
+        param_type: ty.into(),
+        description: desc.into(),
+        required,
+        default: None,
+    }
 }
 
 struct ListScheduledTasks;
-#[async_trait] impl ToolHandler for ListScheduledTasks {
+#[async_trait]
+impl ToolHandler for ListScheduledTasks {
     async fn execute(&self, _params: serde_json::Value) -> ToolResult {
         // List cron jobs for current user + systemd timers
         let cron = tokio::process::Command::new("crontab")
             .arg("-l")
-            .output().await;
+            .output()
+            .await;
         let timers = tokio::process::Command::new("systemctl")
             .args(["--user", "list-timers", "--no-pager"])
-            .output().await;
+            .output()
+            .await;
 
-        let cron_text = cron.map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        let cron_text = cron
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
             .unwrap_or_default();
-        let timers_text = timers.map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        let timers_text = timers
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
             .unwrap_or_default();
 
         ToolResult::ok(serde_json::json!({
@@ -32,7 +43,8 @@ struct ListScheduledTasks;
 }
 
 struct CreateScheduledTask;
-#[async_trait] impl ToolHandler for CreateScheduledTask {
+#[async_trait]
+impl ToolHandler for CreateScheduledTask {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
         let schedule = params["schedule"].as_str().unwrap_or("");
         let command = params["command"].as_str().unwrap_or("");
@@ -40,7 +52,8 @@ struct CreateScheduledTask;
         // Add to crontab
         let existing = tokio::process::Command::new("crontab")
             .arg("-l")
-            .output().await
+            .output()
+            .await
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
             .unwrap_or_default();
 
@@ -75,16 +88,19 @@ struct CreateScheduledTask;
 }
 
 struct DeleteScheduledTask;
-#[async_trait] impl ToolHandler for DeleteScheduledTask {
+#[async_trait]
+impl ToolHandler for DeleteScheduledTask {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
         let pattern = params["pattern"].as_str().unwrap_or("");
         let existing = tokio::process::Command::new("crontab")
             .arg("-l")
-            .output().await
+            .output()
+            .await
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
             .unwrap_or_default();
 
-        let filtered: String = existing.lines()
+        let filtered: String = existing
+            .lines()
             .filter(|l| !l.contains(pattern))
             .collect::<Vec<_>>()
             .join("\n");
@@ -118,24 +134,54 @@ struct DeleteScheduledTask;
 
 pub fn register(reg: &ToolRegistry) {
     let tools: Vec<(ToolDef, Arc<dyn ToolHandler>)> = vec![
-        (ToolDef {
-            name: "list_scheduled_tasks".into(), description: "List cron jobs and systemd timers".into(),
-            category: "scheduler".into(), default_tier: RiskLevel::Green, min_tier: "lite",
-            parameters: vec![],
-        }, Arc::new(ListScheduledTasks)),
-        (ToolDef {
-            name: "create_scheduled_task".into(), description: "Create a cron job or scheduled task".into(),
-            category: "scheduler".into(), default_tier: RiskLevel::Red, min_tier: "standard",
-            parameters: vec![
-                param("schedule", "string", "Cron schedule (e.g. '0 * * * *')", true),
-                param("command", "string", "Command to run", true),
-            ],
-        }, Arc::new(CreateScheduledTask)),
-        (ToolDef {
-            name: "delete_scheduled_task".into(), description: "Delete a cron job by pattern".into(),
-            category: "scheduler".into(), default_tier: RiskLevel::Red, min_tier: "standard",
-            parameters: vec![param("pattern", "string", "Text pattern to match in cron entry", true)],
-        }, Arc::new(DeleteScheduledTask)),
+        (
+            ToolDef {
+                name: "list_scheduled_tasks".into(),
+                description: "List cron jobs and systemd timers".into(),
+                category: "scheduler".into(),
+                default_tier: RiskLevel::Green,
+                min_tier: "lite",
+                parameters: vec![],
+            },
+            Arc::new(ListScheduledTasks),
+        ),
+        (
+            ToolDef {
+                name: "create_scheduled_task".into(),
+                description: "Create a cron job or scheduled task".into(),
+                category: "scheduler".into(),
+                default_tier: RiskLevel::Red,
+                min_tier: "standard",
+                parameters: vec![
+                    param(
+                        "schedule",
+                        "string",
+                        "Cron schedule (e.g. '0 * * * *')",
+                        true,
+                    ),
+                    param("command", "string", "Command to run", true),
+                ],
+            },
+            Arc::new(CreateScheduledTask),
+        ),
+        (
+            ToolDef {
+                name: "delete_scheduled_task".into(),
+                description: "Delete a cron job by pattern".into(),
+                category: "scheduler".into(),
+                default_tier: RiskLevel::Red,
+                min_tier: "standard",
+                parameters: vec![param(
+                    "pattern",
+                    "string",
+                    "Text pattern to match in cron entry",
+                    true,
+                )],
+            },
+            Arc::new(DeleteScheduledTask),
+        ),
     ];
-    for (def, handler) in tools { reg.register(def, handler); }
+    for (def, handler) in tools {
+        reg.register(def, handler);
+    }
 }

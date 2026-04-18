@@ -30,7 +30,13 @@ const App: Component = () => {
 
   const assistantStatus = createMemo(() => appStore.assistantStatus());
   const connectedMcpServers = createMemo(
-    () => appStore.mcpServers().filter((server) => server.enabled).length
+    () => appStore
+      .mcpServers()
+      .filter((server) => {
+        const runtimeState = String(server.runtime_state ?? (server.enabled ? "running" : "stopped")).toLowerCase();
+        return runtimeState === "running";
+      })
+      .length
   );
   const statusDotClass = createMemo(() => {
     const state = assistantStatus().state;
@@ -41,6 +47,23 @@ const App: Component = () => {
       : state === "degraded"
       ? "status-dot degraded"
       : "status-dot disconnected";
+  });
+
+  const ocrStartupWarning = createMemo(() => {
+    const info = appStore.healthInfo();
+    const services = Array.isArray(info?.services) ? info!.services : [];
+    const ocrSvc = services.find((svc: any) => svc?.name === "ocr_dependency");
+    if (!ocrSvc) return null;
+
+    const status = String(ocrSvc.status ?? "").toLowerCase();
+    if (status === "degraded" || status === "unhealthy" || status === "stopped") {
+        return String(
+          ocrSvc.message ||
+          "OCR dependency is unavailable. Vision analysis still works, but text extraction quality may be reduced."
+        );
+    }
+
+    return null;
   });
 
   const shortcuts: { key: string; desc: string }[] = [
@@ -111,6 +134,11 @@ const App: Component = () => {
               <div class="status-pill subtle">{appStore.alerts().length} active alerts</div>
             </div>
           </div>
+          <Show when={ocrStartupWarning()}>
+            <div class="startup-warning-banner">
+              <strong>OCR Warning:</strong> {ocrStartupWarning()}
+            </div>
+          </Show>
           <ChatView />
           <div class="status-bar">
             <div class="status-item">

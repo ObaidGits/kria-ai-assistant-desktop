@@ -5,9 +5,9 @@
 //! and decay pruning.
 
 use chrono::Utc;
+use kria_core::memory::embeddings::EmbeddingModel;
 use kria_core::memory::store::{ConversationTurn, MemoryFact, MemoryStore};
 use kria_core::memory::vectors::VectorIndex;
-use kria_core::memory::embeddings::EmbeddingModel;
 use std::path::Path;
 
 // ── MemoryStore — conversation turns ────────────────────────────────
@@ -42,8 +42,12 @@ fn make_fact(text: &str, category: &str) -> MemoryFact {
 fn store_and_retrieve_conversation_turns() {
     let store = MemoryStore::open(Path::new(":memory:")).unwrap();
 
-    store.store_turn(&make_turn("sess-1", "user", "Hello KRIA")).unwrap();
-    store.store_turn(&make_turn("sess-1", "assistant", "Hi there!")).unwrap();
+    store
+        .store_turn(&make_turn("sess-1", "user", "Hello KRIA"))
+        .unwrap();
+    store
+        .store_turn(&make_turn("sess-1", "assistant", "Hi there!"))
+        .unwrap();
 
     let turns = store.get_recent_turns("sess-1", 10).unwrap();
     assert_eq!(turns.len(), 2);
@@ -57,7 +61,9 @@ fn get_recent_turns_respects_limit() {
     let store = MemoryStore::open(Path::new(":memory:")).unwrap();
 
     for i in 0..20 {
-        store.store_turn(&make_turn("sess-2", "user", &format!("msg {i}"))).unwrap();
+        store
+            .store_turn(&make_turn("sess-2", "user", &format!("msg {i}")))
+            .unwrap();
     }
 
     let turns = store.get_recent_turns("sess-2", 5).unwrap();
@@ -68,8 +74,12 @@ fn get_recent_turns_respects_limit() {
 fn list_sessions_returns_stored_sessions() {
     let store = MemoryStore::open(Path::new(":memory:")).unwrap();
 
-    store.store_turn(&make_turn("sess-a", "user", "hello")).unwrap();
-    store.store_turn(&make_turn("sess-b", "user", "world")).unwrap();
+    store
+        .store_turn(&make_turn("sess-a", "user", "hello"))
+        .unwrap();
+    store
+        .store_turn(&make_turn("sess-b", "user", "world"))
+        .unwrap();
 
     let sessions = store.list_sessions().unwrap();
     assert!(sessions.len() >= 2);
@@ -79,7 +89,9 @@ fn list_sessions_returns_stored_sessions() {
 fn delete_session_removes_all_turns() {
     let store = MemoryStore::open(Path::new(":memory:")).unwrap();
 
-    store.store_turn(&make_turn("sess-del", "user", "bye")).unwrap();
+    store
+        .store_turn(&make_turn("sess-del", "user", "bye"))
+        .unwrap();
     store.delete_session("sess-del").unwrap();
 
     let turns = store.get_recent_turns("sess-del", 10).unwrap();
@@ -92,8 +104,12 @@ fn delete_session_removes_all_turns() {
 fn store_and_search_facts() {
     let store = MemoryStore::open(Path::new(":memory:")).unwrap();
 
-    store.store_fact(&make_fact("Rust was created by Mozilla", "tech")).unwrap();
-    store.store_fact(&make_fact("The user prefers dark themes", "preference")).unwrap();
+    store
+        .store_fact(&make_fact("Rust was created by Mozilla", "tech"))
+        .unwrap();
+    store
+        .store_fact(&make_fact("The user prefers dark themes", "preference"))
+        .unwrap();
 
     let results = store.search_facts("Rust", 10).unwrap();
     assert!(!results.is_empty());

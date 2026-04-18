@@ -8,7 +8,11 @@ fn desktop_tools_registered() {
     use kria_core::tools::registry::build_default_registry;
     let reg = build_default_registry();
     let desktop_tools = reg.list_by_category("desktop");
-    assert!(desktop_tools.len() >= 8, "expected at least 8 desktop tools, got {}", desktop_tools.len());
+    assert!(
+        desktop_tools.len() >= 8,
+        "expected at least 8 desktop tools, got {}",
+        desktop_tools.len()
+    );
 }
 
 #[test]
@@ -83,7 +87,9 @@ async fn open_url_rejects_non_http() {
     use kria_core::tools::registry::build_default_registry;
     let reg = build_default_registry();
     let handler = reg.get_handler("open_url").unwrap();
-    let result = handler.execute(serde_json::json!({"url": "file:///etc/passwd"})).await;
+    let result = handler
+        .execute(serde_json::json!({"url": "file:///etc/passwd"}))
+        .await;
     assert!(!result.success);
 }
 
@@ -92,7 +98,9 @@ async fn open_url_rejects_javascript() {
     use kria_core::tools::registry::build_default_registry;
     let reg = build_default_registry();
     let handler = reg.get_handler("open_url").unwrap();
-    let result = handler.execute(serde_json::json!({"url": "javascript:alert(1)"})).await;
+    let result = handler
+        .execute(serde_json::json!({"url": "javascript:alert(1)"}))
+        .await;
     assert!(!result.success);
 }
 
@@ -103,7 +111,9 @@ async fn tile_windows_requires_two() {
     use kria_core::tools::registry::build_default_registry;
     let reg = build_default_registry();
     let handler = reg.get_handler("tile_windows").unwrap();
-    let result = handler.execute(serde_json::json!({"windows": ["one"], "layout": "side-by-side"})).await;
+    let result = handler
+        .execute(serde_json::json!({"windows": ["one"], "layout": "side-by-side"}))
+        .await;
     assert!(!result.success);
     assert!(result.error.unwrap_or_default().contains("at least 2"));
 }
@@ -115,7 +125,10 @@ fn desktop_tools_standard_tier() {
     use kria_core::tools::registry::build_default_registry;
     let reg = build_default_registry();
     // Most window tools require at least standard tier
-    assert_eq!(reg.get_def("get_active_window").unwrap().min_tier, "standard");
+    assert_eq!(
+        reg.get_def("get_active_window").unwrap().min_tier,
+        "standard"
+    );
     assert_eq!(reg.get_def("list_windows").unwrap().min_tier, "standard");
     assert_eq!(reg.get_def("move_window").unwrap().min_tier, "standard");
     // open_url is available on all tiers
@@ -141,5 +154,9 @@ fn total_tools_include_desktop() {
     use kria_core::tools::registry::build_default_registry;
     let reg = build_default_registry();
     // We had 60+ tools before, now we should have 8 more
-    assert!(reg.len() >= 68, "expected at least 68 tools, got {}", reg.len());
+    assert!(
+        reg.len() >= 68,
+        "expected at least 68 tools, got {}",
+        reg.len()
+    );
 }

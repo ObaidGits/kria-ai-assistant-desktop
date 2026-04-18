@@ -1,9 +1,9 @@
-use std::sync::Arc;
-use std::collections::HashMap;
-use async_trait::async_trait;
 use crate::infra::ToolResult;
 use crate::safety::RiskLevel;
-use crate::tools::registry::{ToolRegistry, ToolDef, ToolHandler, ParamDef};
+use crate::tools::registry::{ParamDef, ToolDef, ToolHandler, ToolRegistry};
+use async_trait::async_trait;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 // ─── Built-in translation dictionaries (lightweight, no LLM needed) ───
 

@@ -18,15 +18,10 @@ impl WebProcessor {
         let doc = scraper::Html::parse_document(html);
 
         // Remove script and style elements by skipping them
-        let text: String = doc.root_element()
-            .text()
-            .collect::<Vec<_>>()
-            .join(" ");
+        let text: String = doc.root_element().text().collect::<Vec<_>>().join(" ");
 
         // Normalize whitespace
-        text.split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
     /// Extract all links from HTML.

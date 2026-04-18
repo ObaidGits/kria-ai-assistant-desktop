@@ -1,6 +1,6 @@
-use std::collections::HashSet;
 use once_cell::sync::Lazy;
 use regex::Regex;
+use std::collections::HashSet;
 
 use crate::safety::blacklist::BlacklistChecker;
 
@@ -45,96 +45,192 @@ pub struct PolicyDecision {
 static GREEN_ACTIONS: Lazy<HashSet<&str>> = Lazy::new(|| {
     [
         // App Control
-        "open_application", "list_running_apps", "focus_window",
+        "open_application",
+        "list_running_apps",
+        "focus_window",
         // System Info (read-only)
-        "get_cpu_usage", "get_memory_info", "get_disk_space", "get_network_status",
-        "get_battery_status", "get_gpu_info", "get_system_uptime",
+        "get_cpu_usage",
+        "get_memory_info",
+        "get_disk_space",
+        "get_network_status",
+        "get_battery_status",
+        "get_gpu_info",
+        "get_system_uptime",
         // File Reading
-        "read_file", "search_files", "list_directory", "get_file_info", "calculate_dir_size",
-        "search_file_contents", "find_files_by_pattern", "get_project_structure",
-        "count_lines_of_code", "diff_files", "find_todos", "analyze_code",
+        "read_file",
+        "search_files",
+        "list_directory",
+        "get_file_info",
+        "calculate_dir_size",
+        "search_file_contents",
+        "find_files_by_pattern",
+        "get_project_structure",
+        "count_lines_of_code",
+        "diff_files",
+        "find_todos",
+        "analyze_code",
         // Document Parsing
-        "parse_pdf", "parse_docx", "parse_xlsx", "parse_csv", "summarize_document",
+        "parse_pdf",
+        "parse_docx",
+        "parse_xlsx",
+        "parse_csv",
+        "summarize_document",
         "parse_document",
         // Internet (read-only)
-        "web_search", "fetch_webpage", "get_weather", "get_news", "get_stock_price",
-        "check_url_status", "rss_feed_read", "get_public_ip",
-        "searxng_search", "duckduckgo_search",
-        "get_current_time", "get_exchange_rate", "calculate",
+        "web_search",
+        "fetch_webpage",
+        "get_weather",
+        "get_news",
+        "get_stock_price",
+        "check_url_status",
+        "rss_feed_read",
+        "get_public_ip",
+        "searxng_search",
+        "duckduckgo_search",
+        "get_current_time",
+        "get_exchange_rate",
+        "calculate",
         // Network Diagnostics
-        "ping_host", "dns_lookup", "traceroute", "get_active_connections",
-        "get_wifi_networks", "speed_test",
+        "ping_host",
+        "dns_lookup",
+        "traceroute",
+        "get_active_connections",
+        "get_wifi_networks",
+        "speed_test",
         // Clipboard (read)
-        "get_clipboard", "clipboard_history", "transform_clipboard",
+        "get_clipboard",
+        "clipboard_history",
+        "transform_clipboard",
         // UI
-        "screenshot", "lock_screen",
+        "screenshot",
+        "lock_screen",
         // Knowledge (read)
-        "recall_fact", "list_remembered", "search_knowledge", "get_snippet", "list_snippets",
+        "recall_fact",
+        "list_remembered",
+        "search_knowledge",
+        "get_snippet",
+        "list_snippets",
         // Notifications
-        "send_notification", "compose_email", "open_email_draft", "schedule_reminder",
+        "send_notification",
+        "compose_email",
+        "open_email_draft",
+        "schedule_reminder",
         // Automation (read)
-        "list_workflows", "list_scheduled_tasks", "list_macros",
+        "list_workflows",
+        "list_scheduled_tasks",
+        "list_macros",
         // Plugins (read)
         "list_plugins",
         // Memory
-        "remember_fact", "ingest_document", "save_snippet",
+        "remember_fact",
+        "ingest_document",
+        "save_snippet",
         // Environment (read)
-        "get_environment_variable", "list_environment_variables", "get_power_plan",
+        "get_environment_variable",
+        "list_environment_variables",
+        "get_power_plan",
         // Developer (read-only)
-        "git_status", "git_log", "git_diff", "git_branch_list",
-        "analyze_project", "diff_files_unified",
+        "git_status",
+        "git_log",
+        "git_diff",
+        "git_branch_list",
+        "analyze_project",
+        "diff_files_unified",
         // Database (read-only)
-        "query_sqlite", "describe_database",
+        "query_sqlite",
+        "describe_database",
         // RAG (read)
-        "rag_query", "list_knowledge_base",
+        "rag_query",
+        "list_knowledge_base",
         // Proactive (read)
-        "check_system_health", "get_alerts", "dismiss_alert",
-        "list_watched_dirs", "smart_suggest",
+        "check_system_health",
+        "get_alerts",
+        "dismiss_alert",
+        "list_watched_dirs",
+        "smart_suggest",
         // i18n / Accessibility (read)
-        "list_languages", "detect_language", "get_accessibility_settings",
+        "list_languages",
+        "detect_language",
+        "get_accessibility_settings",
         // Desktop (read)
-        "get_active_window", "list_windows",
+        "get_active_window",
+        "list_windows",
         // Vision (read-only analysis)
-        "ocr_image", "analyze_image", "screenshot_analyze",
+        "ocr_image",
+        "analyze_image",
+        "screenshot_analyze",
         // Precognitive (analysis only)
-        "image_analyze", "document_extract", "code_analyze_ast",
-        "web_extract_article", "embeddings_generate", "audio_preprocess",
+        "image_analyze",
+        "document_extract",
+        "code_analyze_ast",
+        "web_extract_article",
+        "embeddings_generate",
+        "audio_preprocess",
         // Misc
-        "open_url", "list_installed_packages",
+        "open_url",
+        "list_installed_packages",
         // Package queries (read-only)
-        "search_package", "check_package_installed", "check_package_updates", "get_package_info",
-        "search_news", "fetch_article", "list_news_sources", "news_status",
+        "search_package",
+        "check_package_installed",
+        "check_package_updates",
+        "get_package_info",
+        "search_news",
+        "fetch_article",
+        "list_news_sources",
+        "news_status",
         // Google Workspace (read-only)
-        "gw_gmail_inbox", "gw_gmail_search", "gw_gmail_read",
-        "gw_calendar_today", "gw_calendar_search",
-        "gw_drive_search", "gw_drive_list", "gw_drive_read",
-        "gw_docs_read", "gw_sheets_read", "gw_slides_read",
-    ].into_iter().collect()
+        "gw_gmail_inbox",
+        "gw_gmail_search",
+        "gw_gmail_read",
+        "gw_calendar_today",
+        "gw_calendar_search",
+        "gw_drive_search",
+        "gw_drive_list",
+        "gw_drive_read",
+        "gw_docs_read",
+        "gw_sheets_read",
+        "gw_slides_read",
+    ]
+    .into_iter()
+    .collect()
 });
 
 // ─── Tier 1: YELLOW (execute + notify) ───
 static YELLOW_ACTIONS: Lazy<HashSet<&str>> = Lazy::new(|| {
     [
         // App Control
-        "close_application", "kill_process",
+        "close_application",
+        "kill_process",
         // System Config
-        "set_volume", "set_brightness", "toggle_wifi", "set_power_plan", "connect_wifi",
+        "set_volume",
+        "set_brightness",
+        "toggle_wifi",
+        "set_power_plan",
+        "connect_wifi",
         // File Modification
-        "write_file", "create_directory", "rename_file", "copy_file",
+        "write_file",
+        "create_directory",
+        "rename_file",
+        "copy_file",
         // Document Conversion
         "convert_document",
         // Internet (write-ish)
         "download_file",
         // Clipboard (write)
-        "set_clipboard", "type_text",
+        "set_clipboard",
+        "type_text",
         // Package
         "update_application",
         // Power
-        "sleep", "hibernate",
+        "sleep",
+        "hibernate",
         // Plugins
-        "enable_plugin", "disable_plugin",
+        "enable_plugin",
+        "disable_plugin",
         // Automation
-        "run_workflow", "record_macro", "replay_macro",
+        "run_workflow",
+        "record_macro",
+        "replay_macro",
         // Developer (non-destructive write)
         "git_stash",
         // RAG (ingest)
@@ -142,46 +238,75 @@ static YELLOW_ACTIONS: Lazy<HashSet<&str>> = Lazy::new(|| {
         // Proactive (monitoring)
         "watch_directory",
         // Desktop (window manipulation)
-        "move_window", "resize_window", "maximize_window", "minimize_window", "tile_windows",
+        "move_window",
+        "resize_window",
+        "maximize_window",
+        "minimize_window",
+        "tile_windows",
         // Google Workspace (create/edit — reversible)
-        "gw_docs_create", "gw_docs_edit",
-        "gw_sheets_create", "gw_sheets_edit",
+        "gw_gmail_send",
+        "gw_docs_create",
+        "gw_docs_edit",
+        "gw_sheets_create",
+        "gw_sheets_edit",
         "gw_slides_create",
-    ].into_iter().collect()
+        "gw_calendar_create",
+    ]
+    .into_iter()
+    .collect()
 });
 
 // ─── Tier 2: RED (block until approved) ───
 static RED_ACTIONS: Lazy<HashSet<&str>> = Lazy::new(|| {
     [
         // File Destruction
-        "delete_file", "delete_directory", "move_file",
+        "delete_file",
+        "delete_directory",
+        "move_file",
         // System Administration
-        "manage_service", "set_environment_variable", "add_to_path",
-        "edit_shell_profile", "manage_firewall_rule",
+        "manage_service",
+        "set_environment_variable",
+        "add_to_path",
+        "edit_shell_profile",
+        "manage_firewall_rule",
         // OS Control
-        "shutdown_system", "reboot_system", "clean_temp_files",
+        "shutdown_system",
+        "reboot_system",
+        "clean_temp_files",
         // Package Management
-        "install_application", "uninstall_application", "update_all_packages",
-        "install_package", "uninstall_package",
+        "install_application",
+        "uninstall_application",
+        "update_all_packages",
+        "install_package",
+        "uninstall_package",
         // Code Execution
-        "execute_python", "execute_bash", "execute_powershell",
+        "execute_python",
+        "execute_bash",
+        "execute_powershell",
         // Scheduled Tasks
-        "create_scheduled_task", "delete_scheduled_task", "modify_scheduled_task",
+        "create_scheduled_task",
+        "delete_scheduled_task",
+        "modify_scheduled_task",
         // Registry
         "write_registry",
         // Plugins
-        "install_plugin", "uninstall_plugin",
+        "install_plugin",
+        "uninstall_plugin",
         // Dangerous
-        "set_process_priority", "change_network_config",
+        "set_process_priority",
+        "change_network_config",
         // Developer (destructive)
-        "git_commit", "git_checkout",
+        "git_commit",
+        "git_checkout",
         // RAG (destructive)
         "delete_knowledge_item",
         // Google Workspace (send/delete/share — irreversible)
-        "gw_gmail_send", "gw_gmail_delete",
+        "gw_gmail_delete",
         "gw_drive_delete",
-        "gw_calendar_create", "gw_calendar_delete",
-    ].into_iter().collect()
+        "gw_calendar_delete",
+    ]
+    .into_iter()
+    .collect()
 });
 
 // ─── Protected paths (auto-escalate to RED) ───
@@ -213,6 +338,27 @@ static PROTECTED_PATH_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     raw.iter().filter_map(|p| Regex::new(p).ok()).collect()
 });
 
+fn infer_mcp_gworkspace_risk(action: &str) -> Option<RiskLevel> {
+    let tool = action.strip_prefix("mcp_gworkspace_")?;
+    let lower = tool.to_ascii_lowercase();
+
+    let red_markers = ["delete", "trash", "permanent"];
+    if red_markers.iter().any(|marker| lower.contains(marker)) {
+        return Some(RiskLevel::Red);
+    }
+
+    let yellow_markers = [
+        "create", "update", "append", "insert", "write", "add", "remove", "send", "move", "copy",
+        "rename", "mark", "clear", "convert", "reply", "resolve", "apply", "format", "upload",
+        "save", "edit",
+    ];
+    if yellow_markers.iter().any(|marker| lower.contains(marker)) {
+        return Some(RiskLevel::Yellow);
+    }
+
+    Some(RiskLevel::Green)
+}
+
 /// The core policy engine. Classifies every tool invocation.
 pub struct PolicyEngine {
     blacklist: BlacklistChecker,
@@ -226,11 +372,7 @@ impl PolicyEngine {
     }
 
     /// Classify a tool action and its parameters.
-    pub fn evaluate(
-        &self,
-        action: &str,
-        params: &serde_json::Value,
-    ) -> PolicyDecision {
+    pub fn evaluate(&self, action: &str, params: &serde_json::Value) -> PolicyDecision {
         // 1. Check blacklist first (hardcoded deny, cannot be overridden)
         let param_str = params.to_string();
         if self.blacklist.is_blocked(&param_str) || self.blacklist.is_blocked(action) {
@@ -251,6 +393,8 @@ impl PolicyEngine {
             RiskLevel::Yellow
         } else if RED_ACTIONS.contains(action) {
             RiskLevel::Red
+        } else if let Some(mcp_tier) = infer_mcp_gworkspace_risk(action) {
+            mcp_tier
         } else {
             // Unknown actions default to RED (fail-safe)
             RiskLevel::Red
@@ -270,13 +414,25 @@ impl PolicyEngine {
         };
 
         let (requires_approval, blocked, reason) = match effective_tier {
-            RiskLevel::Green => (false, false, "auto-execute: read-only or trivially reversible".into()),
-            RiskLevel::Yellow => (false, false, "execute + notify: modifies user-level state, easily reversible".into()),
-            RiskLevel::Red => (true, false, if escalated_from.is_some() {
-                "escalated to RED: targets protected path".into()
-            } else {
-                "requires approval: modifies system state or hard to reverse".into()
-            }),
+            RiskLevel::Green => (
+                false,
+                false,
+                "auto-execute: read-only or trivially reversible".into(),
+            ),
+            RiskLevel::Yellow => (
+                false,
+                false,
+                "execute + notify: modifies user-level state, easily reversible".into(),
+            ),
+            RiskLevel::Red => (
+                true,
+                false,
+                if escalated_from.is_some() {
+                    "escalated to RED: targets protected path".into()
+                } else {
+                    "requires approval: modifies system state or hard to reverse".into()
+                },
+            ),
             RiskLevel::Black => (false, true, "always denied: hardcoded safety block".into()),
         };
 
@@ -292,7 +448,14 @@ impl PolicyEngine {
 
     /// Check if any path in params matches protected path patterns.
     fn touches_protected_path(&self, params: &serde_json::Value) -> bool {
-        let path_keys = ["path", "target", "destination", "file", "directory", "source"];
+        let path_keys = [
+            "path",
+            "target",
+            "destination",
+            "file",
+            "directory",
+            "source",
+        ];
         for key in &path_keys {
             if let Some(val) = params.get(key) {
                 let path_str = match val {
@@ -332,5 +495,50 @@ impl PolicyEngine {
             }
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PolicyEngine, RiskLevel};
+
+    #[test]
+    fn relaxed_google_wrapper_send_and_calendar_create_are_yellow() {
+        let policy = PolicyEngine::new();
+
+        let send = policy.evaluate("gw_gmail_send", &serde_json::json!({}));
+        let create = policy.evaluate("gw_calendar_create", &serde_json::json!({}));
+
+        assert_eq!(send.risk_level, RiskLevel::Yellow);
+        assert!(!send.requires_approval);
+        assert_eq!(create.risk_level, RiskLevel::Yellow);
+        assert!(!create.requires_approval);
+    }
+
+    #[test]
+    fn mcp_gworkspace_read_actions_default_green() {
+        let policy = PolicyEngine::new();
+        let decision = policy.evaluate("mcp_gworkspace_readGoogleDoc", &serde_json::json!({}));
+
+        assert_eq!(decision.risk_level, RiskLevel::Green);
+        assert!(!decision.requires_approval);
+    }
+
+    #[test]
+    fn mcp_gworkspace_write_actions_are_yellow() {
+        let policy = PolicyEngine::new();
+        let decision = policy.evaluate("mcp_gworkspace_sendGmailDraft", &serde_json::json!({}));
+
+        assert_eq!(decision.risk_level, RiskLevel::Yellow);
+        assert!(!decision.requires_approval);
+    }
+
+    #[test]
+    fn mcp_gworkspace_delete_actions_remain_red() {
+        let policy = PolicyEngine::new();
+        let decision = policy.evaluate("mcp_gworkspace_deleteFile", &serde_json::json!({}));
+
+        assert_eq!(decision.risk_level, RiskLevel::Red);
+        assert!(decision.requires_approval);
     }
 }

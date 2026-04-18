@@ -1,13 +1,12 @@
+use kria_core::llm::model_router::ModelRouter;
 /// Phase 4 — Vision & Multimodal tests
 ///
 /// Validates: ImageAttachment, ChatMessage multimodal, vision routing,
 /// vision tools registration, image preprocessing, OCR tool structure.
-
 use kria_core::llm::{ChatMessage, ImageAttachment};
-use kria_core::llm::model_router::ModelRouter;
-use kria_core::tools::registry;
 use kria_core::preprocessing::image::ImageProcessor;
 use kria_core::safety::RiskLevel;
+use kria_core::tools::registry;
 use std::path::Path;
 
 // ── 4.1: ImageAttachment and ChatMessage extension ──────────
@@ -42,12 +41,10 @@ fn phase4_chat_message_with_images() {
         role: "user".into(),
         content: "What's in this image?".into(),
         name: None,
-        images: Some(vec![
-            ImageAttachment {
-                data: "abc123base64data".into(),
-                mime_type: "image/jpeg".into(),
-            },
-        ]),
+        images: Some(vec![ImageAttachment {
+            data: "abc123base64data".into(),
+            mime_type: "image/jpeg".into(),
+        }]),
     };
     assert!(msg.has_images());
 }
@@ -58,12 +55,10 @@ fn phase4_multimodal_content_format() {
         role: "user".into(),
         content: "describe this".into(),
         name: None,
-        images: Some(vec![
-            ImageAttachment {
-                data: "TESTDATA".into(),
-                mime_type: "image/png".into(),
-            },
-        ]),
+        images: Some(vec![ImageAttachment {
+            data: "TESTDATA".into(),
+            mime_type: "image/png".into(),
+        }]),
     };
     let content = msg.to_multimodal_content();
     let parts = content.as_array().expect("should be array");
@@ -83,8 +78,14 @@ fn phase4_multimodal_multiple_images() {
         content: "compare these".into(),
         name: None,
         images: Some(vec![
-            ImageAttachment { data: "IMG1".into(), mime_type: "image/png".into() },
-            ImageAttachment { data: "IMG2".into(), mime_type: "image/jpeg".into() },
+            ImageAttachment {
+                data: "IMG1".into(),
+                mime_type: "image/png".into(),
+            },
+            ImageAttachment {
+                data: "IMG2".into(),
+                mime_type: "image/jpeg".into(),
+            },
         ]),
     };
     let content = msg.to_multimodal_content();
@@ -98,9 +99,10 @@ fn phase4_empty_content_with_image() {
         role: "user".into(),
         content: "".into(),
         name: None,
-        images: Some(vec![
-            ImageAttachment { data: "DATA".into(), mime_type: "image/png".into() },
-        ]),
+        images: Some(vec![ImageAttachment {
+            data: "DATA".into(),
+            mime_type: "image/png".into(),
+        }]),
     };
     let content = msg.to_multimodal_content();
     let parts = content.as_array().unwrap();
@@ -129,9 +131,10 @@ fn phase4_image_attachment_serialization() {
         role: "user".into(),
         content: "test".into(),
         name: None,
-        images: Some(vec![
-            ImageAttachment { data: "b64data".into(), mime_type: "image/webp".into() },
-        ]),
+        images: Some(vec![ImageAttachment {
+            data: "b64data".into(),
+            mime_type: "image/webp".into(),
+        }]),
     };
     let json = serde_json::to_value(&msg).unwrap();
     assert!(json["images"].is_array());
@@ -156,9 +159,18 @@ fn phase4_no_images_serialization_skip() {
 #[test]
 fn phase4_vision_tools_registered() {
     let reg = registry::build_default_registry();
-    assert!(reg.get_def("ocr_image").is_some(), "ocr_image tool not found");
-    assert!(reg.get_def("analyze_image").is_some(), "analyze_image tool not found");
-    assert!(reg.get_def("screenshot_analyze").is_some(), "screenshot_analyze tool not found");
+    assert!(
+        reg.get_def("ocr_image").is_some(),
+        "ocr_image tool not found"
+    );
+    assert!(
+        reg.get_def("analyze_image").is_some(),
+        "analyze_image tool not found"
+    );
+    assert!(
+        reg.get_def("screenshot_analyze").is_some(),
+        "screenshot_analyze tool not found"
+    );
 }
 
 #[test]
@@ -166,8 +178,15 @@ fn phase4_vision_tools_category() {
     let reg = registry::build_default_registry();
     for name in &["ocr_image", "analyze_image", "screenshot_analyze"] {
         let def = reg.get_def(name).unwrap();
-        assert_eq!(def.category, "vision", "{name} should be in vision category");
-        assert_eq!(def.default_tier, RiskLevel::Green, "{name} should be GREEN tier");
+        assert_eq!(
+            def.category, "vision",
+            "{name} should be in vision category"
+        );
+        assert_eq!(
+            def.default_tier,
+            RiskLevel::Green,
+            "{name} should be GREEN tier"
+        );
     }
 }
 
@@ -175,15 +194,24 @@ fn phase4_vision_tools_category() {
 fn phase4_ocr_tool_requires_path() {
     let reg = registry::build_default_registry();
     let def = reg.get_def("ocr_image").unwrap();
-    assert!(def.parameters.iter().any(|p| p.name == "path" && p.required));
+    assert!(def
+        .parameters
+        .iter()
+        .any(|p| p.name == "path" && p.required));
 }
 
 #[test]
 fn phase4_analyze_image_params() {
     let reg = registry::build_default_registry();
     let def = reg.get_def("analyze_image").unwrap();
-    assert!(def.parameters.iter().any(|p| p.name == "path" && p.required));
-    assert!(def.parameters.iter().any(|p| p.name == "operations" && !p.required));
+    assert!(def
+        .parameters
+        .iter()
+        .any(|p| p.name == "path" && p.required));
+    assert!(def
+        .parameters
+        .iter()
+        .any(|p| p.name == "operations" && !p.required));
 }
 
 // ── 4.3: ImageProcessor tests ───────────────────────────────
@@ -223,9 +251,7 @@ fn phase4_image_processor_thumbnail() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("thumb_test.png");
     // Create a small valid image with the image crate
-    let img = image::ImageBuffer::from_fn(100, 100, |_, _| {
-        image::Rgb([255u8, 0, 0])
-    });
+    let img = image::ImageBuffer::from_fn(100, 100, |_, _| image::Rgb([255u8, 0, 0]));
     img.save(&path).unwrap();
 
     let thumb = ImageProcessor::thumbnail(&path, 50).unwrap();
@@ -242,7 +268,10 @@ fn phase4_model_router_no_vision() {
     // the local backend fallback (server may support vision).
     let config = kria_core::config::KriaConfig::default();
     let router = ModelRouter::from_config(&config);
-    assert!(router.has_vision(), "local backend should serve as vision fallback");
+    assert!(
+        router.has_vision(),
+        "local backend should serve as vision fallback"
+    );
 
     // Only when local_api_url is empty should vision be unavailable
     let mut no_local = kria_core::config::KriaConfig::default();
@@ -276,7 +305,9 @@ async fn phase4_ocr_tool_missing_path() {
 async fn phase4_ocr_tool_file_not_found() {
     let reg = registry::build_default_registry();
     let handler = reg.get_handler("ocr_image").unwrap();
-    let result = handler.execute(serde_json::json!({"path": "/tmp/nonexistent_ocr_test.png"})).await;
+    let result = handler
+        .execute(serde_json::json!({"path": "/tmp/nonexistent_ocr_test.png"}))
+        .await;
     assert!(!result.success);
     assert!(result.error.as_ref().unwrap().contains("not found"));
 }
@@ -294,7 +325,9 @@ async fn phase4_analyze_image_missing_path() {
 async fn phase4_analyze_image_file_not_found() {
     let reg = registry::build_default_registry();
     let handler = reg.get_handler("analyze_image").unwrap();
-    let result = handler.execute(serde_json::json!({"path": "/tmp/no_such_img.png"})).await;
+    let result = handler
+        .execute(serde_json::json!({"path": "/tmp/no_such_img.png"}))
+        .await;
     assert!(!result.success);
     assert!(result.error.as_ref().unwrap().contains("not found"));
 }
@@ -349,7 +382,10 @@ async fn phase4_analyze_image_accepts_urlencoded_file_uri() {
     let uri = format!("file://{}", encoded_path);
     let result = handler.execute(serde_json::json!({"path": uri})).await;
 
-    assert!(result.success, "expected URL-encoded file:// path to resolve");
+    assert!(
+        result.success,
+        "expected URL-encoded file:// path to resolve"
+    );
     let data = result.data;
     assert!(data.get("metadata").is_some());
 }
@@ -361,7 +397,10 @@ fn phase4_total_tool_count() {
     let reg = registry::build_default_registry();
     // Previous phases had ~60+ tools; Phase 4 adds 3 vision tools
     let count = reg.len();
-    assert!(count >= 63, "expected at least 63 tools with vision, got {count}");
+    assert!(
+        count >= 63,
+        "expected at least 63 tools with vision, got {count}"
+    );
 }
 
 #[test]

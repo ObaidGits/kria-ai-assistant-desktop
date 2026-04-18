@@ -11,12 +11,12 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::config::McpServerConfig;
-use crate::safety::RiskLevel;
-use crate::tools::{ToolDef, ToolHandler, ToolRegistry};
 use super::client::{McpClient, McpServerState};
 use super::protocol::McpToolDef;
 use super::tool_bridge::McpToolHandler;
+use crate::config::McpServerConfig;
+use crate::safety::RiskLevel;
+use crate::tools::{ToolDef, ToolHandler, ToolRegistry};
 
 /// Max consecutive ping failures before a restart attempt.
 const MAX_PING_FAILURES: u64 = 3;
@@ -27,6 +27,16 @@ pub struct McpServerManager {
     configs: Vec<McpServerConfig>,
     /// Per-server consecutive ping failure count.
     ping_failures: HashMap<String, u64>,
+}
+
+/// Summary of one reconcile pass between configured and runtime MCP servers.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct McpReconcileReport {
+    pub started: Vec<String>,
+    pub stopped: Vec<String>,
+    pub restarted: Vec<String>,
+    pub unchanged: Vec<String>,
+    pub errors: Vec<String>,
 }
 
 impl McpServerManager {
@@ -44,7 +54,11 @@ impl McpServerManager {
         let configs = self.configs.clone();
         let total = configs.len();
         let enabled: Vec<_> = configs.iter().filter(|c| c.enabled).cloned().collect();
-        tracing::info!("[MCP] start_all: {} configured, {} enabled — launching in parallel", total, enabled.len());
+        tracing::info!(
+            "[MCP] start_all: {} configured, {} enabled — launching in parallel",
+            total,
+            enabled.len()
+        );
 
         for config in &configs {
             if !config.enabled {
@@ -53,34 +67,74 @@ impl McpServerManager {
         }
 
         // Launch all enabled servers concurrently
-        let handles: Vec<_> = enabled.iter().map(|config| {
-            let config = config.clone();
-            tokio::spawn(async move {
-                tracing::info!("[MCP] starting server '{}' (command='{}' args={:?})", config.name, config.command, config.args);
-                let client = Arc::new(McpClient::new(&config.name));
-                match client.start(&config.command, &config.args, &config.env).await {
-                    Ok(()) => {
-                        let tools = client.tools().await;
-                        tracing::info!("[MCP] server '{}' started — {} tool(s) discovered", config.name, tools.len());
-                        Ok((config, client, tools))
+        let handles: Vec<_> = enabled
+            .iter()
+            .map(|config| {
+                let config = config.clone();
+                tokio::spawn(async move {
+                    tracing::info!(
+                        "[MCP] starting server '{}' (command='{}' args={:?})",
+                        config.name,
+                        config.command,
+                        config.args
+                    );
+                    let client = Arc::new(McpClient::new(&config.name));
+                    let mut last_err: Option<anyhow::Error> = None;
+
+                    for attempt in 1..=2 {
+                        match client
+                            .start(&config.command, &config.args, &config.env)
+                            .await
+                        {
+                            Ok(()) => {
+                                let tools = client.tools().await;
+                                tracing::info!(
+                                    "[MCP] server '{}' started — {} tool(s) discovered",
+                                    config.name,
+                                    tools.len()
+                                );
+                                return Ok((config, client, tools));
+                            }
+                            Err(e) => {
+                                let msg = e.to_string();
+                                tracing::warn!(
+                                    "[MCP] server '{}' start attempt {}/2 failed: {}",
+                                    config.name,
+                                    attempt,
+                                    msg
+                                );
+                                last_err = Some(e);
+
+                                if attempt < 2 {
+                                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                }
+                            }
+                        }
                     }
-                    Err(e) => {
-                        tracing::error!("[MCP] server '{}' FAILED to start: {}", config.name, e);
-                        Err(config.name.clone())
+
+                    if let Some(err) = last_err {
+                        tracing::error!("[MCP] server '{}' FAILED to start: {}", config.name, err);
                     }
-                }
+                    Err(config.name.clone())
+                })
             })
-        }).collect();
+            .collect();
 
         // Collect results and register tools
         for handle in handles {
             match handle.await {
                 Ok(Ok((config, client, tools))) => {
                     for tool_def in &tools {
-                        let override_tier = config.tool_overrides.get(&tool_def.name)
+                        let override_tier = config
+                            .tool_overrides
+                            .get(&tool_def.name)
                             .map(|s| s.as_str())
                             .unwrap_or("(default)");
-                        tracing::info!("[MCP]   tool='{}' override={}", tool_def.name, override_tier);
+                        tracing::info!(
+                            "[MCP]   tool='{}' override={}",
+                            tool_def.name,
+                            override_tier
+                        );
                         register_mcp_tool(
                             registry,
                             &client,
@@ -92,7 +146,9 @@ impl McpServerManager {
                     }
                     tracing::info!(
                         "[MCP] server '{}' ready: {} tools registered (trust_level={})",
-                        config.name, tools.len(), config.trust_level
+                        config.name,
+                        tools.len(),
+                        config.trust_level
                     );
                     self.clients.insert(config.name.clone(), client);
                 }
@@ -104,7 +160,10 @@ impl McpServerManager {
                 }
             }
         }
-        tracing::info!("[MCP] start_all complete — {} server(s) running", self.clients.len());
+        tracing::info!(
+            "[MCP] start_all complete — {} server(s) running",
+            self.clients.len()
+        );
     }
 
     /// Start a single MCP server and register its tools.
@@ -123,12 +182,22 @@ impl McpServerManager {
 
         // Register each discovered tool with a prefixed name
         let tools = client.tools().await;
-        tracing::info!("[MCP] server '{}' advertises {} tool(s):", config.name, tools.len());
+        tracing::info!(
+            "[MCP] server '{}' advertises {} tool(s):",
+            config.name,
+            tools.len()
+        );
         for tool_def in &tools {
-            let override_tier = config.tool_overrides.get(&tool_def.name)
+            let override_tier = config
+                .tool_overrides
+                .get(&tool_def.name)
                 .map(|s| s.as_str())
                 .unwrap_or("(default)");
-            tracing::info!("[MCP]   tool='{}' override={}", tool_def.name, override_tier);
+            tracing::info!(
+                "[MCP]   tool='{}' override={}",
+                tool_def.name,
+                override_tier
+            );
             register_mcp_tool(
                 registry,
                 &client,
@@ -141,7 +210,9 @@ impl McpServerManager {
 
         tracing::info!(
             "[MCP] server '{}' ready: {} tools registered (trust_level={})",
-            config.name, tools.len(), config.trust_level
+            config.name,
+            tools.len(),
+            config.trust_level
         );
 
         self.clients.insert(config.name.clone(), client);
@@ -212,6 +283,102 @@ impl McpServerManager {
         self.start_server(&config, registry).await
     }
 
+    fn config_requires_restart(old: &McpServerConfig, new: &McpServerConfig) -> bool {
+        old.command != new.command
+            || old.args != new.args
+            || old.env != new.env
+            || old.trust_level != new.trust_level
+            || old.tool_overrides != new.tool_overrides
+    }
+
+    /// Reconcile runtime MCP processes with the desired config list.
+    ///
+    /// Behavior:
+    /// - Stops running servers that are disabled or removed from config
+    /// - Starts newly-enabled servers
+    /// - Restarts running servers when launch/runtime config changed
+    pub async fn reconcile(
+        &mut self,
+        desired_configs: Vec<McpServerConfig>,
+        registry: &ToolRegistry,
+    ) -> McpReconcileReport {
+        let previous_configs: HashMap<String, McpServerConfig> = self
+            .configs
+            .iter()
+            .cloned()
+            .map(|cfg| (cfg.name.clone(), cfg))
+            .collect();
+
+        let desired_by_name: HashMap<String, McpServerConfig> = desired_configs
+            .iter()
+            .cloned()
+            .map(|cfg| (cfg.name.clone(), cfg))
+            .collect();
+
+        let mut report = McpReconcileReport::default();
+
+        // Stop runtime servers that should no longer run.
+        let running_names: Vec<String> = self.clients.keys().cloned().collect();
+        for name in running_names {
+            let should_run = desired_by_name
+                .get(&name)
+                .map(|cfg| cfg.enabled)
+                .unwrap_or(false);
+
+            if !should_run {
+                match self.stop_server(&name).await {
+                    Ok(()) => {
+                        self.ping_failures.remove(&name);
+                        report.stopped.push(name);
+                    }
+                    Err(e) => report.errors.push(format!("failed to stop '{name}': {e}")),
+                }
+            }
+        }
+
+        // Ensure all enabled configs are running and up-to-date.
+        for cfg in desired_configs.iter().filter(|cfg| cfg.enabled) {
+            let is_running = self.clients.contains_key(&cfg.name);
+
+            if !is_running {
+                match self.start_server(cfg, registry).await {
+                    Ok(()) => report.started.push(cfg.name.clone()),
+                    Err(e) => report
+                        .errors
+                        .push(format!("failed to start '{}': {e}", cfg.name)),
+                }
+                continue;
+            }
+
+            let restart_required = previous_configs
+                .get(&cfg.name)
+                .map(|old| Self::config_requires_restart(old, cfg))
+                .unwrap_or(true);
+
+            if restart_required {
+                if let Err(e) = self.stop_server(&cfg.name).await {
+                    report
+                        .errors
+                        .push(format!("failed to restart '{}': stop error: {e}", cfg.name));
+                    continue;
+                }
+
+                match self.start_server(cfg, registry).await {
+                    Ok(()) => report.restarted.push(cfg.name.clone()),
+                    Err(e) => report.errors.push(format!(
+                        "failed to restart '{}': start error: {e}",
+                        cfg.name
+                    )),
+                }
+            } else {
+                report.unchanged.push(cfg.name.clone());
+            }
+        }
+
+        self.configs = desired_configs;
+        report
+    }
+
     /// Run one health-check cycle: ping every running server, restart failures.
     pub async fn health_check_cycle(&mut self, registry: &ToolRegistry) {
         let names: Vec<String> = self.clients.keys().cloned().collect();
@@ -237,7 +404,9 @@ impl McpServerManager {
                     tracing::error!(server = %name, "MCP server unresponsive — restarting");
 
                     // Exponential backoff based on the client's restart count
-                    let backoff_secs = self.clients.get(&name)
+                    let backoff_secs = self
+                        .clients
+                        .get(&name)
                         .map(|c| c.increment_restart())
                         .unwrap_or(1);
                     tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
@@ -315,8 +484,11 @@ fn register_mcp_tool(
         min_tier: "standard",
     };
 
-    let handler: Arc<dyn ToolHandler> =
-        Arc::new(McpToolHandler::new(Arc::clone(client), &mcp_tool.name));
+    let handler: Arc<dyn ToolHandler> = Arc::new(McpToolHandler::new(
+        Arc::clone(client),
+        server_name,
+        &mcp_tool.name,
+    ));
 
     registry.register(def, handler);
     tracing::debug!(tool = %prefixed_name, "registered MCP tool");
@@ -376,5 +548,104 @@ impl std::fmt::Debug for McpServerManager {
         f.debug_struct("McpServerManager")
             .field("servers", &self.clients.keys().collect::<Vec<_>>())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(name: &str, enabled: bool, command: &str) -> McpServerConfig {
+        McpServerConfig {
+            name: name.to_string(),
+            command: command.to_string(),
+            args: vec![],
+            env: HashMap::new(),
+            enabled,
+            trust_level: "YELLOW".into(),
+            tool_overrides: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_attempts_start_for_new_enabled_server() {
+        let mut manager = McpServerManager::new(vec![]);
+        let registry = ToolRegistry::new();
+
+        let report = manager
+            .reconcile(
+                vec![cfg(
+                    "alpha",
+                    true,
+                    "__kria_missing_command_for_start_test__",
+                )],
+                &registry,
+            )
+            .await;
+
+        assert!(report.started.is_empty());
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.contains("failed to start 'alpha'")));
+    }
+
+    #[tokio::test]
+    async fn reconcile_stops_disabled_running_server() {
+        let mut manager = McpServerManager::new(vec![cfg("alpha", true, "old")]);
+        manager
+            .clients
+            .insert("alpha".into(), Arc::new(McpClient::new("alpha")));
+
+        let registry = ToolRegistry::new();
+        let report = manager
+            .reconcile(vec![cfg("alpha", false, "old")], &registry)
+            .await;
+
+        assert_eq!(report.stopped, vec!["alpha".to_string()]);
+        assert!(report.errors.is_empty());
+        assert!(!manager.clients.contains_key("alpha"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_attempts_restart_when_runtime_config_changes() {
+        let mut manager = McpServerManager::new(vec![cfg("alpha", true, "old")]);
+        manager
+            .clients
+            .insert("alpha".into(), Arc::new(McpClient::new("alpha")));
+
+        let registry = ToolRegistry::new();
+        let report = manager
+            .reconcile(
+                vec![cfg(
+                    "alpha",
+                    true,
+                    "__kria_missing_command_for_restart_test__",
+                )],
+                &registry,
+            )
+            .await;
+
+        assert!(report.restarted.is_empty());
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.contains("failed to restart 'alpha': start error")));
+    }
+
+    #[tokio::test]
+    async fn reconcile_marks_running_server_unchanged_when_config_matches() {
+        let baseline = cfg("alpha", true, "same");
+        let mut manager = McpServerManager::new(vec![baseline.clone()]);
+        manager
+            .clients
+            .insert("alpha".into(), Arc::new(McpClient::new("alpha")));
+
+        let registry = ToolRegistry::new();
+        let report = manager.reconcile(vec![baseline], &registry).await;
+
+        assert_eq!(report.unchanged, vec!["alpha".to_string()]);
+        assert!(report.errors.is_empty());
+        assert!(manager.clients.contains_key("alpha"));
     }
 }

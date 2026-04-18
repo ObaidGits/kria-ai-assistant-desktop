@@ -17,13 +17,13 @@
 //!   admin:   gw_gmail_send, gw_gmail_delete,
 //!            gw_drive_delete, gw_calendar_create, gw_calendar_delete
 
-use std::sync::Arc;
-use async_trait::async_trait;
 use crate::infra::ToolResult;
 use crate::mcp::McpClient;
-use crate::sidecar::SidecarBridge;
 use crate::safety::RiskLevel;
-use crate::tools::registry::{ToolRegistry, ToolDef, ToolHandler, ParamDef};
+use crate::sidecar::SidecarBridge;
+use crate::tools::registry::{ParamDef, ToolDef, ToolHandler, ToolRegistry};
+use async_trait::async_trait;
+use std::sync::Arc;
 
 /// Lazy reference to the gworkspace MCP client.
 /// Starts as None; populated by `set_client()` once the MCP server connects.
@@ -71,7 +71,8 @@ impl GwBridge {
         }
         // Inject account — never overwrite if the caller already set it
         if let Some(obj) = args.as_object_mut() {
-            obj.entry("account").or_insert_with(|| serde_json::json!(self.account));
+            obj.entry("account")
+                .or_insert_with(|| serde_json::json!(self.account));
         }
 
         tracing::info!("[GW] mcp_call: tool='{}' account='{}'", tool, self.account);
@@ -87,25 +88,43 @@ impl GwBridge {
                      Then restart KRIA. (tool={tool})"
                 );
                 tracing::warn!("[GW] {}", msg);
-                return ToolResult { success: false, data: serde_json::Value::Null, error: Some(msg) };
+                return ToolResult {
+                    success: false,
+                    data: serde_json::Value::Null,
+                    error: Some(msg),
+                };
             }
         };
         drop(guard);
 
         match client.call_tool(tool, Some(args)).await {
             Ok(result) => {
-                let text: String = result.content.iter()
+                let text: String = result
+                    .content
+                    .iter()
                     .filter_map(|c| c.text.as_deref())
                     .collect::<Vec<_>>()
                     .join("\n");
                 if result.is_error {
-                    tracing::warn!("[GW] tool '{}' returned MCP error: {}", tool, &text[..text.len().min(300)]);
+                    tracing::warn!(
+                        "[GW] tool '{}' returned MCP error: {}",
+                        tool,
+                        &text[..text.len().min(300)]
+                    );
                     // Parse well-known Google API errors into concise, actionable messages.
                     let user_error = parse_gw_error(&text);
-                    ToolResult { success: false, data: serde_json::json!(user_error), error: Some(user_error) }
+                    ToolResult {
+                        success: false,
+                        data: serde_json::json!(user_error),
+                        error: Some(user_error),
+                    }
                 } else {
                     tracing::info!("[GW] tool '{}' succeeded ({} chars)", tool, text.len());
-                    ToolResult { success: true, data: serde_json::json!(text), error: None }
+                    ToolResult {
+                        success: true,
+                        data: serde_json::json!(text),
+                        error: None,
+                    }
                 }
             }
             Err(e) => {
@@ -126,7 +145,11 @@ impl GwBridge {
         mcp_args: serde_json::Value,
         sidecar_method: &str,
     ) -> ToolResult {
-        tracing::debug!("[GW] fetch_and_buffer: mcp_tool={} sidecar={}", mcp_tool, sidecar_method);
+        tracing::debug!(
+            "[GW] fetch_and_buffer: mcp_tool={} sidecar={}",
+            mcp_tool,
+            sidecar_method
+        );
         let raw_result = self.mcp_call(mcp_tool, mcp_args).await;
         if !raw_result.success {
             return raw_result;
@@ -135,13 +158,44 @@ impl GwBridge {
         match self.sidecar.request(sidecar_method, buffer_params).await {
             Ok(digest) => {
                 tracing::info!("[GW] sidecar '{}' digest produced", sidecar_method);
-                ToolResult { success: true, data: digest, error: None }
+                ToolResult {
+                    success: true,
+                    data: digest,
+                    error: None,
+                }
             }
             Err(e) => {
-                tracing::warn!("[GW] sidecar '{}' failed ({}), returning raw", sidecar_method, e);
+                tracing::warn!(
+                    "[GW] sidecar '{}' failed ({}), returning raw",
+                    sidecar_method,
+                    e
+                );
                 raw_result
             }
         }
+    }
+}
+
+fn gmail_max_results(params: &serde_json::Value, default: u64) -> u64 {
+    params
+        .get("max_results")
+        .and_then(|v| v.as_u64())
+        .filter(|count| *count > 0)
+        .map(|count| count.min(50))
+        .unwrap_or(default)
+}
+
+fn normalize_gmail_inbox_query(query: Option<&str>) -> String {
+    let trimmed = query.unwrap_or("").trim();
+    if trimmed.is_empty() {
+        return "in:inbox".into();
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("in:") {
+        trimmed.to_string()
+    } else {
+        format!("in:inbox {trimmed}")
     }
 }
 
@@ -154,20 +208,36 @@ impl GwBridge {
 /// KRIA's UI shows something readable.
 fn parse_gw_error(raw: &str) -> String {
     // "accessNotConfigured" / "API has not been used" — API disabled in Cloud Console
-    if raw.contains("accessNotConfigured") || raw.contains("has not been used") || raw.contains("is disabled") {
+    if raw.contains("accessNotConfigured")
+        || raw.contains("has not been used")
+        || raw.contains("is disabled")
+    {
         // Try to extract the enable URL
         let url = raw
             .split_once("https://console")
-            .map(|(_, rest)| format!("https://console{}", rest.split_whitespace().next().unwrap_or("")))
+            .map(|(_, rest)| {
+                format!(
+                    "https://console{}",
+                    rest.split_whitespace().next().unwrap_or("")
+                )
+            })
             .unwrap_or_default();
         // Determine which API from the URL or the error text
-        let api_name = if raw.contains("gmail") { "Gmail API" }
-            else if raw.contains("calendar") { "Calendar API" }
-            else if raw.contains("drive") { "Drive API" }
-            else if raw.contains("docs") { "Docs API" }
-            else if raw.contains("sheets") { "Sheets API" }
-            else if raw.contains("slides") { "Slides API" }
-            else { "Google API" };
+        let api_name = if raw.contains("gmail") {
+            "Gmail API"
+        } else if raw.contains("calendar") {
+            "Calendar API"
+        } else if raw.contains("drive") {
+            "Drive API"
+        } else if raw.contains("docs") {
+            "Docs API"
+        } else if raw.contains("sheets") {
+            "Sheets API"
+        } else if raw.contains("slides") {
+            "Slides API"
+        } else {
+            "Google API"
+        };
         if url.is_empty() {
             return format!(
                 "{api_name} is disabled in your Google Cloud project. \
@@ -181,13 +251,19 @@ fn parse_gw_error(raw: &str) -> String {
     }
 
     // "invalid_grant" / token expired / revoked
-    if raw.contains("invalid_grant") || raw.contains("Token has been expired") || raw.contains("Token has been revoked") {
+    if raw.contains("invalid_grant")
+        || raw.contains("Token has been expired")
+        || raw.contains("Token has been revoked")
+    {
         return "Google authentication token expired or revoked. \
-                Re-run: bash scripts/setup_google_workspace.sh  then restart KRIA.".into();
+                Re-run: bash scripts/setup_google_workspace.sh  then restart KRIA."
+            .into();
     }
 
     // "insufficientPermissions" — scope missing
-    if raw.contains("insufficientPermissions") || raw.contains("Request had insufficient authentication scopes") {
+    if raw.contains("insufficientPermissions")
+        || raw.contains("Request had insufficient authentication scopes")
+    {
         return "Insufficient OAuth scopes. \
                 Re-run: bash scripts/setup_google_workspace.sh  to refresh permissions, then restart KRIA.".into();
     }
@@ -214,15 +290,15 @@ struct GwGmailInbox(GwBridge);
 #[async_trait]
 impl ToolHandler for GwGmailInbox {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
-        // listGmailMessages: account, maxResults?, query?
-        // Returns a list — pass directly to sidecar for structured summarization.
-        let mut args = serde_json::json!({ "maxResults": 20 });
-        if let Some(q) = params.get("query").and_then(|v| v.as_str()) {
-            args["query"] = serde_json::json!(q);
-        }
-        // Use fetch_and_buffer so the sidecar can structure the message list;
-        // sidecar fallback returns raw text automatically if it fails.
-        self.0.fetch_and_buffer("listGmailMessages", args, "google.summarize_email_thread").await
+        // searchGmail returns sender, subject, date, labels, preview, and IDs.
+        // That is much more useful for "check my inbox" flows than listGmailMessages,
+        // which only returns IDs and links.
+        let query = normalize_gmail_inbox_query(params.get("query").and_then(|v| v.as_str()));
+        let args = serde_json::json!({
+            "query": query,
+            "maxResults": gmail_max_results(&params, 10),
+        });
+        self.0.mcp_call("searchGmail", args).await
     }
 }
 
@@ -232,8 +308,11 @@ impl ToolHandler for GwGmailSearch {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
         // searchGmail: account, query, maxResults?
         let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
-        let args = serde_json::json!({ "query": query, "maxResults": 20 });
-        self.0.fetch_and_buffer("searchGmail", args, "google.summarize_email_thread").await
+        let args = serde_json::json!({
+            "query": query,
+            "maxResults": gmail_max_results(&params, 10),
+        });
+        self.0.mcp_call("searchGmail", args).await
     }
 }
 
@@ -242,9 +321,12 @@ struct GwGmailRead(GwBridge);
 impl ToolHandler for GwGmailRead {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
         // readGmailMessage: account, messageId
-        let msg_id = params.get("message_id").and_then(|v| v.as_str()).unwrap_or("");
+        let msg_id = params
+            .get("message_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let args = serde_json::json!({ "messageId": msg_id });
-        self.0.fetch_and_buffer("readGmailMessage", args, "google.summarize_email_thread").await
+        self.0.mcp_call("readGmailMessage", args).await
     }
 }
 
@@ -266,12 +348,18 @@ impl ToolHandler for GwGmailSend {
         }
         // Extract draft_id from result (JSON string containing draftId field)
         let draft_text = draft_result.data.as_str().unwrap_or("");
-        tracing::info!("[GW] draft created: {}", &draft_text[..draft_text.len().min(200)]);
+        tracing::info!(
+            "[GW] draft created: {}",
+            &draft_text[..draft_text.len().min(200)]
+        );
         // Step 2: sendGmailDraft using the draft_id
         // The result text from createGmailDraft typically contains the draft ID
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(draft_text) {
             if let Some(draft_id) = parsed.get("draftId").and_then(|v| v.as_str()) {
-                return self.0.mcp_call("sendGmailDraft", serde_json::json!({ "draftId": draft_id })).await;
+                return self
+                    .0
+                    .mcp_call("sendGmailDraft", serde_json::json!({ "draftId": draft_id }))
+                    .await;
             }
         }
         // Fallback: return the draft result and let user know to send manually
@@ -288,8 +376,16 @@ struct GwGmailDelete(GwBridge);
 #[async_trait]
 impl ToolHandler for GwGmailDelete {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
-        let msg_id = params.get("message_id").and_then(|v| v.as_str()).unwrap_or("");
-        self.0.mcp_call("deleteGmailMessage", serde_json::json!({ "messageId": msg_id })).await
+        let msg_id = params
+            .get("message_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        self.0
+            .mcp_call(
+                "deleteGmailMessage",
+                serde_json::json!({ "messageId": msg_id }),
+            )
+            .await
     }
 }
 
@@ -302,10 +398,18 @@ impl ToolHandler for GwCalendarToday {
     async fn execute(&self, _params: serde_json::Value) -> ToolResult {
         // listCalendarEvents with today's date range
         let now = chrono::Utc::now();
-        let start = now.date_naive().and_hms_opt(0, 0, 0).unwrap()
-            .and_utc().to_rfc3339();
-        let end = now.date_naive().and_hms_opt(23, 59, 59).unwrap()
-            .and_utc().to_rfc3339();
+        let start = now
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .to_rfc3339();
+        let end = now
+            .date_naive()
+            .and_hms_opt(23, 59, 59)
+            .unwrap()
+            .and_utc()
+            .to_rfc3339();
         let args = serde_json::json!({ "timeMin": start, "timeMax": end, "maxResults": 50 });
         self.0.mcp_call("listCalendarEvents", args).await
     }
@@ -348,8 +452,16 @@ struct GwCalendarDelete(GwBridge);
 #[async_trait]
 impl ToolHandler for GwCalendarDelete {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
-        let event_id = params.get("event_id").and_then(|v| v.as_str()).unwrap_or("");
-        self.0.mcp_call("deleteCalendarEvent", serde_json::json!({ "eventId": event_id })).await
+        let event_id = params
+            .get("event_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        self.0
+            .mcp_call(
+                "deleteCalendarEvent",
+                serde_json::json!({ "eventId": event_id }),
+            )
+            .await
     }
 }
 
@@ -362,7 +474,9 @@ impl ToolHandler for GwDriveSearch {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
         let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
         let args = serde_json::json!({ "query": query });
-        self.0.fetch_and_buffer("searchGoogleDocs", args, "google.summarize_drive_folder").await
+        self.0
+            .fetch_and_buffer("searchGoogleDocs", args, "google.summarize_drive_folder")
+            .await
     }
 }
 
@@ -376,7 +490,9 @@ impl ToolHandler for GwDriveList {
         } else {
             serde_json::json!({})
         };
-        self.0.fetch_and_buffer("listFolderContents", args, "google.summarize_drive_folder").await
+        self.0
+            .fetch_and_buffer("listFolderContents", args, "google.summarize_drive_folder")
+            .await
     }
 }
 
@@ -396,7 +512,9 @@ struct GwDriveDelete(GwBridge);
 impl ToolHandler for GwDriveDelete {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
         let file_id = params.get("file_id").and_then(|v| v.as_str()).unwrap_or("");
-        self.0.mcp_call("deleteFile", serde_json::json!({ "fileId": file_id })).await
+        self.0
+            .mcp_call("deleteFile", serde_json::json!({ "fileId": file_id }))
+            .await
     }
 }
 
@@ -407,9 +525,14 @@ struct GwDocsRead(GwBridge);
 #[async_trait]
 impl ToolHandler for GwDocsRead {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
-        let doc_id = params.get("document_id").and_then(|v| v.as_str()).unwrap_or("");
+        let doc_id = params
+            .get("document_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let args = serde_json::json!({ "documentId": doc_id, "format": "markdown" });
-        self.0.fetch_and_buffer("readGoogleDoc", args, "google.extract_doc").await
+        self.0
+            .fetch_and_buffer("readGoogleDoc", args, "google.extract_doc")
+            .await
     }
 }
 
@@ -417,8 +540,13 @@ struct GwDocsCreate(GwBridge);
 #[async_trait]
 impl ToolHandler for GwDocsCreate {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
-        let title = params.get("title").and_then(|v| v.as_str()).unwrap_or("Untitled");
-        self.0.mcp_call("createDocument", serde_json::json!({ "title": title })).await
+        let title = params
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Untitled");
+        self.0
+            .mcp_call("createDocument", serde_json::json!({ "title": title }))
+            .await
     }
 }
 
@@ -426,10 +554,18 @@ struct GwDocsEdit(GwBridge);
 #[async_trait]
 impl ToolHandler for GwDocsEdit {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
-        let doc_id = params.get("document_id").and_then(|v| v.as_str()).unwrap_or("");
+        let doc_id = params
+            .get("document_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
         // Default to append operation
-        self.0.mcp_call("appendToGoogleDoc", serde_json::json!({ "documentId": doc_id, "text": text })).await
+        self.0
+            .mcp_call(
+                "appendToGoogleDoc",
+                serde_json::json!({ "documentId": doc_id, "text": text }),
+            )
+            .await
     }
 }
 
@@ -440,12 +576,17 @@ struct GwSheetsRead(GwBridge);
 #[async_trait]
 impl ToolHandler for GwSheetsRead {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
-        let id = params.get("spreadsheet_id").and_then(|v| v.as_str()).unwrap_or("");
+        let id = params
+            .get("spreadsheet_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let mut args = serde_json::json!({ "spreadsheetId": id });
         if let Some(r) = params.get("range").and_then(|v| v.as_str()) {
             args["range"] = serde_json::json!(r);
         }
-        self.0.fetch_and_buffer("readSpreadsheet", args, "google.extract_sheet").await
+        self.0
+            .fetch_and_buffer("readSpreadsheet", args, "google.extract_sheet")
+            .await
     }
 }
 
@@ -453,8 +594,13 @@ struct GwSheetsCreate(GwBridge);
 #[async_trait]
 impl ToolHandler for GwSheetsCreate {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
-        let title = params.get("title").and_then(|v| v.as_str()).unwrap_or("Untitled");
-        self.0.mcp_call("createSpreadsheet", serde_json::json!({ "title": title })).await
+        let title = params
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Untitled");
+        self.0
+            .mcp_call("createSpreadsheet", serde_json::json!({ "title": title }))
+            .await
     }
 }
 
@@ -462,13 +608,25 @@ struct GwSheetsEdit(GwBridge);
 #[async_trait]
 impl ToolHandler for GwSheetsEdit {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
-        let id = params.get("spreadsheet_id").and_then(|v| v.as_str()).unwrap_or("");
+        let id = params
+            .get("spreadsheet_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let range = params.get("range").and_then(|v| v.as_str()).unwrap_or("A1");
-        let values_str = params.get("values").and_then(|v| v.as_str()).unwrap_or("[]");
-        let values: serde_json::Value = serde_json::from_str(values_str).unwrap_or(serde_json::json!([]));
-        self.0.mcp_call("writeSpreadsheet", serde_json::json!({
-            "spreadsheetId": id, "range": range, "values": values
-        })).await
+        let values_str = params
+            .get("values")
+            .and_then(|v| v.as_str())
+            .unwrap_or("[]");
+        let values: serde_json::Value =
+            serde_json::from_str(values_str).unwrap_or(serde_json::json!([]));
+        self.0
+            .mcp_call(
+                "writeSpreadsheet",
+                serde_json::json!({
+                    "spreadsheetId": id, "range": range, "values": values
+                }),
+            )
+            .await
     }
 }
 
@@ -479,8 +637,17 @@ struct GwSlidesRead(GwBridge);
 #[async_trait]
 impl ToolHandler for GwSlidesRead {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
-        let id = params.get("presentation_id").and_then(|v| v.as_str()).unwrap_or("");
-        self.0.fetch_and_buffer("readPresentation", serde_json::json!({ "presentationId": id }), "google.extract_slides").await
+        let id = params
+            .get("presentation_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        self.0
+            .fetch_and_buffer(
+                "readPresentation",
+                serde_json::json!({ "presentationId": id }),
+                "google.extract_slides",
+            )
+            .await
     }
 }
 
@@ -488,8 +655,13 @@ struct GwSlidesCreate(GwBridge);
 #[async_trait]
 impl ToolHandler for GwSlidesCreate {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
-        let title = params.get("title").and_then(|v| v.as_str()).unwrap_or("Untitled");
-        self.0.mcp_call("createPresentation", serde_json::json!({ "title": title })).await
+        let title = params
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Untitled");
+        self.0
+            .mcp_call("createPresentation", serde_json::json!({ "title": title }))
+            .await
     }
 }
 
@@ -503,28 +675,32 @@ impl ToolHandler for GwSlidesCreate {
 ///
 /// `account` is the name given to the Google account when running
 /// `npx google-workspace-mcp accounts add <account>` (e.g. "personal").
-pub fn register(
-    reg: &ToolRegistry,
-    mcp_ref: GwClientRef,
-    sidecar: Arc<SidecarBridge>,
-) {
+pub fn register(reg: &ToolRegistry, mcp_ref: GwClientRef, sidecar: Arc<SidecarBridge>) {
     // Default account name — user sets this up via CLI before starting KRIA
     let account = std::env::var("KRIA_GW_ACCOUNT").unwrap_or_else(|_| "personal".into());
-    tracing::info!("[GW] registering Google Workspace tools (account='{}', lazy MCP ref)", account);
+    tracing::info!(
+        "[GW] registering Google Workspace tools (account='{}', lazy MCP ref)",
+        account
+    );
 
-    let gw = GwBridge { mcp: mcp_ref, sidecar, account };
+    let gw = GwBridge {
+        mcp: mcp_ref,
+        sidecar,
+        account,
+    };
 
     let tools: Vec<(ToolDef, Arc<dyn ToolHandler>)> = vec![
         // ── Ambient (always mounted) ─────────────────────
         (
             ToolDef {
                 name: "gw_gmail_inbox".into(),
-                description: "List recent emails from Gmail inbox. USE THIS to check inbox, see recent mail, or list emails. Returns sender, subject, date, and snippet for each message.".into(),
+                description: "List recent emails from Gmail inbox. USE THIS to check inbox, see recent mail, or list emails. Returns sender, subject, date, preview, labels, and message IDs.".into(),
                 category: "google_workspace".into(),
                 default_tier: RiskLevel::Green,
-                min_tier: "standard",
+                min_tier: "lite",
                 parameters: vec![
                     param("query", "string", "Optional Gmail search filter (e.g. 'is:unread')", false),
+                    param("max_results", "integer", "Maximum messages to return (default 10, max 50)", false),
                 ],
             },
             Arc::new(GwGmailInbox(gw.clone())),
@@ -535,9 +711,10 @@ pub fn register(
                 description: "Search Gmail with a query string (same syntax as Gmail search bar). Use for filtering by sender, subject, label, date, etc.".into(),
                 category: "google_workspace".into(),
                 default_tier: RiskLevel::Green,
-                min_tier: "standard",
+                min_tier: "lite",
                 parameters: vec![
                     param("query", "string", "Gmail search query (e.g. 'from:boss subject:report')", true),
+                    param("max_results", "integer", "Maximum messages to return (default 10, max 50)", false),
                 ],
             },
             Arc::new(GwGmailSearch(gw.clone())),
@@ -548,7 +725,7 @@ pub fn register(
                 description: "Read the FULL content of a single Gmail message. Requires the message_id obtained from gw_gmail_inbox or gw_gmail_search. Do NOT use this to list or check inbox.".into(),
                 category: "google_workspace".into(),
                 default_tier: RiskLevel::Green,
-                min_tier: "standard",
+                min_tier: "lite",
                 parameters: vec![
                     param("message_id", "string", "Gmail message ID", true),
                 ],
@@ -561,7 +738,7 @@ pub fn register(
                 description: "Get today's calendar events from Google Calendar.".into(),
                 category: "google_workspace".into(),
                 default_tier: RiskLevel::Green,
-                min_tier: "standard",
+                min_tier: "lite",
                 parameters: vec![],
             },
             Arc::new(GwCalendarToday(gw.clone())),
@@ -572,7 +749,7 @@ pub fn register(
                 description: "Search Google Calendar events by keyword or date range.".into(),
                 category: "google_workspace".into(),
                 default_tier: RiskLevel::Green,
-                min_tier: "standard",
+                min_tier: "lite",
                 parameters: vec![
                     param("query", "string", "Search text for event titles/descriptions", false),
                     param("time_min", "string", "Start of time range (ISO 8601)", false),
@@ -587,7 +764,7 @@ pub fn register(
                 description: "Search Google Drive files by name or content.".into(),
                 category: "google_workspace".into(),
                 default_tier: RiskLevel::Green,
-                min_tier: "standard",
+                min_tier: "lite",
                 parameters: vec![
                     param("query", "string", "Search query (supports Drive search operators)", true),
                 ],
@@ -600,7 +777,7 @@ pub fn register(
                 description: "List files in a Google Drive folder.".into(),
                 category: "google_workspace".into(),
                 default_tier: RiskLevel::Green,
-                min_tier: "standard",
+                min_tier: "lite",
                 parameters: vec![
                     param("folder_id", "string", "Drive folder ID (omit for root)", false),
                 ],
@@ -613,7 +790,7 @@ pub fn register(
                 description: "Read content of a Google Drive file / Google Doc by ID.".into(),
                 category: "google_workspace".into(),
                 default_tier: RiskLevel::Green,
-                min_tier: "standard",
+                min_tier: "lite",
                 parameters: vec![
                     param("file_id", "string", "Google Drive file or Google Doc ID", true),
                 ],
@@ -628,7 +805,7 @@ pub fn register(
                 description: "Read a Google Doc by ID (markdown format).".into(),
                 category: "google_workspace".into(),
                 default_tier: RiskLevel::Green,
-                min_tier: "standard",
+                min_tier: "lite",
                 parameters: vec![
                     param("document_id", "string", "Google Docs document ID", true),
                 ],
@@ -641,7 +818,7 @@ pub fn register(
                 description: "Create a new Google Doc.".into(),
                 category: "google_workspace".into(),
                 default_tier: RiskLevel::Yellow,
-                min_tier: "standard",
+                min_tier: "lite",
                 parameters: vec![
                     param("title", "string", "Document title", true),
                 ],
@@ -654,7 +831,7 @@ pub fn register(
                 description: "Append text to an existing Google Doc.".into(),
                 category: "google_workspace".into(),
                 default_tier: RiskLevel::Yellow,
-                min_tier: "standard",
+                min_tier: "lite",
                 parameters: vec![
                     param("document_id", "string", "Google Docs document ID", true),
                     param("text", "string", "Text to append", true),
@@ -668,7 +845,7 @@ pub fn register(
                 description: "Read a Google Spreadsheet by ID.".into(),
                 category: "google_workspace".into(),
                 default_tier: RiskLevel::Green,
-                min_tier: "standard",
+                min_tier: "lite",
                 parameters: vec![
                     param("spreadsheet_id", "string", "Google Sheets spreadsheet ID", true),
                     param("range", "string", "Cell range like 'Sheet1!A1:D10' (optional)", false),
@@ -682,7 +859,7 @@ pub fn register(
                 description: "Create a new Google Spreadsheet.".into(),
                 category: "google_workspace".into(),
                 default_tier: RiskLevel::Yellow,
-                min_tier: "standard",
+                min_tier: "lite",
                 parameters: vec![
                     param("title", "string", "Spreadsheet title", true),
                 ],
@@ -695,7 +872,7 @@ pub fn register(
                 description: "Write data to a Google Sheet range.".into(),
                 category: "google_workspace".into(),
                 default_tier: RiskLevel::Yellow,
-                min_tier: "standard",
+                min_tier: "lite",
                 parameters: vec![
                     param("spreadsheet_id", "string", "Google Sheets spreadsheet ID", true),
                     param("range", "string", "Target cell range (e.g. 'Sheet1!A1:C3')", true),
@@ -710,7 +887,7 @@ pub fn register(
                 description: "Read a Google Slides presentation by ID.".into(),
                 category: "google_workspace".into(),
                 default_tier: RiskLevel::Green,
-                min_tier: "standard",
+                min_tier: "lite",
                 parameters: vec![
                     param("presentation_id", "string", "Google Slides presentation ID", true),
                 ],
@@ -723,7 +900,7 @@ pub fn register(
                 description: "Create a new Google Slides presentation.".into(),
                 category: "google_workspace".into(),
                 default_tier: RiskLevel::Yellow,
-                min_tier: "standard",
+                min_tier: "lite",
                 parameters: vec![
                     param("title", "string", "Presentation title", true),
                 ],
@@ -738,7 +915,7 @@ pub fn register(
                 description: "Send an email via Gmail (creates draft then sends). Requires HITL approval.".into(),
                 category: "google_workspace".into(),
                 default_tier: RiskLevel::Red,
-                min_tier: "standard",
+                min_tier: "lite",
                 parameters: vec![
                     param("to", "string", "Recipient email address", true),
                     param("subject", "string", "Email subject line", true),
@@ -754,7 +931,7 @@ pub fn register(
                 description: "Delete a Gmail message. Requires HITL approval.".into(),
                 category: "google_workspace".into(),
                 default_tier: RiskLevel::Red,
-                min_tier: "standard",
+                min_tier: "lite",
                 parameters: vec![
                     param("message_id", "string", "Gmail message ID to delete", true),
                 ],
@@ -767,7 +944,7 @@ pub fn register(
                 description: "Delete a file from Google Drive. Requires HITL approval.".into(),
                 category: "google_workspace".into(),
                 default_tier: RiskLevel::Red,
-                min_tier: "standard",
+                min_tier: "lite",
                 parameters: vec![
                     param("file_id", "string", "Google Drive file ID to delete", true),
                 ],
@@ -780,7 +957,7 @@ pub fn register(
                 description: "Create a new Google Calendar event. Requires HITL approval.".into(),
                 category: "google_workspace".into(),
                 default_tier: RiskLevel::Yellow,
-                min_tier: "standard",
+                min_tier: "lite",
                 parameters: vec![
                     param("summary", "string", "Event title", true),
                     param("start", "string", "Start time (ISO 8601)", true),
@@ -797,7 +974,7 @@ pub fn register(
                 description: "Delete a Google Calendar event. Requires HITL approval.".into(),
                 category: "google_workspace".into(),
                 default_tier: RiskLevel::Red,
-                min_tier: "standard",
+                min_tier: "lite",
                 parameters: vec![
                     param("event_id", "string", "Calendar event ID to delete", true),
                 ],
@@ -811,6 +988,36 @@ pub fn register(
         reg.register(def, handler);
     }
 
-    tracing::info!("[GW] 22 Google Workspace tools registered (account='{}', MCP connection pending)", gw.account);
+    tracing::info!(
+        "[GW] 22 Google Workspace tools registered (account='{}', MCP connection pending)",
+        gw.account
+    );
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{gmail_max_results, normalize_gmail_inbox_query};
+
+    #[test]
+    fn gmail_inbox_query_defaults_to_inbox() {
+        assert_eq!(normalize_gmail_inbox_query(None), "in:inbox");
+        assert_eq!(
+            normalize_gmail_inbox_query(Some("is:unread")),
+            "in:inbox is:unread"
+        );
+        assert_eq!(normalize_gmail_inbox_query(Some("in:sent")), "in:sent");
+    }
+
+    #[test]
+    fn gmail_max_results_uses_param_and_caps_values() {
+        assert_eq!(gmail_max_results(&serde_json::json!({}), 10), 10);
+        assert_eq!(
+            gmail_max_results(&serde_json::json!({"max_results": 3}), 10),
+            3
+        );
+        assert_eq!(
+            gmail_max_results(&serde_json::json!({"max_results": 500}), 10),
+            50
+        );
+    }
+}

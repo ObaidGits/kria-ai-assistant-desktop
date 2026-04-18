@@ -1,21 +1,14 @@
-use axum::{
-    extract::Request,
-    http::StatusCode,
-    middleware::Next,
-    response::Response,
-};
+use axum::{extract::Request, http::StatusCode, middleware::Next, response::Response};
 
 /// JWT authentication middleware (optional — for remote server mode).
-pub async fn auth_middleware(
-    request: Request,
-    next: Next,
-) -> Result<Response, StatusCode> {
+pub async fn auth_middleware(request: Request, next: Next) -> Result<Response, StatusCode> {
     // If no auth is configured, pass through
     let auth_header = request.headers().get("Authorization");
 
     match auth_header {
         Some(value) => {
-            let token = value.to_str()
+            let token = value
+                .to_str()
                 .map_err(|_| StatusCode::UNAUTHORIZED)?
                 .strip_prefix("Bearer ")
                 .ok_or(StatusCode::UNAUTHORIZED)?;

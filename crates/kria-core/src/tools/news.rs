@@ -6,12 +6,12 @@
 //!   list_news_sources → which sources are being polled and when
 //!   news_status       → poller health + DB stats
 
-use std::sync::Arc;
-use async_trait::async_trait;
 use crate::infra::ToolResult;
-use crate::sidecar::SidecarBridge;
 use crate::safety::RiskLevel;
-use crate::tools::registry::{ToolRegistry, ToolDef, ToolHandler, ParamDef};
+use crate::sidecar::SidecarBridge;
+use crate::tools::registry::{ParamDef, ToolDef, ToolHandler, ToolRegistry};
+use async_trait::async_trait;
+use std::sync::Arc;
 
 fn param(name: &str, ty: &str, desc: &str, required: bool) -> ParamDef {
     ParamDef {
@@ -30,8 +30,16 @@ struct Sidecar(Arc<SidecarBridge>);
 impl Sidecar {
     async fn call(&self, method: &str, params: serde_json::Value) -> ToolResult {
         match self.0.request(method, params).await {
-            Ok(v)  => ToolResult { success: true,  data: v,                          error: None },
-            Err(e) => ToolResult { success: false, data: serde_json::Value::Null, error: Some(e.to_string()) },
+            Ok(v) => ToolResult {
+                success: true,
+                data: v,
+                error: None,
+            },
+            Err(e) => ToolResult {
+                success: false,
+                data: serde_json::Value::Null,
+                error: Some(e.to_string()),
+            },
         }
     }
 }

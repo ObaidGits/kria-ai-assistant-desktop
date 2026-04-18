@@ -1,6 +1,6 @@
+pub mod auth;
 pub mod routes;
 pub mod ws;
-pub mod auth;
 
 use axum::Router;
 use std::sync::Arc;

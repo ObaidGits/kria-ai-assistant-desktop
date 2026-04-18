@@ -15,9 +15,13 @@ const [hitlRequest, setHitlRequest] = createSignal<HitlRequest | null>(null);
 const [voiceActive, setVoiceActive] = createSignal(false);
 const [voiceState, setVoiceState] = createSignal<"idle" | "listening" | "processing" | "speaking">("idle");
 const [voiceLiveTranscript, setVoiceLiveTranscript] = createSignal("");
+const [voiceLiveConfidence, setVoiceLiveConfidence] = createSignal<number | null>(null);
+const [voiceLiveLanguage, setVoiceLiveLanguage] = createSignal("auto");
+const [voiceLiveStability, setVoiceLiveStability] = createSignal<number | null>(null);
 const [inputText, setInputText] = createSignal("");
 const [settings, setSettings] = createSignal<Record<string, any> | null>(null);
 const [models, setModels] = createSignal<any[]>([]);
+const [audioDevices, setAudioDevices] = createSignal<AudioDevicesData | null>(null);
 const resolveInitialTheme = (): "dark" | "light" => {
   if (typeof window === "undefined") return "dark";
   const saved = window.localStorage.getItem("kria_theme");
@@ -33,6 +37,9 @@ const [workflows, setWorkflows] = createSignal<WorkflowInfo[]>([]);
 const [hardwareInfo, setHardwareInfo] = createSignal<HardwareInfoData | null>(null);
 const [knowledgeBase, setKnowledgeBase] = createSignal<KnowledgeDoc[]>([]);
 const [alerts, setAlerts] = createSignal<ProactiveAlert[]>([]);
+
+let healthLoadInFlight = false;
+let healthLoadQueued = false;
 
 // Telegram integration
 export interface TelegramConfig {
@@ -98,6 +105,9 @@ export interface McpServer {
   args: string[];
   enabled: boolean;
   trust_level: string;
+  runtime_state?: string;
+  runtime_tool_count?: number;
+  runtime_error?: string | null;
 }
 
 export interface ScheduledTask {
@@ -138,6 +148,13 @@ export interface HardwareInfoData {
   context_window: number;
   gpu_layers: number;
   threads: number;
+}
+
+export interface AudioDevicesData {
+  inputs: string[];
+  outputs: string[];
+  default_input: string | null;
+  default_output: string | null;
 }
 
 export interface KnowledgeDoc {
@@ -253,6 +270,9 @@ async function toggleVoice() {
     await invoke("stop_voice");
     setVoiceActive(false);
     setVoiceState("idle");
+    setVoiceLiveTranscript("");
+    setVoiceLiveConfidence(null);
+    setVoiceLiveStability(null);
   } else {
     try {
       await invoke("start_voice");
@@ -317,11 +337,23 @@ async function toggleMcpServer(name: string, enabled: boolean) {
 
 // --- Health & Automation management ---
 async function loadHealth() {
+  if (healthLoadInFlight) {
+    healthLoadQueued = true;
+    return;
+  }
+
+  healthLoadInFlight = true;
   try {
     const result = await invoke<Record<string, any>>("get_health");
     setHealthInfo(result);
   } catch (e) {
     console.error("Failed to load health:", e);
+  } finally {
+    healthLoadInFlight = false;
+    if (healthLoadQueued) {
+      healthLoadQueued = false;
+      void loadHealth();
+    }
   }
 }
 
@@ -519,20 +551,49 @@ async function stopTelegramMcp() {
 }
 
 // --- Google Workspace ---
+export interface GoogleWorkspaceMcpStatus {
+  configured_enabled: boolean;
+  state: string;
+  tool_count: number;
+  error: string | null;
+}
+
+export interface GoogleWorkspaceCapabilities {
+  gmail: boolean;
+  drive: boolean;
+  calendar: boolean;
+  docs: boolean;
+  sheets: boolean;
+  slides: boolean;
+  meet: boolean;
+  meet_via_calendar: boolean;
+}
+
 export interface GoogleWorkspaceStatus {
   connected: boolean;
+  legacy_connected?: boolean;
   account: string;
   credentials_configured: boolean;
+  token_present: boolean;
+  auth_ready: boolean;
+  runtime_ready: boolean;
+  gw_client_wired: boolean;
+  mcp: GoogleWorkspaceMcpStatus;
+  capabilities: GoogleWorkspaceCapabilities;
+  meet_support_mode: string;
+  warnings: string[];
 }
 
 const [googleStatus, setGoogleStatus] = createSignal<GoogleWorkspaceStatus | null>(null);
 
-async function loadGoogleStatus(account?: string) {
+async function loadGoogleStatus(account?: string): Promise<GoogleWorkspaceStatus | null> {
   try {
     const result = await invoke<GoogleWorkspaceStatus>("get_google_workspace_status", { account: account ?? null });
     setGoogleStatus(result);
+    return result;
   } catch (e) {
     console.error("Failed to load Google status:", e);
+    return null;
   }
 }
 
@@ -560,6 +621,21 @@ async function loadSettings() {
     }
   } catch (e) {
     console.error("Failed to load settings:", e);
+  }
+}
+
+async function loadAudioDevices() {
+  try {
+    const result = await invoke<AudioDevicesData>("list_audio_devices");
+    setAudioDevices(result);
+  } catch (e) {
+    console.error("Failed to load audio devices:", e);
+    setAudioDevices({
+      inputs: [],
+      outputs: [],
+      default_input: null,
+      default_output: null,
+    });
   }
 }
 
@@ -816,15 +892,26 @@ function initListeners() {
   listen<{ state: "idle" | "listening" | "processing" | "speaking" }>("voice:state", (event) => {
     setVoiceState(event.payload.state);
     setVoiceActive(event.payload.state !== "idle");
+    if (event.payload.state === "idle") {
+      setVoiceLiveTranscript("");
+      setVoiceLiveConfidence(null);
+      setVoiceLiveStability(null);
+    }
   });
 
-  listen<{ text: string }>("voice:partial_transcript", (event) => {
+  listen<{ text: string; confidence?: number; language?: string; stability?: number }>("voice:partial_transcript", (event) => {
     setVoiceLiveTranscript(event.payload.text);
+    setVoiceLiveConfidence(event.payload.confidence ?? null);
+    setVoiceLiveLanguage(event.payload.language ?? "auto");
+    setVoiceLiveStability(event.payload.stability ?? null);
   });
 
-  listen<{ text: string }>("voice:transcript", (event) => {
+  listen<{ text: string; confidence?: number; language?: string; stability?: number }>("voice:transcript", (event) => {
     // Clear partial transcript on final result
     setVoiceLiveTranscript("");
+    setVoiceLiveConfidence(event.payload.confidence ?? null);
+    setVoiceLiveLanguage(event.payload.language ?? "auto");
+    setVoiceLiveStability(event.payload.stability ?? null);
     // Show the transcript as a user message
     const userMsg: Message = {
       id: crypto.randomUUID(),
@@ -837,6 +924,13 @@ function initListeners() {
 
   listen<{ error: string }>("voice:error", (event) => {
     console.error("Voice error:", event.payload.error);
+    const errMsg: Message = {
+      id: crypto.randomUUID(),
+      role: "system",
+      content: `⚠️ Voice Error: ${event.payload.error}`,
+      timestamp: Date.now(),
+    };
+    setMessages((prev) => [...prev, errMsg]);
   });
 }
 
@@ -848,6 +942,7 @@ applyTheme(theme());
 loadSessions();
 // Load settings on startup
 loadSettings();
+loadAudioDevices();
 // Prime and refresh system health for UI status indicators.
 loadHealth();
 setInterval(() => {
@@ -867,10 +962,14 @@ export const appStore = {
   voiceActive,
   voiceState,
   voiceLiveTranscript,
+  voiceLiveConfidence,
+  voiceLiveLanguage,
+  voiceLiveStability,
   inputText,
   setInputText,
   settings,
   models,
+  audioDevices,
   theme,
   sendMessage,
   sendImageMessage,
@@ -883,6 +982,7 @@ export const appStore = {
   deleteSession,
   renameSession,
   loadSettings,
+  loadAudioDevices,
   saveSettings,
   loadModels,
   applyTheme,

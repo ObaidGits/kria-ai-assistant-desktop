@@ -31,10 +31,47 @@ logger = logging.getLogger("kria.bridge")
 _start_time = time.monotonic()
 _tier = os.environ.get("KRIA_TIER", "standard")
 _request_count = 0
+MAX_REQUEST_SIZE_BYTES = int(os.environ.get("KRIA_MAX_REQUEST_MB", "50")) * 1024 * 1024
 
 # ── Processor registry ──────────────────────────────────────────
 
 _processors: dict[str, Any] = {}
+
+
+def _json_safe(value: Any) -> Any:
+    """Convert non-JSON-native types (e.g. numpy scalars) into serializable values."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+
+    # numpy scalar compatibility without importing numpy directly.
+    if hasattr(value, "item"):
+        try:
+            return _json_safe(value.item())
+        except Exception:
+            pass
+
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode("utf-8", errors="replace")
+
+    return str(value)
+
+
+def _validate_params(method: str, params: dict[str, Any]) -> str | None:
+    """Validate method-specific params for critical paths before dispatch."""
+    if method == "image.analyze":
+        file_path = params.get("file_path") or params.get("file")
+        if not isinstance(file_path, str) or not file_path.strip():
+            return "image.analyze requires params.file_path or params.file as a non-empty string"
+        operations = params.get("operations")
+        if operations is not None and not isinstance(operations, list):
+            return "image.analyze params.operations must be a list when provided"
+    return None
 
 
 def _load_processors() -> None:
@@ -101,26 +138,32 @@ def _load_processors() -> None:
 # ── JSON-RPC helpers ────────────────────────────────────────────
 
 def _success_response(id: Any, result: Any) -> dict:
-    return {"jsonrpc": "2.0", "id": id, "result": result}
+    return {"jsonrpc": "2.0", "id": _json_safe(id), "result": _json_safe(result)}
 
 
 def _error_response(id: Any, code: int, message: str, data: Any = None) -> dict:
     err: dict[str, Any] = {"code": code, "message": message}
     if data is not None:
-        err["data"] = data
-    return {"jsonrpc": "2.0", "id": id, "error": err}
+        err["data"] = _json_safe(data)
+    return {"jsonrpc": "2.0", "id": _json_safe(id), "error": err}
 
 
 # ── Built-in methods ───────────────────────────────────────────
 
 def _handle_ping(params: dict) -> dict:
-    import psutil  # noqa: lazy import — only used for health
+    memory_mb: float | None = None
+    try:
+        import psutil  # noqa: lazy import — only used for health
 
-    proc = psutil.Process()
+        proc = psutil.Process()
+        memory_mb = round(proc.memory_info().rss / (1024 * 1024), 1)
+    except Exception:
+        pass
+
     return {
         "status": "pong",
         "uptime_secs": round(time.monotonic() - _start_time, 2),
-        "memory_mb": round(proc.memory_info().rss / (1024 * 1024), 1),
+        "memory_mb": memory_mb,
         "request_count": _request_count,
     }
 
@@ -195,31 +238,53 @@ def _dispatch(method: str, params: dict) -> Any:
         raise ValueError(f"Unknown method '{func_name}' on processor '{module_name}'")
 
     # Inject tier into params so processors can adapt
-    params["_tier"] = _tier
-    return handler(params)
+    dispatch_params = dict(params)
+    dispatch_params["_tier"] = _tier
+    return handler(dispatch_params)
 
 
 def _process_request(line: str) -> str | None:
     """Parse a JSON-RPC request and return a JSON-RPC response string."""
     global _request_count
 
+    if len(line.encode("utf-8")) > MAX_REQUEST_SIZE_BYTES:
+        return json.dumps(
+            _error_response(
+                None,
+                -32600,
+                f"Request too large (max {MAX_REQUEST_SIZE_BYTES} bytes)",
+            )
+        )
+
     try:
         req = json.loads(line)
     except json.JSONDecodeError as e:
         return json.dumps(_error_response(None, -32700, f"Parse error: {e}"))
 
+    if not isinstance(req, dict):
+        return json.dumps(_error_response(None, -32600, "Invalid request object"))
+
     req_id = req.get("id")
     method = req.get("method")
     params = req.get("params", {})
 
-    if not method:
+    if not isinstance(method, str) or not method:
         return json.dumps(_error_response(req_id, -32600, "Missing 'method' field"))
+
+    if params is None:
+        params = {}
+    if not isinstance(params, dict):
+        return json.dumps(_error_response(req_id, -32602, "Invalid params: expected JSON object"))
+
+    validation_error = _validate_params(method, params)
+    if validation_error:
+        return json.dumps(_error_response(req_id, -32602, validation_error))
 
     _request_count += 1
     logger.info("Request #%d: %s", _request_count, method)
 
     try:
-        result = _dispatch(method, params if isinstance(params, dict) else {})
+        result = _dispatch(method, params)
         return json.dumps(_success_response(req_id, result))
     except ValueError as e:
         return json.dumps(_error_response(req_id, -32601, str(e)))

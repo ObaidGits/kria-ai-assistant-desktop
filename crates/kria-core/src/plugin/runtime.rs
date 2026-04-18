@@ -46,7 +46,11 @@ impl PluginRuntime {
             if manifest_path.exists() {
                 match self.load_manifest(&manifest_path) {
                     Ok(manifest) => {
-                        tracing::info!("discovered plugin: {} v{}", manifest.name, manifest.version);
+                        tracing::info!(
+                            "discovered plugin: {} v{}",
+                            manifest.name,
+                            manifest.version
+                        );
                         found.push(manifest);
                     }
                     Err(e) => {
@@ -77,7 +81,8 @@ impl PluginRuntime {
 
     /// Check if a plugin provides a specific tool.
     pub fn find_tool_provider(&self, tool_name: &str) -> Option<&PluginManifest> {
-        self.loaded.values()
+        self.loaded
+            .values()
             .find(|m| m.tools.iter().any(|t| t == tool_name))
     }
 

@@ -2934,6 +2934,8 @@ name = "kria-desktop"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "axum",
  "chrono",
  "kria-core",
  "reqwest 0.12.28",

@@ -82,7 +82,9 @@ impl WorkflowEngine {
         F: Fn(String, serde_json::Value) -> Fut,
         Fut: std::future::Future<Output = anyhow::Result<String>>,
     {
-        let workflow = self.workflows.get(workflow_id)
+        let workflow = self
+            .workflows
+            .get(workflow_id)
             .ok_or_else(|| anyhow::anyhow!("workflow not found: {workflow_id}"))?;
 
         let mut execution = WorkflowExecution {
@@ -112,9 +114,8 @@ impl WorkflowEngine {
                     });
 
                     if step.on_failure.is_none() {
-                        execution.status = WorkflowStatus::Failed(
-                            format!("step {} failed: {e}", step.id),
-                        );
+                        execution.status =
+                            WorkflowStatus::Failed(format!("step {} failed: {e}", step.id));
                         return Ok(execution);
                     }
                     // on_failure jump not yet implemented (requires index lookup)

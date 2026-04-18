@@ -124,7 +124,9 @@ async fn list_languages_returns_all() {
 async fn detect_language_english() {
     let reg = build_default_registry();
     let handler = reg.get_handler("detect_language").unwrap();
-    let result = handler.execute(serde_json::json!({ "text": "Hello world, this is a test" })).await;
+    let result = handler
+        .execute(serde_json::json!({ "text": "Hello world, this is a test" }))
+        .await;
     assert!(result.success);
     assert_eq!(result.data["detected_language"].as_str().unwrap(), "en");
 }
@@ -133,7 +135,9 @@ async fn detect_language_english() {
 async fn detect_language_arabic() {
     let reg = build_default_registry();
     let handler = reg.get_handler("detect_language").unwrap();
-    let result = handler.execute(serde_json::json!({ "text": "مرحبا بالعالم هذا اختبار" })).await;
+    let result = handler
+        .execute(serde_json::json!({ "text": "مرحبا بالعالم هذا اختبار" }))
+        .await;
     assert!(result.success);
     assert_eq!(result.data["detected_language"].as_str().unwrap(), "ar");
 }
@@ -142,7 +146,9 @@ async fn detect_language_arabic() {
 async fn detect_language_chinese() {
     let reg = build_default_registry();
     let handler = reg.get_handler("detect_language").unwrap();
-    let result = handler.execute(serde_json::json!({ "text": "你好世界这是一个测试" })).await;
+    let result = handler
+        .execute(serde_json::json!({ "text": "你好世界这是一个测试" }))
+        .await;
     assert!(result.success);
     assert_eq!(result.data["detected_language"].as_str().unwrap(), "zh");
 }
@@ -151,7 +157,9 @@ async fn detect_language_chinese() {
 async fn detect_language_hindi() {
     let reg = build_default_registry();
     let handler = reg.get_handler("detect_language").unwrap();
-    let result = handler.execute(serde_json::json!({ "text": "नमस्ते दुनिया यह एक परीक्षण है" })).await;
+    let result = handler
+        .execute(serde_json::json!({ "text": "नमस्ते दुनिया यह एक परीक्षण है" }))
+        .await;
     assert!(result.success);
     assert_eq!(result.data["detected_language"].as_str().unwrap(), "hi");
 }

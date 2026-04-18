@@ -17,7 +17,8 @@ impl ImageProcessor {
         let meta = std::fs::metadata(path)?;
         let img = image::open(path)?;
         let (w, h) = (img.width(), img.height());
-        let ext = path.extension()
+        let ext = path
+            .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("unknown")
             .to_lowercase();
@@ -35,10 +36,7 @@ impl ImageProcessor {
         let img = image::open(path)?;
         let thumb = img.thumbnail(max_dim, max_dim);
         let mut buf = Vec::new();
-        thumb.write_to(
-            &mut std::io::Cursor::new(&mut buf),
-            image::ImageFormat::Png,
-        )?;
+        thumb.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)?;
         Ok(buf)
     }
 

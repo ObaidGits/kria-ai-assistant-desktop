@@ -1,5 +1,5 @@
-use regex::Regex;
 use once_cell::sync::Lazy;
+use regex::Regex;
 
 /// Parsed tool call from LLM output.
 #[derive(Debug, Clone)]
@@ -11,14 +11,12 @@ pub struct ParsedToolCall {
 // ─── Tool call regexes (7 patterns) ───
 
 /// Pattern 1: XML-style <tool_call>{"name": ..., "arguments": ...}</tool_call>
-static TOOL_CALL_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?s)<tool_call>\s*(\{.*?\})\s*</tool_call>").unwrap()
-});
+static TOOL_CALL_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?s)<tool_call>\s*(\{.*?\})\s*</tool_call>").unwrap());
 
 /// Pattern 2: Bracket style [[tool_name(arg1=val1, arg2=val2)]]
-static BRACKET_CALL_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\[\[(\w+)\(([^)]*)\)\]\]").unwrap()
-});
+static BRACKET_CALL_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\[\[(\w+)\(([^)]*)\)\]\]").unwrap());
 
 /// Pattern 3: Raw JSON {"name": "tool_name", "arguments": {...}}
 static RAW_JSON_TOOL_RE: Lazy<Regex> = Lazy::new(|| {
@@ -26,16 +24,13 @@ static RAW_JSON_TOOL_RE: Lazy<Regex> = Lazy::new(|| {
 });
 
 /// Pattern 4: Key-value style tool_name: key1=val1, key2=val2
-static KV_TOOL_CALL_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"^(\w+):\s*(.+)$").unwrap()
-});
+static KV_TOOL_CALL_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^(\w+):\s*(.+)$").unwrap());
 
 /// Pattern 7: Python-style positional call  tool_name("value")  or  tool_name(param="value")
 /// Last-resort fallback — only matched when all other patterns fail.
 /// The caller must supply a set of known tool names to prevent false positives.
-static PYTHON_CALL_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(?m)^[ \t]*(\w+)\(([^)]*)\)[ \t]*$"#).unwrap()
-});
+static PYTHON_CALL_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"(?m)^[ \t]*(\w+)\(([^)]*)\)[ \t]*$"#).unwrap());
 
 /// Parse all tool calls from LLM output text.
 pub fn parse_tool_calls(text: &str) -> Vec<ParsedToolCall> {
@@ -64,7 +59,10 @@ pub fn parse_tool_calls(text: &str) -> Vec<ParsedToolCall> {
 
     // Try Pattern 2: [[tool_name(args)]]
     for cap in BRACKET_CALL_RE.captures_iter(text) {
-        let name = cap.get(1).map(|m| m.as_str().to_string()).unwrap_or_default();
+        let name = cap
+            .get(1)
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
         let args_str = cap.get(2).map(|m| m.as_str()).unwrap_or("");
         let arguments = parse_kv_args(args_str);
         calls.push(ParsedToolCall { name, arguments });
@@ -76,7 +74,10 @@ pub fn parse_tool_calls(text: &str) -> Vec<ParsedToolCall> {
 
     // Try Pattern 3: Raw JSON
     for cap in RAW_JSON_TOOL_RE.captures_iter(text) {
-        let name = cap.get(1).map(|m| m.as_str().to_string()).unwrap_or_default();
+        let name = cap
+            .get(1)
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
         let args_str = cap.get(2).map(|m| m.as_str()).unwrap_or("{}");
         let arguments = serde_json::from_str(args_str).unwrap_or(serde_json::json!({}));
         calls.push(ParsedToolCall { name, arguments });
@@ -90,7 +91,10 @@ pub fn parse_tool_calls(text: &str) -> Vec<ParsedToolCall> {
     for line in text.lines() {
         let trimmed = line.trim();
         if let Some(cap) = KV_TOOL_CALL_RE.captures(trimmed) {
-            let name = cap.get(1).map(|m| m.as_str().to_string()).unwrap_or_default();
+            let name = cap
+                .get(1)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default();
             let args_str = cap.get(2).map(|m| m.as_str()).unwrap_or("");
             let arguments = parse_kv_args(args_str);
             calls.push(ParsedToolCall { name, arguments });
@@ -158,11 +162,10 @@ fn parse_kv_args(s: &str) -> serde_json::Value {
             let key = key.trim().to_string();
             let val = val.trim();
             // Try to parse as JSON value, fallback to string
-            let json_val = serde_json::from_str(val)
-                .unwrap_or_else(|_| {
-                    let unquoted = val.trim_matches('"').trim_matches('\'');
-                    serde_json::Value::String(unquoted.to_string())
-                });
+            let json_val = serde_json::from_str(val).unwrap_or_else(|_| {
+                let unquoted = val.trim_matches('"').trim_matches('\'');
+                serde_json::Value::String(unquoted.to_string())
+            });
             map.insert(key, json_val);
         }
     }

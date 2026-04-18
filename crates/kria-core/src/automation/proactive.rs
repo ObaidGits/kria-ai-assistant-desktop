@@ -1,8 +1,8 @@
+use chrono::{DateTime, Utc};
 /// Proactive Intelligence — system health monitoring, file watchers, smart suggestions.
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use chrono::{DateTime, Utc};
 
 /// A proactive notification with category and suggested action.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -69,12 +69,22 @@ impl ProactiveEngine {
     /// Add a directory to watch.
     pub async fn watch_dir(&self, path: PathBuf, label: &str) {
         let mut dirs = self.watched_dirs.write().await;
-        dirs.push(WatchedDir { path, label: label.to_string(), enabled: true });
+        dirs.push(WatchedDir {
+            path,
+            label: label.to_string(),
+            enabled: true,
+        });
     }
 
     /// Get all undismissed alerts.
     pub async fn get_alerts(&self) -> Vec<ProactiveAlert> {
-        self.alerts.read().await.iter().filter(|a| !a.dismissed).cloned().collect()
+        self.alerts
+            .read()
+            .await
+            .iter()
+            .filter(|a| !a.dismissed)
+            .cloned()
+            .collect()
     }
 
     /// Get all alerts including dismissed.
@@ -94,7 +104,13 @@ impl ProactiveEngine {
     }
 
     /// Push a new alert.
-    pub async fn push_alert(&self, category: AlertCategory, title: &str, message: &str, suggestion: Option<&str>) {
+    pub async fn push_alert(
+        &self,
+        category: AlertCategory,
+        title: &str,
+        message: &str,
+        suggestion: Option<&str>,
+    ) {
         let alert = ProactiveAlert {
             id: uuid::Uuid::new_v4().to_string(),
             category,
@@ -125,9 +141,13 @@ impl ProactiveEngine {
             self.push_alert(
                 AlertCategory::Alert,
                 "Low Memory",
-                &format!("Available RAM is {}MB (threshold: {}MB)", available_ram_mb, self.thresholds.min_ram_mb),
+                &format!(
+                    "Available RAM is {}MB (threshold: {}MB)",
+                    available_ram_mb, self.thresholds.min_ram_mb
+                ),
                 Some("Close unused applications to free memory"),
-            ).await;
+            )
+            .await;
         }
 
         // Check disk space
@@ -145,7 +165,8 @@ impl ProactiveEngine {
                         "Low Disk Space",
                         &format!("{}: {:.1}% free ({} GB available)", mount, pct, avail_gb),
                         Some("Want me to find large files to clean up?"),
-                    ).await;
+                    )
+                    .await;
                 }
             }
         }
@@ -154,10 +175,14 @@ impl ProactiveEngine {
     /// Start the file watcher for configured directories.
     /// Returns a handle to the watcher (keep alive).
     pub async fn start_file_watcher(&self) -> anyhow::Result<Option<notify::RecommendedWatcher>> {
-        use notify::{Watcher, RecursiveMode, Config};
+        use notify::{Config, RecursiveMode, Watcher};
 
         let dirs = self.watched_dirs.read().await;
-        let active: Vec<WatchedDir> = dirs.iter().filter(|d| d.enabled && d.path.exists()).cloned().collect();
+        let active: Vec<WatchedDir> = dirs
+            .iter()
+            .filter(|d| d.enabled && d.path.exists())
+            .cloned()
+            .collect();
         drop(dirs);
 
         if active.is_empty() {
@@ -186,7 +211,10 @@ impl ProactiveEngine {
             while let Some(event) = rx.recv().await {
                 if event.kind.is_create() || event.kind.is_modify() {
                     for path in &event.paths {
-                        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                        let name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
                         let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
                         let size_str = if size > 1_000_000_000 {
                             format!("{:.1} GB", size as f64 / 1_000_000_000.0)
@@ -196,11 +224,16 @@ impl ProactiveEngine {
                             format!("{} KB", size / 1024)
                         };
 
-                        let is_sensitive = name.starts_with('.') && (
-                            name.contains("env") || name.contains("key") || name.contains("secret")
-                        );
+                        let is_sensitive = name.starts_with('.')
+                            && (name.contains("env")
+                                || name.contains("key")
+                                || name.contains("secret"));
 
-                        let category = if is_sensitive { AlertCategory::Alert } else { AlertCategory::Info };
+                        let category = if is_sensitive {
+                            AlertCategory::Alert
+                        } else {
+                            AlertCategory::Info
+                        };
                         let title = if is_sensitive {
                             format!("Sensitive file detected: {}", name)
                         } else if event.kind.is_create() {

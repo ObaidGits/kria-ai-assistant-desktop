@@ -6,10 +6,9 @@
 ///  5-6. HITL request_id – UUID instead of "pending"
 ///  7. Vision / image routing – multimodal content format + fallback
 /// ────────────────────────────────────────────────────────────────
-
 use kria_core::config::KriaConfig;
 use kria_core::llm::{ChatMessage, ImageAttachment, ModelRouter};
-use kria_core::safety::hitl::{HitlGateway, ApprovalResponse};
+use kria_core::safety::hitl::{ApprovalResponse, HitlGateway};
 use kria_core::safety::PolicyEngine;
 use kria_core::voice::pipeline::VoicePipelineEvent;
 
@@ -51,7 +50,8 @@ async fn hitl_request_approval_with_id_responds_correctly() {
             kria_core::safety::RiskLevel::Red,
             "test",
             false,
-        ).await
+        )
+        .await
     });
 
     // Small delay to let the request register
@@ -69,7 +69,9 @@ async fn hitl_request_approval_with_id_responds_correctly() {
 async fn hitl_respond_with_wrong_id_fails() {
     let gateway = HitlGateway::new(2);
     // Responding to a non-existent ID should return false
-    let ok = gateway.respond("non-existent-id", ApprovalResponse::Approved).await;
+    let ok = gateway
+        .respond("non-existent-id", ApprovalResponse::Approved)
+        .await;
     assert!(!ok, "responding to unknown ID should fail");
 }
 
@@ -87,14 +89,18 @@ async fn hitl_respond_with_pending_string_fails() {
             kria_core::safety::RiskLevel::Red,
             "test",
             false,
-        ).await
+        )
+        .await
     });
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // Trying to respond with "pending" should fail — the real UUID is different
     let ok = gw.respond("pending", ApprovalResponse::Approved).await;
-    assert!(!ok, "responding with 'pending' should NOT match any real request ID");
+    assert!(
+        !ok,
+        "responding with 'pending' should NOT match any real request ID"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -106,7 +112,10 @@ fn searxng_search_is_green() {
     let engine = PolicyEngine::new();
     let decision = engine.evaluate("searxng_search", &serde_json::json!({"query": "test"}));
     assert_eq!(decision.risk_level, kria_core::safety::RiskLevel::Green);
-    assert!(!decision.requires_approval, "searxng_search should auto-execute");
+    assert!(
+        !decision.requires_approval,
+        "searxng_search should auto-execute"
+    );
     assert!(!decision.blocked);
 }
 
@@ -121,11 +130,22 @@ fn duckduckgo_search_is_green() {
 #[test]
 fn developer_read_tools_are_green() {
     let engine = PolicyEngine::new();
-    for tool in &["git_status", "git_log", "git_diff", "git_branch_list",
-                   "analyze_project", "diff_files_unified", "query_sqlite", "describe_database"] {
+    for tool in &[
+        "git_status",
+        "git_log",
+        "git_diff",
+        "git_branch_list",
+        "analyze_project",
+        "diff_files_unified",
+        "query_sqlite",
+        "describe_database",
+    ] {
         let d = engine.evaluate(tool, &serde_json::json!({}));
-        assert_eq!(d.risk_level, kria_core::safety::RiskLevel::Green,
-            "{tool} should be GREEN");
+        assert_eq!(
+            d.risk_level,
+            kria_core::safety::RiskLevel::Green,
+            "{tool} should be GREEN"
+        );
         assert!(!d.requires_approval, "{tool} should not require approval");
     }
 }
@@ -135,63 +155,107 @@ fn rag_read_tools_are_green() {
     let engine = PolicyEngine::new();
     for tool in &["rag_query", "list_knowledge_base"] {
         let d = engine.evaluate(tool, &serde_json::json!({}));
-        assert_eq!(d.risk_level, kria_core::safety::RiskLevel::Green,
-            "{tool} should be GREEN");
+        assert_eq!(
+            d.risk_level,
+            kria_core::safety::RiskLevel::Green,
+            "{tool} should be GREEN"
+        );
     }
 }
 
 #[test]
 fn proactive_read_tools_are_green() {
     let engine = PolicyEngine::new();
-    for tool in &["check_system_health", "get_alerts", "dismiss_alert",
-                   "list_watched_dirs", "smart_suggest"] {
+    for tool in &[
+        "check_system_health",
+        "get_alerts",
+        "dismiss_alert",
+        "list_watched_dirs",
+        "smart_suggest",
+    ] {
         let d = engine.evaluate(tool, &serde_json::json!({}));
-        assert_eq!(d.risk_level, kria_core::safety::RiskLevel::Green,
-            "{tool} should be GREEN");
+        assert_eq!(
+            d.risk_level,
+            kria_core::safety::RiskLevel::Green,
+            "{tool} should be GREEN"
+        );
     }
 }
 
 #[test]
 fn i18n_tools_are_green() {
     let engine = PolicyEngine::new();
-    for tool in &["list_languages", "detect_language", "get_accessibility_settings"] {
+    for tool in &[
+        "list_languages",
+        "detect_language",
+        "get_accessibility_settings",
+    ] {
         let d = engine.evaluate(tool, &serde_json::json!({}));
-        assert_eq!(d.risk_level, kria_core::safety::RiskLevel::Green,
-            "{tool} should be GREEN");
+        assert_eq!(
+            d.risk_level,
+            kria_core::safety::RiskLevel::Green,
+            "{tool} should be GREEN"
+        );
     }
 }
 
 #[test]
 fn vision_analysis_tools_are_green() {
     let engine = PolicyEngine::new();
-    for tool in &["ocr_image", "analyze_image", "screenshot_analyze",
-                   "image_analyze", "document_extract", "code_analyze_ast"] {
+    for tool in &[
+        "ocr_image",
+        "analyze_image",
+        "screenshot_analyze",
+        "image_analyze",
+        "document_extract",
+        "code_analyze_ast",
+    ] {
         let d = engine.evaluate(tool, &serde_json::json!({}));
-        assert_eq!(d.risk_level, kria_core::safety::RiskLevel::Green,
-            "{tool} should be GREEN");
+        assert_eq!(
+            d.risk_level,
+            kria_core::safety::RiskLevel::Green,
+            "{tool} should be GREEN"
+        );
     }
 }
 
 #[test]
 fn file_read_tools_all_green() {
     let engine = PolicyEngine::new();
-    for tool in &["search_file_contents", "find_files_by_pattern",
-                   "get_project_structure", "count_lines_of_code",
-                   "diff_files", "find_todos", "analyze_code"] {
+    for tool in &[
+        "search_file_contents",
+        "find_files_by_pattern",
+        "get_project_structure",
+        "count_lines_of_code",
+        "diff_files",
+        "find_todos",
+        "analyze_code",
+    ] {
         let d = engine.evaluate(tool, &serde_json::json!({}));
-        assert_eq!(d.risk_level, kria_core::safety::RiskLevel::Green,
-            "{tool} should be GREEN");
+        assert_eq!(
+            d.risk_level,
+            kria_core::safety::RiskLevel::Green,
+            "{tool} should be GREEN"
+        );
     }
 }
 
 #[test]
 fn desktop_window_tools_yellow() {
     let engine = PolicyEngine::new();
-    for tool in &["move_window", "resize_window", "maximize_window",
-                   "minimize_window", "tile_windows"] {
+    for tool in &[
+        "move_window",
+        "resize_window",
+        "maximize_window",
+        "minimize_window",
+        "tile_windows",
+    ] {
         let d = engine.evaluate(tool, &serde_json::json!({}));
-        assert_eq!(d.risk_level, kria_core::safety::RiskLevel::Yellow,
-            "{tool} should be YELLOW");
+        assert_eq!(
+            d.risk_level,
+            kria_core::safety::RiskLevel::Yellow,
+            "{tool} should be YELLOW"
+        );
     }
 }
 
@@ -200,8 +264,11 @@ fn git_destructive_tools_are_red() {
     let engine = PolicyEngine::new();
     for tool in &["git_commit", "git_checkout"] {
         let d = engine.evaluate(tool, &serde_json::json!({}));
-        assert_eq!(d.risk_level, kria_core::safety::RiskLevel::Red,
-            "{tool} should be RED");
+        assert_eq!(
+            d.risk_level,
+            kria_core::safety::RiskLevel::Red,
+            "{tool} should be RED"
+        );
         assert!(d.requires_approval, "{tool} should require approval");
     }
 }
@@ -233,7 +300,9 @@ fn multimodal_content_format_correct() {
     assert!(msg.has_images());
 
     let content = msg.to_multimodal_content();
-    let parts = content.as_array().expect("multimodal content should be an array");
+    let parts = content
+        .as_array()
+        .expect("multimodal content should be an array");
     assert_eq!(parts.len(), 2, "should have text + image parts");
 
     // Text part
@@ -243,8 +312,14 @@ fn multimodal_content_format_correct() {
     // Image part
     assert_eq!(parts[1]["type"], "image_url");
     let url = parts[1]["image_url"]["url"].as_str().unwrap();
-    assert!(url.starts_with("data:image/png;base64,"), "should be a data URI");
-    assert!(url.contains("iVBORw0KGgo="), "should contain the base64 data");
+    assert!(
+        url.starts_with("data:image/png;base64,"),
+        "should be a data URI"
+    );
+    assert!(
+        url.contains("iVBORw0KGgo="),
+        "should contain the base64 data"
+    );
 }
 
 #[test]
@@ -258,7 +333,10 @@ fn non_image_message_content_is_string() {
 
     assert!(!msg.has_images());
     let content = msg.to_multimodal_content();
-    assert!(content.is_string(), "non-image message should produce a string");
+    assert!(
+        content.is_string(),
+        "non-image message should produce a string"
+    );
     assert_eq!(content.as_str().unwrap(), "Hello");
 }
 
@@ -270,8 +348,10 @@ fn non_image_message_content_is_string() {
 fn vision_available_with_default_local_config() {
     let config = KriaConfig::default();
     let router = ModelRouter::from_config(&config);
-    assert!(router.has_vision(),
-        "with local_api_url set, vision should be available via local fallback");
+    assert!(
+        router.has_vision(),
+        "with local_api_url set, vision should be available via local fallback"
+    );
 }
 
 #[tokio::test]
@@ -287,8 +367,10 @@ fn no_vision_when_no_local_url() {
     let mut config = KriaConfig::default();
     config.llm.local_api_url = String::new();
     let router = ModelRouter::from_config(&config);
-    assert!(!router.has_vision(),
-        "without local backend, vision should not be available");
+    assert!(
+        !router.has_vision(),
+        "without local backend, vision should not be available"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -302,7 +384,10 @@ async fn detect_server_model_returns_none_when_server_down() {
     let router = ModelRouter::from_config(&config);
     let model = router.detect_server_model().await;
     // The server is not running, so it should return None (not panic)
-    assert!(model.is_none(), "should gracefully return None when server is unreachable");
+    assert!(
+        model.is_none(),
+        "should gracefully return None when server is unreachable"
+    );
 }
 
 #[tokio::test]
@@ -326,7 +411,10 @@ async fn model_router_status_reports_unhealthy_when_server_down() {
 
     // Server not running in test → should report unhealthy
     let healthy = status["local_healthy"].as_bool().unwrap_or(true);
-    assert!(!healthy, "local_healthy should be false when llama server is not running");
+    assert!(
+        !healthy,
+        "local_healthy should be false when llama server is not running"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -336,10 +424,18 @@ async fn model_router_status_reports_unhealthy_when_server_down() {
 #[test]
 fn partial_transcript_event_exists() {
     // Verify the PartialTranscript variant can be constructed
-    let evt = VoicePipelineEvent::PartialTranscript("hello wor".to_string());
+    let evt = VoicePipelineEvent::PartialTranscript(kria_core::voice::VoiceTranscriptFrame {
+        text: "hello wor".to_string(),
+        confidence: 0.61,
+        language: "en".to_string(),
+        stability: 0.45,
+    });
     match evt {
-        VoicePipelineEvent::PartialTranscript(text) => {
-            assert_eq!(text, "hello wor");
+        VoicePipelineEvent::PartialTranscript(frame) => {
+            assert_eq!(frame.text, "hello wor");
+            assert!((frame.confidence - 0.61).abs() < f32::EPSILON);
+            assert_eq!(frame.language, "en");
+            assert!((frame.stability - 0.45).abs() < f32::EPSILON);
         }
         _ => panic!("expected PartialTranscript variant"),
     }
@@ -347,8 +443,18 @@ fn partial_transcript_event_exists() {
 
 #[test]
 fn partial_transcript_is_separate_from_final() {
-    let partial = VoicePipelineEvent::PartialTranscript("partial".into());
-    let final_t = VoicePipelineEvent::Transcript("final".into());
+    let partial = VoicePipelineEvent::PartialTranscript(kria_core::voice::VoiceTranscriptFrame {
+        text: "partial".into(),
+        confidence: 0.55,
+        language: "en".into(),
+        stability: 0.40,
+    });
+    let final_t = VoicePipelineEvent::Transcript(kria_core::voice::VoiceTranscriptFrame {
+        text: "final".into(),
+        confidence: 0.88,
+        language: "en".into(),
+        stability: 1.0,
+    });
 
     // Both should match their own variant
     assert!(matches!(partial, VoicePipelineEvent::PartialTranscript(_)));

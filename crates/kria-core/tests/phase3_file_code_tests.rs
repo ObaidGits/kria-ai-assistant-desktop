@@ -1,11 +1,10 @@
+use kria_core::preprocessing::code::CodeProcessor;
+use kria_core::safety::{BlacklistChecker, HitlGateway, PolicyEngine, RiskLevel};
 /// Phase 3 — File & System Intelligence tests
 ///
 /// Validates: file search tools, code intelligence tools, document tools,
 /// clipboard tools, HITL/safety system, CodeProcessor, and project structure.
-
 use kria_core::tools::registry;
-use kria_core::preprocessing::code::CodeProcessor;
-use kria_core::safety::{PolicyEngine, RiskLevel, HitlGateway, BlacklistChecker};
 use std::path::Path;
 
 // ── 3.1 & 3.2: File tools registration ──────────────────────
@@ -70,12 +69,14 @@ async fn phase3_search_file_contents_finds_text() {
     let reg = registry::build_default_registry();
     let handler = reg.get_handler("search_file_contents").unwrap();
     // Search for "fn " in our own source crate
-    let result = handler.execute(serde_json::json!({
-        "directory": "src",
-        "query": "pub fn register",
-        "max_results": 5,
-        "context_lines": 1,
-    })).await;
+    let result = handler
+        .execute(serde_json::json!({
+            "directory": "src",
+            "query": "pub fn register",
+            "max_results": 5,
+            "context_lines": 1,
+        }))
+        .await;
     assert!(result.success);
     let data = &result.data;
     assert!(data["count"].as_u64().unwrap() > 0);
@@ -89,11 +90,13 @@ async fn phase3_search_file_contents_case_insensitive() {
     let reg = registry::build_default_registry();
     let handler = reg.get_handler("search_file_contents").unwrap();
     // Search for "TOOLRESULT" (case-insensitive should match "ToolResult")
-    let result = handler.execute(serde_json::json!({
-        "directory": "src",
-        "query": "TOOLRESULT",
-        "max_results": 3,
-    })).await;
+    let result = handler
+        .execute(serde_json::json!({
+            "directory": "src",
+            "query": "TOOLRESULT",
+            "max_results": 3,
+        }))
+        .await;
     assert!(result.success);
     let data = &result.data;
     assert!(data["count"].as_u64().unwrap() > 0);
@@ -105,10 +108,12 @@ async fn phase3_search_file_contents_case_insensitive() {
 async fn phase3_project_structure_returns_tree() {
     let reg = registry::build_default_registry();
     let handler = reg.get_handler("get_project_structure").unwrap();
-    let result = handler.execute(serde_json::json!({
-        "path": "src",
-        "max_depth": 2,
-    })).await;
+    let result = handler
+        .execute(serde_json::json!({
+            "path": "src",
+            "max_depth": 2,
+        }))
+        .await;
     assert!(result.success);
     let data = &result.data;
     let tree = data["tree"].as_array().unwrap();
@@ -132,10 +137,24 @@ fn phase3_code_intelligence_tools_registered() {
 #[test]
 fn phase3_code_tools_category() {
     let reg = registry::build_default_registry();
-    for name in &["count_lines_of_code", "diff_files", "find_todos", "analyze_code"] {
+    for name in &[
+        "count_lines_of_code",
+        "diff_files",
+        "find_todos",
+        "analyze_code",
+    ] {
         let def = reg.get_def(name).unwrap();
-        assert_eq!(def.category, "code_intelligence", "tool {} should be in code_intelligence", name);
-        assert_eq!(def.default_tier, RiskLevel::Green, "tool {} should be GREEN", name);
+        assert_eq!(
+            def.category, "code_intelligence",
+            "tool {} should be in code_intelligence",
+            name
+        );
+        assert_eq!(
+            def.default_tier,
+            RiskLevel::Green,
+            "tool {} should be GREEN",
+            name
+        );
     }
 }
 
@@ -144,12 +163,30 @@ fn phase3_code_tools_category() {
 #[test]
 fn phase3_code_processor_detect_language() {
     assert_eq!(CodeProcessor::detect_language(Path::new("main.rs")), "rust");
-    assert_eq!(CodeProcessor::detect_language(Path::new("app.py")), "python");
-    assert_eq!(CodeProcessor::detect_language(Path::new("index.tsx")), "react");
-    assert_eq!(CodeProcessor::detect_language(Path::new("script.sh")), "shell");
-    assert_eq!(CodeProcessor::detect_language(Path::new("data.json")), "json");
-    assert_eq!(CodeProcessor::detect_language(Path::new("config.toml")), "toml");
-    assert_eq!(CodeProcessor::detect_language(Path::new("Makefile")), "unknown");
+    assert_eq!(
+        CodeProcessor::detect_language(Path::new("app.py")),
+        "python"
+    );
+    assert_eq!(
+        CodeProcessor::detect_language(Path::new("index.tsx")),
+        "react"
+    );
+    assert_eq!(
+        CodeProcessor::detect_language(Path::new("script.sh")),
+        "shell"
+    );
+    assert_eq!(
+        CodeProcessor::detect_language(Path::new("data.json")),
+        "json"
+    );
+    assert_eq!(
+        CodeProcessor::detect_language(Path::new("config.toml")),
+        "toml"
+    );
+    assert_eq!(
+        CodeProcessor::detect_language(Path::new("Makefile")),
+        "unknown"
+    );
 }
 
 #[test]
@@ -168,16 +205,21 @@ fn phase3_code_processor_analyze_rust_file() {
 async fn phase3_count_loc_returns_breakdown() {
     let reg = registry::build_default_registry();
     let handler = reg.get_handler("count_lines_of_code").unwrap();
-    let result = handler.execute(serde_json::json!({
-        "directory": "src",
-    })).await;
+    let result = handler
+        .execute(serde_json::json!({
+            "directory": "src",
+        }))
+        .await;
     assert!(result.success);
     let data = &result.data;
     assert!(data["total_files"].as_u64().unwrap() > 0);
     assert!(data["total_lines"].as_u64().unwrap() > 0);
     let breakdown = data["breakdown"].as_array().unwrap();
     // Should find "rust" in the breakdown
-    let langs: Vec<&str> = breakdown.iter().filter_map(|e| e["language"].as_str()).collect();
+    let langs: Vec<&str> = breakdown
+        .iter()
+        .filter_map(|e| e["language"].as_str())
+        .collect();
     assert!(langs.contains(&"rust"));
 }
 
@@ -187,10 +229,12 @@ async fn phase3_count_loc_returns_breakdown() {
 async fn phase3_find_todos_works() {
     let reg = registry::build_default_registry();
     let handler = reg.get_handler("find_todos").unwrap();
-    let result = handler.execute(serde_json::json!({
-        "directory": "src",
-        "max_results": 10,
-    })).await;
+    let result = handler
+        .execute(serde_json::json!({
+            "directory": "src",
+            "max_results": 10,
+        }))
+        .await;
     assert!(result.success);
     let data = &result.data;
     // May or may not find TODOs, but should succeed
@@ -204,9 +248,11 @@ async fn phase3_find_todos_works() {
 async fn phase3_analyze_code_rust_file() {
     let reg = registry::build_default_registry();
     let handler = reg.get_handler("analyze_code").unwrap();
-    let result = handler.execute(serde_json::json!({
-        "path": "src/lib.rs",
-    })).await;
+    let result = handler
+        .execute(serde_json::json!({
+            "path": "src/lib.rs",
+        }))
+        .await;
     assert!(result.success);
     let data = &result.data;
     assert_eq!(data["language"].as_str().unwrap(), "rust");
@@ -247,7 +293,10 @@ fn phase3_policy_classifies_read_as_green() {
 #[test]
 fn phase3_policy_classifies_delete_as_red() {
     let policy = PolicyEngine::new();
-    let decision = policy.evaluate("delete_file", &serde_json::json!({ "path": "/tmp/test.txt" }));
+    let decision = policy.evaluate(
+        "delete_file",
+        &serde_json::json!({ "path": "/tmp/test.txt" }),
+    );
     assert_eq!(decision.risk_level, RiskLevel::Red);
     assert!(decision.requires_approval);
 }
@@ -302,11 +351,23 @@ fn phase3_clipboard_tools_registered() {
 fn phase3_clipboard_risk_tiers() {
     let reg = registry::build_default_registry();
     // Read-only = green
-    assert_eq!(reg.get_def("get_clipboard").unwrap().default_tier, RiskLevel::Green);
-    assert_eq!(reg.get_def("transform_clipboard").unwrap().default_tier, RiskLevel::Green);
+    assert_eq!(
+        reg.get_def("get_clipboard").unwrap().default_tier,
+        RiskLevel::Green
+    );
+    assert_eq!(
+        reg.get_def("transform_clipboard").unwrap().default_tier,
+        RiskLevel::Green
+    );
     // Write = yellow
-    assert_eq!(reg.get_def("set_clipboard").unwrap().default_tier, RiskLevel::Yellow);
-    assert_eq!(reg.get_def("type_text").unwrap().default_tier, RiskLevel::Yellow);
+    assert_eq!(
+        reg.get_def("set_clipboard").unwrap().default_tier,
+        RiskLevel::Yellow
+    );
+    assert_eq!(
+        reg.get_def("type_text").unwrap().default_tier,
+        RiskLevel::Yellow
+    );
 }
 
 // ── Registry completeness ───────────────────────────────────
@@ -317,7 +378,11 @@ fn phase3_total_tool_count() {
     // Phase 0: ~25 system tools, Phase 1: 8 knowledge, Phase 2: 14 internet,
     // Phase 3: +7 file/code tools, updated docs
     // Total should be well above 60
-    assert!(reg.len() >= 60, "Expected at least 60 tools, got {}", reg.len());
+    assert!(
+        reg.len() >= 60,
+        "Expected at least 60 tools, got {}",
+        reg.len()
+    );
 }
 
 #[test]

@@ -1,4 +1,4 @@
-import { Component, Show, For, createSignal, createEffect, onMount, onCleanup } from "solid-js";
+import { Component, Show, For, createSignal, createEffect, createMemo, onMount, onCleanup } from "solid-js";
 import { listen } from "@tauri-apps/api/event";
 import { appStore } from "../stores/app";
 import { SUPPORTED_LANGUAGES, setLocale } from "../stores/i18n";
@@ -31,7 +31,7 @@ interface McpCatalogItem {
 }
 
 const SettingsModal: Component = () => {
-  const { setShowSettings, settings, loadSettings, saveSettings, models, loadModels, theme, applyTheme, mcpServers, loadMcpServers, addMcpServer, removeMcpServer, toggleMcpServer, healthInfo, loadHealth, scheduledTasks, loadScheduledTasks, addScheduledTask, removeScheduledTask, macros, loadMacros, deleteMacro, workflows, loadWorkflows, deleteWorkflow, hardwareInfo, loadHardwareInfo, knowledgeBase, loadKnowledgeBase, telegramConfig, telegramBotInfo, loadTelegramConfig, saveTelegramConfig, testTelegramConnection, startTelegramMcp, stopTelegramMcp, googleStatus, loadGoogleStatus, connectGoogle, disconnectGoogle } = appStore;
+  const { setShowSettings, settings, loadSettings, saveSettings, models, loadModels, audioDevices, loadAudioDevices, theme, applyTheme, mcpServers, loadMcpServers, addMcpServer, removeMcpServer, toggleMcpServer, healthInfo, loadHealth, scheduledTasks, loadScheduledTasks, addScheduledTask, removeScheduledTask, macros, loadMacros, deleteMacro, workflows, loadWorkflows, deleteWorkflow, hardwareInfo, loadHardwareInfo, knowledgeBase, loadKnowledgeBase, telegramConfig, telegramBotInfo, loadTelegramConfig, saveTelegramConfig, testTelegramConnection, startTelegramMcp, stopTelegramMcp, googleStatus, loadGoogleStatus, connectGoogle, disconnectGoogle } = appStore;
 
   const [activeTab, setActiveTab] = createSignal<Tab>("llm");
   const [draft, setDraft] = createSignal<Record<string, any>>({});
@@ -114,6 +114,7 @@ const SettingsModal: Component = () => {
   onMount(async () => {
     await loadSettings();
     await loadModels();
+    await loadAudioDevices();
     await loadMcpServers();
     await loadHealth();
     await loadScheduledTasks();
@@ -237,6 +238,56 @@ const SettingsModal: Component = () => {
     return `${secs}s`;
   };
 
+  const runtimeDotClass = (state?: string): "running" | "stopped" | "" => {
+    const normalized = String(state ?? "").toLowerCase();
+    if (normalized === "running") return "running";
+    if (normalized === "starting") return "";
+    return "stopped";
+  };
+
+  const runtimeStateLabel = (state?: string): string => {
+    const normalized = String(state ?? "stopped").toLowerCase();
+    if (normalized === "starting") return "starting";
+    if (normalized === "running") return "running";
+    if (normalized === "error") return "error";
+    return "stopped";
+  };
+
+  const googleStatusMessage = (): string => {
+    const status = googleStatus();
+    if (!status) {
+      return "Checking Google integration status...";
+    }
+    if (status.connected) {
+      return `Connected as ${status.account}`;
+    }
+    if (status.auth_ready && !status.runtime_ready) {
+      return `OAuth is ready, but runtime is unavailable (state=${status.mcp?.state ?? "unknown"}).`;
+    }
+    if (!status.credentials_configured) {
+      return "OAuth credentials are missing.";
+    }
+    if (!status.token_present) {
+      return `OAuth token is missing for account '${status.account}'.`;
+    }
+    return "Google integration is not ready.";
+  };
+
+  const googleCapabilityEntries = () => {
+    const capabilities = googleStatus()?.capabilities;
+    if (!capabilities) return [];
+    return [
+      ["Gmail", capabilities.gmail],
+      ["Calendar", capabilities.calendar],
+      ["Drive", capabilities.drive],
+      ["Docs", capabilities.docs],
+      ["Sheets", capabilities.sheets],
+      ["Slides", capabilities.slides],
+      ["Meet (direct)", capabilities.meet],
+      ["Meet via Calendar", capabilities.meet_via_calendar],
+    ] as const;
+  };
+
   const setAssistantPref = <K extends keyof AssistantFrontendPrefs>(key: K, value: AssistantFrontendPrefs[K]) => {
     setAssistantPrefs((prev) => ({ ...prev, [key]: value }));
   };
@@ -251,41 +302,119 @@ const SettingsModal: Component = () => {
     );
   };
 
-  const tabGroups: { title: string; tabs: { id: Tab; label: string }[] }[] = [
+  const tabGroups: {
+    title: string;
+    tabs: { id: Tab; label: string; icon: string; description: string }[];
+  }[] = [
     {
-      title: "Model & Agent",
+      title: "General",
       tabs: [
-        { id: "llm", label: "LLM" },
-        { id: "voice", label: "Voice" },
-        { id: "safety", label: "Safety" },
-        { id: "assistant", label: "Assistant" },
+        {
+          id: "llm",
+          label: "Model",
+          icon: "M",
+          description: "Choose local or cloud model routing, providers, and generation controls.",
+        },
+        {
+          id: "voice",
+          label: "Voice",
+          icon: "V",
+          description: "Configure microphone selection, VAD sensitivity, language, and TTS behavior.",
+        },
+        {
+          id: "safety",
+          label: "Safety",
+          icon: "S",
+          description: "Tune approval thresholds, rollback windows, and tool execution safety limits.",
+        },
+        {
+          id: "search",
+          label: "Search",
+          icon: "Q",
+          description: "Set the default search provider and endpoint for web retrieval.",
+        },
       ],
     },
     {
-      title: "Experience",
+      title: "Personalization",
       tabs: [
-        { id: "ui", label: "Appearance" },
-        { id: "labs", label: "Labs" },
+        {
+          id: "ui",
+          label: "Appearance",
+          icon: "A",
+          description: "Customize visual theme, language, contrast, motion, and text scale.",
+        },
+        {
+          id: "assistant",
+          label: "Assistant",
+          icon: "H",
+          description: "Select persona, response depth, and helper behavior preferences.",
+        },
+        {
+          id: "labs",
+          label: "Labs",
+          icon: "L",
+          description: "Toggle preview interfaces and prototype modules for advanced workflows.",
+        },
       ],
     },
     {
-      title: "Integrations",
+      title: "Connected Apps",
       tabs: [
-        { id: "services", label: "MCP Services" },
-        { id: "telegram", label: "Telegram" },
-        { id: "google", label: "Google" },
+        {
+          id: "services",
+          label: "MCP Services",
+          icon: "P",
+          description: "Manage MCP servers, runtime status, trust levels, and command registration.",
+        },
+        {
+          id: "telegram",
+          label: "Telegram",
+          icon: "T",
+          description: "Connect a Telegram bot for mobile chat and remote assistant access.",
+        },
+        {
+          id: "google",
+          label: "Google",
+          icon: "G",
+          description: "Manage Google auth, runtime health, capabilities, and synchronization warnings.",
+        },
       ],
     },
     {
-      title: "System",
+      title: "System & Data",
       tabs: [
-        { id: "search", label: "Search" },
-        { id: "automation", label: "Automation" },
-        { id: "hardware", label: "Hardware" },
-        { id: "knowledge", label: "Knowledge" },
+        {
+          id: "automation",
+          label: "Automation",
+          icon: "U",
+          description: "Inspect health, schedule jobs, and manage stored macros and workflow assets.",
+        },
+        {
+          id: "hardware",
+          label: "Hardware",
+          icon: "R",
+          description: "Review detected hardware and recommended runtime tiers and performance values.",
+        },
+        {
+          id: "knowledge",
+          label: "Knowledge",
+          icon: "K",
+          description: "Review indexed documents and retrieval corpus status for knowledge grounding.",
+        },
       ],
     },
   ];
+
+  const activeTabInfo = createMemo(() => {
+    for (const group of tabGroups) {
+      const tab = group.tabs.find((item) => item.id === activeTab());
+      if (tab) {
+        return { group: group.title, tab };
+      }
+    }
+    return { group: tabGroups[0].title, tab: tabGroups[0].tabs[0] };
+  });
 
   return (
     <div class="modal-overlay" onClick={() => setShowSettings(false)}>
@@ -295,33 +424,48 @@ const SettingsModal: Component = () => {
           <button class="close-btn" onClick={() => setShowSettings(false)}>×</button>
         </div>
 
-        <div class="settings-tabs settings-tabs-grouped">
-          <For each={tabGroups}>
-            {(group) => (
-              <div class="settings-tab-group">
-                <div class="settings-tab-group-title">{group.title}</div>
-                <For each={group.tabs}>
-                  {(tab) => (
-                    <button
-                      class={`settings-tab ${activeTab() === tab.id ? "active" : ""}`}
-                      onClick={() => setActiveTab(tab.id)}
-                    >
-                      {tab.label}
-                    </button>
-                  )}
-                </For>
-              </div>
-            )}
-          </For>
-        </div>
+        <div class="modal-body settings-shell">
+          <aside class="settings-sidebar-nav">
+            <div class="settings-sidebar-head">
+              <h3>Preferences</h3>
+              <p>Select a category</p>
+            </div>
 
-        <div class="modal-body">
-          <Show when={error()}>
-            <div class="settings-error">{error()}</div>
-          </Show>
-          <Show when={success()}>
-            <div class="settings-success">{success()}</div>
-          </Show>
+            <For each={tabGroups}>
+              {(group) => (
+                <div class="settings-nav-group">
+                  <div class="settings-nav-group-title">{group.title}</div>
+                  <For each={group.tabs}>
+                    {(tab) => (
+                      <button
+                        class={`settings-nav-item ${activeTab() === tab.id ? "active" : ""}`}
+                        onClick={() => setActiveTab(tab.id)}
+                        title={tab.description}
+                      >
+                        <span class="settings-nav-icon" aria-hidden="true">{tab.icon}</span>
+                        <span class="settings-nav-label">{tab.label}</span>
+                      </button>
+                    )}
+                  </For>
+                </div>
+              )}
+            </For>
+          </aside>
+
+          <section class="settings-content">
+            <div class="settings-content-header">
+              <span class="settings-content-group">{activeTabInfo().group}</span>
+              <h3>{activeTabInfo().tab.label}</h3>
+              <p>{activeTabInfo().tab.description}</p>
+            </div>
+
+            <div class="settings-content-scroll">
+              <Show when={error()}>
+                <div class="settings-error">{error()}</div>
+              </Show>
+              <Show when={success()}>
+                <div class="settings-success">{success()}</div>
+              </Show>
 
           {/* LLM Tab */}
           <Show when={activeTab() === "llm"}>
@@ -462,6 +606,42 @@ const SettingsModal: Component = () => {
                 </select>
               </div>
               <div class="settings-field">
+                <label>Microphone</label>
+                <select
+                  value={draft()?.voice?.mic_device ?? "auto"}
+                  onChange={(e) => {
+                    const selected = e.currentTarget.value;
+                    const followDefault = selected === "auto";
+                    updateField("voice", "mic_device", selected);
+                    updateField("voice", "follow_system_default_mic", followDefault);
+                  }}
+                >
+                  <option value="auto">
+                    {audioDevices()?.default_input
+                      ? `System Default (${audioDevices()?.default_input})`
+                      : "System Default"}
+                  </option>
+                  <For each={audioDevices()?.inputs ?? []}>
+                    {(device) => (
+                      <Show when={device !== "auto"}>
+                        <option value={device}>{device}</option>
+                      </Show>
+                    )}
+                  </For>
+                  <Show
+                    when={
+                      (draft()?.voice?.mic_device ?? "auto") !== "auto" &&
+                      !(audioDevices()?.inputs ?? []).includes(draft()?.voice?.mic_device ?? "")
+                    }
+                  >
+                    <option value={draft()?.voice?.mic_device}>
+                      {(draft()?.voice?.mic_device ?? "Unknown device") + " (unavailable)"}
+                    </option>
+                  </Show>
+                </select>
+                <span class="field-hint">If not selected, KRIA uses the system default microphone.</span>
+              </div>
+              <div class="settings-field">
                 <label>TTS Voice</label>
                 <select
                   value={draft()?.voice?.tts_voice ?? "en_US-lessac-high"}
@@ -469,6 +649,28 @@ const SettingsModal: Component = () => {
                 >
                   <option value="en_US-lessac-high">Lessac (High)</option>
                   <option value="en_US-ryan-high">Ryan (High)</option>
+                </select>
+              </div>
+              <div class="settings-field">
+                <label>STT Language</label>
+                <select
+                  value={draft()?.voice?.language ?? "auto"}
+                  onChange={(e) => updateField("voice", "language", e.currentTarget.value)}
+                >
+                  <option value="auto">Auto Detect</option>
+                  <option value="en">English</option>
+                  <option value="hi">Hindi</option>
+                </select>
+              </div>
+              <div class="settings-field">
+                <label>Noise Suppression</label>
+                <select
+                  value={draft()?.voice?.noise_suppression_mode ?? "off"}
+                  onChange={(e) => updateField("voice", "noise_suppression_mode", e.currentTarget.value)}
+                >
+                  <option value="off">Off</option>
+                  <option value="light">Light</option>
+                  <option value="aggressive">Aggressive</option>
                 </select>
               </div>
               <div class="settings-field">
@@ -480,12 +682,38 @@ const SettingsModal: Component = () => {
                 />
               </div>
               <div class="settings-field">
-                <label>Energy Threshold</label>
+                <label>Energy Threshold (normalized)</label>
                 <input
                   type="number"
-                  value={draft()?.voice?.energy_threshold ?? 2000}
-                  onInput={(e) => updateField("voice", "energy_threshold", parseFloat(e.currentTarget.value) || 2000)}
+                  min="0.001"
+                  max="1"
+                  step="0.005"
+                  value={draft()?.voice?.energy_threshold ?? 0.02}
+                  onInput={(e) => updateField("voice", "energy_threshold", parseFloat(e.currentTarget.value) || 0.02)}
                 />
+                <span class="field-hint">Typical range is 0.01 to 0.08. Lower values make voice activation more sensitive.</span>
+              </div>
+              <div class="settings-field">
+                <label>Partial Transcript Interval (ms)</label>
+                <input
+                  type="number"
+                  min="200"
+                  value={draft()?.voice?.partial_update_ms ?? 2000}
+                  onInput={(e) => updateField("voice", "partial_update_ms", parseInt(e.currentTarget.value) || 2000)}
+                />
+              </div>
+              <div class="settings-field">
+                <label>Transcript Confidence Threshold</label>
+                <input
+                  type="range"
+                  min="0"
+                  max="1"
+                  step="0.05"
+                  value={draft()?.voice?.confidence_threshold ?? 0.3}
+                  onInput={(e) => updateField("voice", "confidence_threshold", parseFloat(e.currentTarget.value))}
+                />
+                <span class="field-value">{(draft()?.voice?.confidence_threshold ?? 0.3).toFixed(2)}</span>
+                <span class="field-hint">Final transcripts below this threshold are ignored.</span>
               </div>
             </section>
           </Show>
@@ -842,11 +1070,18 @@ const SettingsModal: Component = () => {
                     <div class="mcp-server-card">
                       <div class="mcp-server-info">
                         <div class="mcp-server-name">
-                          <span class={`mcp-status-dot ${server.enabled ? "running" : "stopped"}`}></span>
+                          <span class={`mcp-status-dot ${runtimeDotClass(server.runtime_state)}`}></span>
                           {server.name}
                         </div>
                         <div class="mcp-server-cmd">{server.command} {server.args.join(" ")}</div>
                         <div class="mcp-server-trust">Trust: {server.trust_level}</div>
+                        <div class="mcp-server-trust">
+                          Runtime: {runtimeStateLabel(server.runtime_state)}
+                          {typeof server.runtime_tool_count === "number" ? ` (${server.runtime_tool_count} tools)` : ""}
+                        </div>
+                        <Show when={server.runtime_error}>
+                          <div class="mcp-server-trust" style="color:#ef4444">Error: {server.runtime_error}</div>
+                        </Show>
                       </div>
                       <div class="mcp-server-actions">
                         <button
@@ -1335,18 +1570,67 @@ const SettingsModal: Component = () => {
                 Uses OAuth 2.0 — KRIA never sees your password.
               </p>
 
-              {/* Connection status banner */}
-              <Show when={googleStatus()?.connected}>
-                <div class="tg-status-banner tg-connected">
-                  <span class="mcp-status-dot running"></span>
-                  <span>Connected as <strong>{googleStatus()!.account}</strong></span>
-                </div>
-              </Show>
-              <Show when={googleStatus() && !googleStatus()!.connected && !gwConnecting()}>
-                <div class="tg-status-banner" style="background:var(--surface-2,#2a2a2a);border-left:3px solid var(--text-muted,#888)">
-                  <span class="mcp-status-dot stopped"></span>
-                  <span>Not connected</span>
-                </div>
+              {/* Connection status banner and details */}
+              <Show when={googleStatus()}>
+                {(status) => (
+                  <>
+                    <div
+                      class={`tg-status-banner ${status().connected ? "tg-connected" : ""}`}
+                      style={status().connected
+                        ? ""
+                        : "background:var(--surface-2,#2a2a2a);border-left:3px solid var(--text-muted,#888)"}
+                    >
+                      <span
+                        class={`mcp-status-dot ${status().connected ? "running" : runtimeDotClass(status().mcp?.state)}`}
+                      ></span>
+                      <span>{googleStatusMessage()}</span>
+                    </div>
+
+                    <div class="settings-field" style="margin-top:0.5rem">
+                      <label>Runtime signals</label>
+                      <div style="display:flex;flex-wrap:wrap;gap:0.45rem;margin-top:0.35rem">
+                        <span class="mcp-server-trust">Auth: {status().auth_ready ? "ready" : "not ready"}</span>
+                        <span class="mcp-server-trust">Runtime: {status().runtime_ready ? "ready" : "not ready"}</span>
+                        <span class="mcp-server-trust">MCP state: {runtimeStateLabel(status().mcp?.state)}</span>
+                        <span class="mcp-server-trust">Tools: {status().mcp?.tool_count ?? 0}</span>
+                        <span class="mcp-server-trust">Bridge: {status().gw_client_wired ? "wired" : "not wired"}</span>
+                      </div>
+                    </div>
+
+                    <div class="settings-field" style="margin-top:0.75rem">
+                      <label>Capabilities</label>
+                      <div style="display:flex;flex-wrap:wrap;gap:0.45rem;margin-top:0.35rem">
+                        <For each={googleCapabilityEntries()}>
+                          {(entry) => (
+                            <span class="mcp-server-trust" style={entry[1] ? "" : "opacity:0.7"}>
+                              {entry[0]}: {entry[1] ? "yes" : "no"}
+                            </span>
+                          )}
+                        </For>
+                      </div>
+                      <span class="field-hint">
+                        Meet support mode: <code>{status().meet_support_mode}</code> (calendar conference-link fallback)
+                      </span>
+                    </div>
+
+                    <Show when={status().mcp?.error}>
+                      <div class="settings-error" style="margin-top:0.6rem">
+                        <strong>MCP runtime error:</strong> {status().mcp?.error}
+                      </div>
+                    </Show>
+
+                    <Show when={(status().warnings?.length ?? 0) > 0}>
+                      <div class="settings-error" style="margin-top:0.6rem">
+                        <strong>Warnings</strong>
+                        <ul style="margin:0.4rem 0 0 1.2rem;padding:0">
+                          <For each={status().warnings}>
+                            {(warning) => <li>{warning}</li>}
+                          </For>
+                        </ul>
+                      </div>
+                    </Show>
+                  </>
+                )}
               </Show>
 
               {/* Missing credentials warning */}
@@ -1379,7 +1663,7 @@ const SettingsModal: Component = () => {
               <Show when={gwConnecting()}>
                 <div class="tg-status-banner" style="background:var(--surface-2,#2a2a2a);border-left:3px solid #4a9eff;margin-top:0.5rem">
                   <span class="mcp-status-dot" style="background:#4a9eff;animation:pulse 1s infinite"></span>
-                  <span>Waiting for authorization in browser…</span>
+                  <span>Waiting for authorization in browser...</span>
                 </div>
                 <p class="field-hint" style="margin-top:0.4rem">
                   A browser tab has opened. Sign in with Google and click <strong>Allow</strong>.
@@ -1396,26 +1680,60 @@ const SettingsModal: Component = () => {
 
               {/* Action buttons */}
               <div class="tg-actions" style="margin-top:1rem">
-                <Show when={!googleStatus()?.connected}>
+                <Show when={!googleStatus()?.auth_ready}>
                   <button
                     class="btn-primary"
                     disabled={gwConnecting() || !googleStatus()?.credentials_configured}
                     onClick={async () => {
+                      const existing = gwPollTimer();
+                      if (existing) {
+                        clearInterval(existing);
+                        setGwPollTimer(null);
+                      }
+
                       setGwConnecting(true);
                       setGwMessage("");
                       try {
-                        const res = await connectGoogle(gwAccount());
-                        // Start polling every 3 s while we wait for the browser
+                        await connectGoogle(gwAccount());
+                        let attempts = 0;
+                        const maxAttempts = 20;
+
+                        // Poll every 3s while OAuth browser flow is in progress.
                         const timer = setInterval(async () => {
-                          await loadGoogleStatus(gwAccount());
-                          if (googleStatus()?.connected) {
+                          attempts += 1;
+                          const status = await loadGoogleStatus(gwAccount());
+
+                          if (status?.connected) {
                             clearInterval(timer);
                             setGwPollTimer(null);
                             setGwConnecting(false);
                             setGwMessage("Connected! Google Workspace tools are now active.");
+                            await loadMcpServers();
                             setTimeout(() => setGwMessage(""), 4000);
+                            return;
+                          }
+
+                          if (status?.auth_ready && !status.runtime_ready && status.mcp?.state !== "starting") {
+                            clearInterval(timer);
+                            setGwPollTimer(null);
+                            setGwConnecting(false);
+                            setGwMessage(
+                              status.warnings?.[0] || "Authorization succeeded, but runtime is not ready yet."
+                            );
+                            await loadMcpServers();
+                            return;
+                          }
+
+                          if (attempts >= maxAttempts) {
+                            clearInterval(timer);
+                            setGwPollTimer(null);
+                            setGwConnecting(false);
+                            setGwMessage(
+                              status?.warnings?.[0] || "Authorization still pending. Please finish OAuth in the browser."
+                            );
                           }
                         }, 3000);
+
                         setGwPollTimer(timer);
                       } catch (e) {
                         setGwConnecting(false);
@@ -1427,23 +1745,40 @@ const SettingsModal: Component = () => {
                   </button>
                 </Show>
 
-                <Show when={googleStatus()?.connected}>
+                <Show when={googleStatus()}>
                   <button
                     class="btn-secondary"
                     onClick={async () => {
-                      await loadGoogleStatus(gwAccount());
-                      setGwMessage(googleStatus()?.connected ? "Still connected." : "Token not found.");
+                      const status = await loadGoogleStatus(gwAccount());
+                      await loadMcpServers();
+
+                      if (!status) {
+                        setGwMessage("Unable to fetch Google status.");
+                      } else if (status.connected) {
+                        setGwMessage("Google auth and runtime are healthy.");
+                      } else if (status.auth_ready && !status.runtime_ready) {
+                        setGwMessage(`OAuth ready; runtime not ready (state=${status.mcp?.state ?? "unknown"}).`);
+                      } else if (!status.auth_ready) {
+                        setGwMessage("Google OAuth is not ready.");
+                      } else {
+                        setGwMessage("Google integration is not ready.");
+                      }
+
                       setTimeout(() => setGwMessage(""), 2500);
                     }}
                   >
                     Refresh status
                   </button>
+                </Show>
+
+                <Show when={googleStatus()?.token_present}>
                   <button
                     class="btn-danger"
                     onClick={async () => {
                       try {
                         await disconnectGoogle(gwAccount());
-                        setGwMessage("Disconnected. Restart KRIA for changes to take effect.");
+                        await loadMcpServers();
+                        setGwMessage("Disconnected. OAuth token removed.");
                       } catch (e) {
                         setGwMessage(`Failed to disconnect: ${e}`);
                       }
@@ -1463,7 +1798,8 @@ const SettingsModal: Component = () => {
                   <li>Download the JSON and save it as <code>~/.google-mcp/credentials.json</code></li>
                   <li>Enable these APIs: Gmail, Calendar, Drive, Docs, Sheets, Slides</li>
                   <li>Come back here and click <strong>Connect with Google</strong></li>
-                  <li>Sign in and click <strong>Allow</strong> — KRIA can now access your Workspace</li>
+                  <li>Sign in and click <strong>Allow</strong> - KRIA can now access your Workspace</li>
+                  <li>Meet requests use calendar conference-link mode (<code>calendar_conference_link</code>)</li>
                 </ol>
               </div>
             </section>
@@ -1499,6 +1835,9 @@ const SettingsModal: Component = () => {
               <p class="settings-hint">{knowledgeBase().length} document(s) in knowledge base</p>
             </section>
           </Show>
+
+            </div>
+          </section>
         </div>
 
         <div class="modal-footer">

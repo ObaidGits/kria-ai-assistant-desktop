@@ -1,5 +1,5 @@
-use regex::Regex;
 use once_cell::sync::Lazy;
+use regex::Regex;
 use std::collections::HashMap;
 
 /// Intent classification result.
@@ -34,29 +34,70 @@ static CONVERSATION_RE: Lazy<Vec<Regex>> = Lazy::new(|| {
         r"^(explain|describe|what\s+is|what\s+are|define)\b",
         r"\?$",
     ];
-    patterns.iter().filter_map(|p| Regex::new(&format!("(?i){p}")).ok()).collect()
+    patterns
+        .iter()
+        .filter_map(|p| Regex::new(&format!("(?i){p}")).ok())
+        .collect()
 });
 
 // ─── Direct tool patterns (trigger specific tools) ───
 static DIRECT_TOOL_RE: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
     let mappings: Vec<(&str, &str)> = vec![
         // System info
-        (r"(?i)\b(cpu|processor)\s*(usage|load|info)\b", "get_cpu_usage"),
-        (r"(?i)\b(ram|memory)\s*(usage|info|status)\b", "get_memory_info"),
-        (r"(?i)\b(disk|storage)\s*(space|usage|info)\b", "get_disk_space"),
-        (r"(?i)\b(battery)\s*(status|level|info)\b", "get_battery_status"),
-        (r"(?i)\b(gpu|graphics)\s*(info|status|usage)\b", "get_gpu_info"),
+        (
+            r"(?i)\b(cpu|processor)\s*(usage|load|info)\b",
+            "get_cpu_usage",
+        ),
+        (
+            r"(?i)\b(ram|memory)\s*(usage|info|status)\b",
+            "get_memory_info",
+        ),
+        (
+            r"(?i)\b(disk|storage)\s*(space|usage|info)\b",
+            "get_disk_space",
+        ),
+        (
+            r"(?i)\b(battery)\s*(status|level|info)\b",
+            "get_battery_status",
+        ),
+        (
+            r"(?i)\b(gpu|graphics)\s*(info|status|usage)\b",
+            "get_gpu_info",
+        ),
         (r"(?i)\b(uptime|how\s+long.*running)\b", "get_system_uptime"),
-        (r"(?i)\b(network|internet)\s*(status|info|connection)\b", "get_network_status"),
+        (
+            r"(?i)\b(network|internet)\s*(status|info|connection)\b",
+            "get_network_status",
+        ),
         // App lifecycle
-        (r"(?i)\b(open|launch|start|run)\s+(\w+)\b", "open_application"),
+        (
+            r"(?i)\b(open|launch|start|run)\s+(\w+)\b",
+            "open_application",
+        ),
         (r"(?i)\b(close|quit|exit)\s+(\w+)\b", "close_application"),
-        (r"(?i)\b(running|active)\s*(apps|applications|processes)\b", "list_running_apps"),
+        (
+            r"(?i)\b(running|active)\s*(apps|applications|processes)\b",
+            "list_running_apps",
+        ),
         (r"(?i)\b(kill|terminate)\s*(process|pid)\b", "kill_process"),
         // File ops
-        (r"(?i)\b(read|show|cat|display)\s+(the\s+)?file\b", "read_file"),
-        (r"(?i)\b(list|ls|dir)\s+(the\s+)?(directory|folder|files)\b", "list_directory"),
+        (
+            r"(?i)\b(read|show|cat|display)\s+(the\s+)?file\b",
+            "read_file",
+        ),
+        (
+            r"(?i)\b(list|ls|dir)\s+(the\s+)?(directory|folder|files)\b",
+            "list_directory",
+        ),
         (r"(?i)\b(search|find)\s+(for\s+)?files?\b", "search_files"),
+        (
+            r"(?i)\b(search|find|locate|look\s*for)\b.*\b(file|folder|directory)\b",
+            "search_files",
+        ),
+        (
+            r"(?i)\b(file|folder|directory)\b.*\b(named|called|name)\b",
+            "search_files",
+        ),
         (r"(?i)\b(write|create|save)\s+(a\s+)?file\b", "write_file"),
         (r"(?i)\b(delete|remove|rm)\s+(the\s+)?file\b", "delete_file"),
         // Clipboard
@@ -64,40 +105,158 @@ static DIRECT_TOOL_RE: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
         (r"(?i)\b(copy|set\s+clipboard)\b", "set_clipboard"),
         (r"(?i)\bscreenshot\b", "screenshot"),
         // Power
-        (r"(?i)\b(shutdown|shut\s+down|power\s+off)\b", "shutdown_system"),
-        (r"(?i)\b(reboot|restart)\s*(system|computer|pc)?\b", "reboot_system"),
+        (
+            r"(?i)\b(shutdown|shut\s+down|power\s+off)\b",
+            "shutdown_system",
+        ),
+        (
+            r"(?i)\b(reboot|restart)\s*(system|computer|pc)?\b",
+            "reboot_system",
+        ),
         (r"(?i)\block\s*(screen|computer)\b", "lock_screen"),
         (r"(?i)\b(sleep|suspend)\s*(mode|computer)?\b", "sleep"),
         // System config
-        (r"(?i)\b(volume|sound)\s*(set|to|at)\s*(\d+)\b", "set_volume"),
-        (r"(?i)\b(brightness)\s*(set|to|at)\s*(\d+)\b", "set_brightness"),
-        (r"(?i)\b(wifi)\s*(on|off|enable|disable|toggle)\b", "toggle_wifi"),
+        (
+            r"(?i)\b(volume|sound)\s*(set|to|at)\s*(\d+)\b",
+            "set_volume",
+        ),
+        (
+            r"(?i)\b(brightness)\s*(set|to|at)\s*(\d+)\b",
+            "set_brightness",
+        ),
+        (
+            r"(?i)\b(wifi)\s*(on|off|enable|disable|toggle)\b",
+            "toggle_wifi",
+        ),
         // Internet
-        (r"(?i)\b(latest|breaking|today|current|recent)\b.*\b(news|headlines|updates?)\b", "search_news"),
-        (r"(?i)\b(news|headlines|updates?)\b.*\b(india|indian|pakistan|bangladesh|sri\s*lanka|us|uk|europe|asia|middle\s*east)\b", "search_news"),
-        (r"(?i)\b(news|headlines|updates?)\b.*\b(authentic|trusted|reliable|verified)\b", "search_news"),
-        (r"(?i)\b(search|google|look\s+up|find\s+online)\b.*\b(web|online|internet)\b", "web_search"),
-        (r"(?i)\b(search|google|look\s+up)\s+(for|the|about)\b", "web_search"),
+        (
+            r"(?i)\b(latest|breaking|today|current|recent)\b.*\b(news|headlines|updates?)\b",
+            "search_news",
+        ),
+        (
+            r"(?i)\b(news|headlines|updates?)\b.*\b(india|indian|pakistan|bangladesh|sri\s*lanka|us|uk|europe|asia|middle\s*east)\b",
+            "search_news",
+        ),
+        (
+            r"(?i)\b(news|headlines|updates?)\b.*\b(authentic|trusted|reliable|verified)\b",
+            "search_news",
+        ),
+        (
+            r"(?i)\b(search|google|look\s+up|find\s+online)\b.*\b(web|online|internet)\b",
+            "web_search",
+        ),
+        (
+            r"(?i)\b(search|google|look\s+up)\s+(for|the|about)\b",
+            "web_search",
+        ),
+        // Google Workspace (Gmail)
+        (
+            r"(?i)\b(check|show|list|get|read|fetch)\b.*\b(gmail|gmails|inbox|emails?|mailbox)\b",
+            "gw_gmail_inbox",
+        ),
+        (
+            r"(?i)\b(gmail|gmails|inbox|emails?|mailbox)\b.*\b(check|show|list|get|read|fetch|recent|latest|unread)\b",
+            "gw_gmail_inbox",
+        ),
+        (
+            r"(?i)\b(unread|recent|latest)\s+(gmail|gmails|emails?)\b",
+            "gw_gmail_inbox",
+        ),
+        (
+            r"(?i)\b(search|find|look\s*for)\b.*\b(gmail|gmails|emails?|inbox)\b",
+            "gw_gmail_search",
+        ),
+        // Google Workspace (Calendar / Meet fallback via Calendar)
+        (
+            r"(?i)\b(what'?s|show|list|check|get|view)\b.*\b(calendar|schedule|events?)\b",
+            "gw_calendar_search",
+        ),
+        (
+            r"(?i)\b(schedule|create|book|add|plan)\b.*\b(calendar\s+event|event|meeting|appointment|meet|call|invite)\b",
+            "gw_calendar_create",
+        ),
+        // Google Workspace (Drive)
+        (
+            r"(?i)\b(search|find|look\s*for|list|show|browse)\b.*\b(google\s+drive|drive\s+files?|drive)\b",
+            "gw_drive_search",
+        ),
+        // Google Workspace (Docs)
+        (
+            r"(?i)\b(create|new|start|draft|write)\b.*\b(google\s+docs?|gdocs?|gdoc|document)\b",
+            "gw_docs_create",
+        ),
+        (
+            r"(?i)\b(read|open|show|view|summarize|extract)\b.*\b(google\s+docs?|gdocs?|gdoc|document)\b",
+            "gw_docs_read",
+        ),
+        (
+            r"(?i)\b(edit|update|append|modify)\b.*\b(google\s+docs?|gdocs?|gdoc|document)\b",
+            "gw_docs_edit",
+        ),
+        // Google Workspace (Sheets)
+        (
+            r"(?i)\b(create|new|start|make)\b.*\b(google\s+sheets?|gsheets?|spreadsheet|sheet)\b",
+            "gw_sheets_create",
+        ),
+        (
+            r"(?i)\b(read|open|show|view|analyze)\b.*\b(google\s+sheets?|gsheets?|spreadsheet|sheet)\b",
+            "gw_sheets_read",
+        ),
+        (
+            r"(?i)\b(edit|update|write|append|modify)\b.*\b(google\s+sheets?|gsheets?|spreadsheet|sheet)\b",
+            "gw_sheets_edit",
+        ),
+        // Google Workspace (Slides)
+        (
+            r"(?i)\b(create|new|start|make)\b.*\b(google\s+slides?|gslides?|presentation|deck)\b",
+            "gw_slides_create",
+        ),
+        (
+            r"(?i)\b(read|open|show|view)\b.*\b(google\s+slides?|gslides?|presentation|deck)\b",
+            "gw_slides_read",
+        ),
+        // Google Workspace (Forms via raw MCP tools)
+        (
+            r"(?i)\b(list|show|read|open|find|search)\b.*\b(google\s+forms?|forms?)\b",
+            "mcp_gworkspace_listForms",
+        ),
+        (
+            r"(?i)\b(create|new|make|build)\b.*\b(google\s+forms?|forms?)\b",
+            "mcp_gworkspace_createForm",
+        ),
         (r"(?i)\b(ping)\s+\w+", "ping_host"),
         (r"(?i)\b(download)\s+", "download_file"),
         (r"(?i)\bspeed\s*test\b", "speed_test"),
         (r"(?i)\b(my|public)\s*ip\b", "get_public_ip"),
         // Knowledge
         (r"(?i)\bremember\s+(that|this)\b", "remember_fact"),
-        (r"(?i)\b(recall|what\s+did\s+I|do\s+you\s+remember)\b", "recall_fact"),
+        (
+            r"(?i)\b(recall|what\s+did\s+I|do\s+you\s+remember)\b",
+            "recall_fact",
+        ),
         // Notifications
         (r"(?i)\b(notify|notification|alert)\b", "send_notification"),
         (r"(?i)\b(remind|reminder)\s+me\b", "schedule_reminder"),
-        (r"(?i)\b(email|compose|draft)\s*(an?\s+)?email\b", "compose_email"),
+        (
+            r"(?i)\b(email|compose|draft)\s*(an?\s+)?email\b",
+            "compose_email",
+        ),
         // Code execution
-        (r"(?i)\b(run|execute)\s+(this\s+)?(bash|shell|command)\b", "execute_bash"),
-        (r"(?i)\b(run|execute)\s+(this\s+)?python\b", "execute_python"),
+        (
+            r"(?i)\b(run|execute)\s+(this\s+)?(bash|shell|command)\b",
+            "execute_bash",
+        ),
+        (
+            r"(?i)\b(run|execute)\s+(this\s+)?python\b",
+            "execute_python",
+        ),
         // Package
         (r"(?i)\binstall\s+\w+\b", "install_application"),
         (r"(?i)\buninstall\s+\w+\b", "uninstall_application"),
     ];
 
-    mappings.into_iter()
+    mappings
+        .into_iter()
         .filter_map(|(pat, tool)| Regex::new(pat).ok().map(|r| (r, tool)))
         .collect()
 });
@@ -106,18 +265,40 @@ static DIRECT_TOOL_RE: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
 static VERB_TO_CATEGORY: Lazy<HashMap<&str, &str>> = Lazy::new(|| {
     let mut m = HashMap::new();
     for (verbs, cat) in [
-        (&["open", "launch", "start", "run", "focus", "close", "quit", "kill"][..], "app_lifecycle"),
-        (&["read", "write", "create", "delete", "move", "copy", "rename", "search", "find", "list"][..], "file_ops"),
+        (
+            &[
+                "open", "launch", "start", "run", "focus", "close", "quit", "kill",
+            ][..],
+            "app_lifecycle",
+        ),
+        (
+            &[
+                "read", "write", "create", "delete", "move", "copy", "rename", "search", "find",
+                "list",
+            ][..],
+            "file_ops",
+        ),
         (&["install", "uninstall", "update"][..], "disk"),
-        (&["volume", "brightness", "wifi", "bluetooth"][..], "system_config"),
-        (&["shutdown", "reboot", "sleep", "hibernate", "lock"][..], "power"),
-        (&["search", "google", "download", "fetch", "ping"][..], "internet"),
+        (
+            &["volume", "brightness", "wifi", "bluetooth"][..],
+            "system_config",
+        ),
+        (
+            &["shutdown", "reboot", "sleep", "hibernate", "lock"][..],
+            "power",
+        ),
+        (
+            &["search", "google", "download", "fetch", "ping"][..],
+            "internet",
+        ),
         (&["remember", "recall", "forget", "save"][..], "knowledge"),
         (&["notify", "remind", "email"][..], "communication"),
         (&["screenshot", "clipboard", "type"][..], "interaction"),
         (&["schedule", "cron"][..], "scheduler"),
     ] {
-        for verb in verbs { m.insert(*verb, cat); }
+        for verb in verbs {
+            m.insert(*verb, cat);
+        }
     }
     m
 });
@@ -155,7 +336,11 @@ impl IntentRouter {
         }
 
         // 3. Check verb-based category mapping
-        let first_word = trimmed.split_whitespace().next().unwrap_or("").to_lowercase();
+        let first_word = trimmed
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_lowercase();
         if let Some(category) = VERB_TO_CATEGORY.get(first_word.as_str()) {
             return IntentResult {
                 intent: Intent::ComplexTask,
@@ -198,5 +383,57 @@ mod tests {
         let result = IntentRouter::classify("Search online for rust ownership examples");
         assert!(matches!(result.intent, Intent::DirectTool(_)));
         assert_eq!(result.tool_hint.as_deref(), Some("web_search"));
+    }
+
+    #[test]
+    fn routes_check_gmail_prompts_to_gmail_inbox_tool() {
+        let result = IntentRouter::classify("check my gmail for unread emails");
+        assert!(matches!(result.intent, Intent::DirectTool(_)));
+        assert_eq!(result.tool_hint.as_deref(), Some("gw_gmail_inbox"));
+    }
+
+    #[test]
+    fn routes_search_gmail_prompts_to_gmail_search_tool() {
+        let result = IntentRouter::classify("search gmail for from:boss subject:invoice");
+        assert!(matches!(result.intent, Intent::DirectTool(_)));
+        assert_eq!(result.tool_hint.as_deref(), Some("gw_gmail_search"));
+    }
+
+    #[test]
+    fn routes_fetch_latest_unread_gmails_to_gmail_inbox_tool() {
+        let result = IntentRouter::classify("Fetch 3 latest unread gmails");
+        assert!(matches!(result.intent, Intent::DirectTool(_)));
+        assert_eq!(result.tool_hint.as_deref(), Some("gw_gmail_inbox"));
+    }
+
+    #[test]
+    fn routes_schedule_meeting_to_calendar_create_tool() {
+        let result = IntentRouter::classify("Schedule a Google Meet for tomorrow at 3pm");
+        assert!(matches!(result.intent, Intent::DirectTool(_)));
+        assert_eq!(result.tool_hint.as_deref(), Some("gw_calendar_create"));
+    }
+
+    #[test]
+    fn routes_create_doc_to_docs_create_tool() {
+        let result = IntentRouter::classify("Create a new Google Doc called Weekly Plan");
+        assert!(matches!(result.intent, Intent::DirectTool(_)));
+        assert_eq!(result.tool_hint.as_deref(), Some("gw_docs_create"));
+    }
+
+    #[test]
+    fn routes_forms_listing_to_raw_forms_tool() {
+        let result = IntentRouter::classify("List my google forms");
+        assert!(matches!(result.intent, Intent::DirectTool(_)));
+        assert_eq!(
+            result.tool_hint.as_deref(),
+            Some("mcp_gworkspace_listForms")
+        );
+    }
+
+    #[test]
+    fn routes_folder_lookup_prompts_to_search_files() {
+        let result = IntentRouter::classify("search for folder name zrok");
+        assert!(matches!(result.intent, Intent::DirectTool(_)));
+        assert_eq!(result.tool_hint.as_deref(), Some("search_files"));
     }
 }

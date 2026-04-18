@@ -3,11 +3,11 @@
 //! Covers AutomationScheduler, MacroRecorder, WorkflowEngine,
 //! HealthRegistry, CircuitBreaker, and SupervisedTask.
 
-use kria_core::automation::{AutomationScheduler, MacroRecorder, WorkflowEngine};
 use kria_core::automation::scheduler::ScheduledTask;
-use kria_core::automation::workflows::{Workflow, WorkflowStep, WorkflowStatus};
-use kria_core::infra::health::{HealthRegistry, ServiceStatus};
+use kria_core::automation::workflows::{Workflow, WorkflowStatus, WorkflowStep};
+use kria_core::automation::{AutomationScheduler, MacroRecorder, WorkflowEngine};
 use kria_core::infra::circuit_breaker::CircuitBreaker;
+use kria_core::infra::health::{HealthRegistry, ServiceStatus};
 use serde_json::json;
 
 // ── HealthRegistry ─────────────────────────────────────────────────
@@ -332,17 +332,14 @@ mod workflows {
 
 mod circuit_breaker {
     use super::*;
-    use std::time::Duration;
     use kria_core::infra::circuit_breaker::CircuitBreakerError;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn passes_when_closed() {
         let cb = CircuitBreaker::new("test", 3, Duration::from_secs(5));
         let result = cb
-            .call(
-                async { Ok::<_, String>("hello") },
-                |_: &String| false,
-            )
+            .call(async { Ok::<_, String>("hello") }, |_: &String| false)
             .await
             .unwrap();
         assert_eq!(result, "hello");

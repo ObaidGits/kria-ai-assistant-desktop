@@ -8,17 +8,19 @@
 //!
 //! Uses a mock LLM backend that returns scripted responses.
 
-use kria_core::agent::AgentLoop;
 use kria_core::agent::loop_engine::StreamEvent;
-use kria_core::llm::{ChatMessage, ModelRouter};
-use kria_core::safety::{PolicyEngine, AuditLogger, RollbackManager};
-use kria_core::safety::hitl::HitlGateway;
-use kria_core::tools::registry;
+use kria_core::agent::AgentLoop;
 use kria_core::infra::EventBus;
+use kria_core::llm::{ChatMessage, ModelRouter};
+use kria_core::safety::hitl::HitlGateway;
+use kria_core::safety::{AuditLogger, PolicyEngine, RollbackManager};
+use kria_core::tools::registry;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-fn spawn_mock_chat_server(responses: Vec<serde_json::Value>) -> (String, std::thread::JoinHandle<()>) {
+fn spawn_mock_chat_server(
+    responses: Vec<serde_json::Value>,
+) -> (String, std::thread::JoinHandle<()>) {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
@@ -170,7 +172,9 @@ async fn agent_loop_instantiates_with_all_subsystems() {
     let agent_loop = AgentLoop::new(
         model_router,
         tool_registry.clone(),
-        Arc::new(tokio::sync::RwLock::new(kria_core::tools::mount_manager::ToolMountManager::new())),
+        Arc::new(tokio::sync::RwLock::new(
+            kria_core::tools::mount_manager::ToolMountManager::new(),
+        )),
         policy_engine,
         hitl,
         audit_logger,
@@ -204,8 +208,13 @@ async fn agent_loop_instantiates_with_all_subsystems() {
     // Without a running LLM backend, we expect an error event
     assert!(!events.is_empty(), "should emit at least one event");
 
-    let has_error_or_done = events.iter().any(|e| matches!(e, StreamEvent::Error(_) | StreamEvent::Done(_)));
-    assert!(has_error_or_done, "should end with Error (no backend) or Done");
+    let has_error_or_done = events
+        .iter()
+        .any(|e| matches!(e, StreamEvent::Error(_) | StreamEvent::Done(_)));
+    assert!(
+        has_error_or_done,
+        "should end with Error (no backend) or Done"
+    );
 }
 
 #[tokio::test]
@@ -220,7 +229,10 @@ async fn event_bus_publishes_and_receives() {
 
     let event = rx.recv().await.unwrap();
     match event {
-        kria_core::infra::event_bus::KriaEvent::MessageReceived { session_id, content } => {
+        kria_core::infra::event_bus::KriaEvent::MessageReceived {
+            session_id,
+            content,
+        } => {
             assert_eq!(session_id, "s1");
             assert_eq!(content, "hello");
         }
@@ -241,8 +253,14 @@ async fn event_bus_multiple_subscribers() {
     let e1 = rx1.recv().await.unwrap();
     let e2 = rx2.recv().await.unwrap();
 
-    assert!(matches!(e1, kria_core::infra::event_bus::KriaEvent::SidecarReady));
-    assert!(matches!(e2, kria_core::infra::event_bus::KriaEvent::SidecarReady));
+    assert!(matches!(
+        e1,
+        kria_core::infra::event_bus::KriaEvent::SidecarReady
+    ));
+    assert!(matches!(
+        e2,
+        kria_core::infra::event_bus::KriaEvent::SidecarReady
+    ));
 }
 
 #[test]
@@ -255,17 +273,26 @@ fn policy_engine_classifies_tool_tiers() {
     assert!(!d.blocked);
 
     // YELLOW: user-level mutation
-    let d = engine.evaluate("write_file", &serde_json::json!({"path": "/home/user/test.txt"}));
+    let d = engine.evaluate(
+        "write_file",
+        &serde_json::json!({"path": "/home/user/test.txt"}),
+    );
     assert!(!d.requires_approval); // YELLOW auto-executes with notify
     assert!(!d.blocked);
 
     // RED: system mutation
-    let d = engine.evaluate("delete_file", &serde_json::json!({"path": "/home/user/test.txt"}));
+    let d = engine.evaluate(
+        "delete_file",
+        &serde_json::json!({"path": "/home/user/test.txt"}),
+    );
     assert!(d.requires_approval);
     assert!(!d.blocked);
 
     // BLACK: dangerous pattern (mkfs matches blacklist)
-    let d = engine.evaluate("execute_bash", &serde_json::json!({"command": "mkfs.ext4 /dev/sda"}));
+    let d = engine.evaluate(
+        "execute_bash",
+        &serde_json::json!({"command": "mkfs.ext4 /dev/sda"}),
+    );
     assert!(d.blocked);
 }
 
@@ -278,11 +305,20 @@ fn tool_registry_generates_function_schemas() {
 
     // Each schema should have the OpenAI function-calling shape
     for schema in &schemas {
-        assert!(schema.get("function").is_some(), "schema missing 'function' key");
+        assert!(
+            schema.get("function").is_some(),
+            "schema missing 'function' key"
+        );
         let func = &schema["function"];
         assert!(func.get("name").is_some(), "function missing 'name'");
-        assert!(func.get("description").is_some(), "function missing 'description'");
-        assert!(func.get("parameters").is_some(), "function missing 'parameters'");
+        assert!(
+            func.get("description").is_some(),
+            "function missing 'description'"
+        );
+        assert!(
+            func.get("parameters").is_some(),
+            "function missing 'parameters'"
+        );
     }
 }
 
@@ -301,10 +337,22 @@ fn system_prompt_includes_tools_and_datetime() {
     assert!(prompt.contains("TestUser"), "should include user name");
     assert!(prompt.contains("linux"), "should include OS name");
     assert!(prompt.contains("standard"), "should include hardware tier");
-    assert!(prompt.contains("get_cpu_usage"), "should include tool descriptions");
-    assert!(prompt.contains("dark theme"), "should include memory context");
-    assert!(prompt.contains("Current Date/Time:"), "should include date/time");
-    assert!(prompt.contains("<tool_call>"), "should include tool call format");
+    assert!(
+        prompt.contains("get_cpu_usage"),
+        "should include tool descriptions"
+    );
+    assert!(
+        prompt.contains("dark theme"),
+        "should include memory context"
+    );
+    assert!(
+        prompt.contains("Current Date/Time:"),
+        "should include date/time"
+    );
+    assert!(
+        prompt.contains("<tool_call>"),
+        "should include tool call format"
+    );
 }
 
 #[tokio::test]
@@ -328,7 +376,11 @@ async fn agent_loop_blocks_tool_above_hardware_tier() {
     let db_path = tmp.path().join("test_audit_tier.db");
     let audit_conn = rusqlite::Connection::open(&db_path).unwrap();
     let audit_logger = Arc::new(AuditLogger::new(audit_conn));
-    let rollback_mgr = Arc::new(RollbackManager::new(tmp.path().join("rollback_tier"), 1, 10));
+    let rollback_mgr = Arc::new(RollbackManager::new(
+        tmp.path().join("rollback_tier"),
+        1,
+        10,
+    ));
 
     let mount_mgr = Arc::new(tokio::sync::RwLock::new(
         kria_core::tools::mount_manager::ToolMountManager::new(),
@@ -366,19 +418,29 @@ async fn agent_loop_blocks_tool_above_hardware_tier() {
     let events = collect_events(rx).await;
 
     let tool_end = events.iter().find_map(|e| match e {
-        StreamEvent::ToolEnd { name, result, success } if name == "install_package" => {
-            Some((result.clone(), *success))
-        }
+        StreamEvent::ToolEnd {
+            name,
+            result,
+            success,
+        } if name == "install_package" => Some((result.clone(), *success)),
         _ => None,
     });
     assert!(tool_end.is_some(), "expected ToolEnd for install_package");
     let (result, success) = tool_end.unwrap();
     assert!(!success, "install_package should be blocked on lite tier");
     let err = result["error"].as_str().unwrap_or_default();
-    assert!(err.contains("not available for current hardware tier 'lite'"), "unexpected error: {err}");
+    assert!(
+        err.contains("not available for current hardware tier 'lite'"),
+        "unexpected error: {err}"
+    );
 
-    let has_approval_prompt = events.iter().any(|e| matches!(e, StreamEvent::ApprovalRequired { .. }));
-    assert!(!has_approval_prompt, "tier-gated tool should not reach HITL approval");
+    let has_approval_prompt = events
+        .iter()
+        .any(|e| matches!(e, StreamEvent::ApprovalRequired { .. }));
+    assert!(
+        !has_approval_prompt,
+        "tier-gated tool should not reach HITL approval"
+    );
 
     let has_done = events.iter().any(|e| matches!(e, StreamEvent::Done(_)));
     assert!(has_done, "loop should complete with Done event");
@@ -407,7 +469,11 @@ async fn agent_loop_blocks_unmounted_tool_even_if_tier_allows_it() {
     let db_path = tmp.path().join("test_audit_mount.db");
     let audit_conn = rusqlite::Connection::open(&db_path).unwrap();
     let audit_logger = Arc::new(AuditLogger::new(audit_conn));
-    let rollback_mgr = Arc::new(RollbackManager::new(tmp.path().join("rollback_mount"), 1, 10));
+    let rollback_mgr = Arc::new(RollbackManager::new(
+        tmp.path().join("rollback_mount"),
+        1,
+        10,
+    ));
 
     let mut mount = kria_core::tools::mount_manager::ToolMountManager::new();
     mount.define_group("hidden_sys", vec!["get_cpu_usage".into()], false);
@@ -441,20 +507,27 @@ async fn agent_loop_blocks_unmounted_tool_even_if_tier_allows_it() {
         },
     ];
 
-    agent_loop.run("test-session-mount", &mut messages, tx).await;
+    agent_loop
+        .run("test-session-mount", &mut messages, tx)
+        .await;
     let events = collect_events(rx).await;
 
     let tool_end = events.iter().find_map(|e| match e {
-        StreamEvent::ToolEnd { name, result, success } if name == "get_cpu_usage" => {
-            Some((result.clone(), *success))
-        }
+        StreamEvent::ToolEnd {
+            name,
+            result,
+            success,
+        } if name == "get_cpu_usage" => Some((result.clone(), *success)),
         _ => None,
     });
     assert!(tool_end.is_some(), "expected ToolEnd for get_cpu_usage");
     let (result, success) = tool_end.unwrap();
     assert!(!success, "unmounted tool should be blocked");
     let err = result["error"].as_str().unwrap_or_default();
-    assert!(err.contains("mounted tool groups"), "unexpected error: {err}");
+    assert!(
+        err.contains("mounted tool groups"),
+        "unexpected error: {err}"
+    );
 
     let has_done = events.iter().any(|e| matches!(e, StreamEvent::Done(_)));
     assert!(has_done, "loop should complete with Done event");

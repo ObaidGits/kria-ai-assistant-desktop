@@ -6,7 +6,8 @@ pub struct DocumentProcessor;
 impl DocumentProcessor {
     /// Extract text from a file based on extension.
     pub async fn extract_text(path: &Path) -> anyhow::Result<String> {
-        let ext = path.extension()
+        let ext = path
+            .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_lowercase();
@@ -51,10 +52,7 @@ impl DocumentProcessor {
     async fn extract_html(path: &Path) -> anyhow::Result<String> {
         let html = tokio::fs::read_to_string(path).await?;
         let document = scraper::Html::parse_document(&html);
-        let text: String = document.root_element()
-            .text()
-            .collect::<Vec<_>>()
-            .join(" ");
+        let text: String = document.root_element().text().collect::<Vec<_>>().join(" ");
         Ok(text.split_whitespace().collect::<Vec<_>>().join(" "))
     }
 }

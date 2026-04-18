@@ -8,7 +8,11 @@ fn developer_tools_registered() {
     use kria_core::tools::registry::build_default_registry;
     let reg = build_default_registry();
     let dev_tools = reg.list_by_category("developer");
-    assert!(dev_tools.len() >= 11, "expected at least 11 developer tools, got {}", dev_tools.len());
+    assert!(
+        dev_tools.len() >= 11,
+        "expected at least 11 developer tools, got {}",
+        dev_tools.len()
+    );
 }
 
 #[test]
@@ -35,8 +39,8 @@ fn git_diff_registered() {
 
 #[test]
 fn git_commit_is_red_tier() {
-    use kria_core::tools::registry::build_default_registry;
     use kria_core::safety::RiskLevel;
+    use kria_core::tools::registry::build_default_registry;
     let reg = build_default_registry();
     let def = reg.get_def("git_commit").unwrap();
     assert_eq!(def.default_tier, RiskLevel::Red);
@@ -60,8 +64,8 @@ fn git_branch_list_registered() {
 
 #[test]
 fn git_checkout_is_yellow_tier() {
-    use kria_core::tools::registry::build_default_registry;
     use kria_core::safety::RiskLevel;
+    use kria_core::tools::registry::build_default_registry;
     let reg = build_default_registry();
     let def = reg.get_def("git_checkout").unwrap();
     assert_eq!(def.default_tier, RiskLevel::Yellow);
@@ -116,10 +120,12 @@ async fn query_sqlite_rejects_write() {
     use kria_core::tools::registry::build_default_registry;
     let reg = build_default_registry();
     let handler = reg.get_handler("query_sqlite").unwrap();
-    let result = handler.execute(serde_json::json!({
-        "db_path": "/tmp/test.db",
-        "sql": "DROP TABLE users"
-    })).await;
+    let result = handler
+        .execute(serde_json::json!({
+            "db_path": "/tmp/test.db",
+            "sql": "DROP TABLE users"
+        }))
+        .await;
     assert!(!result.success);
     assert!(result.error.unwrap().contains("read-only"));
 }
@@ -129,10 +135,12 @@ async fn query_sqlite_rejects_insert() {
     use kria_core::tools::registry::build_default_registry;
     let reg = build_default_registry();
     let handler = reg.get_handler("query_sqlite").unwrap();
-    let result = handler.execute(serde_json::json!({
-        "db_path": "/tmp/test.db",
-        "sql": "INSERT INTO users VALUES (1, 'test')"
-    })).await;
+    let result = handler
+        .execute(serde_json::json!({
+            "db_path": "/tmp/test.db",
+            "sql": "INSERT INTO users VALUES (1, 'test')"
+        }))
+        .await;
     assert!(!result.success);
 }
 
@@ -141,10 +149,12 @@ async fn query_sqlite_rejects_update() {
     use kria_core::tools::registry::build_default_registry;
     let reg = build_default_registry();
     let handler = reg.get_handler("query_sqlite").unwrap();
-    let result = handler.execute(serde_json::json!({
-        "db_path": "/tmp/test.db",
-        "sql": "UPDATE users SET name='test'"
-    })).await;
+    let result = handler
+        .execute(serde_json::json!({
+            "db_path": "/tmp/test.db",
+            "sql": "UPDATE users SET name='test'"
+        }))
+        .await;
     assert!(!result.success);
 }
 
@@ -153,7 +163,9 @@ async fn diff_files_unified_requires_both_params() {
     use kria_core::tools::registry::build_default_registry;
     let reg = build_default_registry();
     let handler = reg.get_handler("diff_files_unified").unwrap();
-    let result = handler.execute(serde_json::json!({ "file_a": "/tmp/a.txt" })).await;
+    let result = handler
+        .execute(serde_json::json!({ "file_a": "/tmp/a.txt" }))
+        .await;
     assert!(!result.success);
     assert!(result.error.unwrap().contains("required"));
 }
@@ -185,7 +197,9 @@ async fn analyze_project_invalid_path() {
     use kria_core::tools::registry::build_default_registry;
     let reg = build_default_registry();
     let handler = reg.get_handler("analyze_project").unwrap();
-    let result = handler.execute(serde_json::json!({ "path": "/nonexistent/path/xyz" })).await;
+    let result = handler
+        .execute(serde_json::json!({ "path": "/nonexistent/path/xyz" }))
+        .await;
     assert!(!result.success);
 }
 
@@ -213,5 +227,9 @@ fn total_tool_count_after_phase11() {
     use kria_core::tools::registry::build_default_registry;
     let reg = build_default_registry();
     // Phase 10 had at least 56 tools total, now +11 developer = 67+
-    assert!(reg.len() >= 67, "expected at least 67 tools, got {}", reg.len());
+    assert!(
+        reg.len() >= 67,
+        "expected at least 67 tools, got {}",
+        reg.len()
+    );
 }

@@ -6,22 +6,25 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{mpsc, watch};
 use tracing;
 
-use crate::agent::AgentLoop;
 use crate::agent::loop_engine::StreamEvent;
+use crate::agent::AgentLoop;
 use crate::config::TelegramConfig;
 use crate::llm::ChatMessage;
-use crate::memory::store::MemoryStore;
 use crate::memory::embeddings::EmbeddingModel;
+use crate::memory::store::MemoryStore;
 use crate::memory::vectors::VectorIndex;
 use crate::platform::detect::get_available_package_managers;
 use crate::tools::ToolRegistry;
 
 const TELEGRAM_API: &str = "https://api.telegram.org/bot";
+const TELEGRAM_CONFLICT_BASE_BACKOFF_SECS: u64 = 2;
+const TELEGRAM_CONFLICT_MAX_BACKOFF_SECS: u64 = 90;
+const TELEGRAM_CONFLICT_JITTER_MAX_MS: u64 = 1200;
 
 /// Handle to a running Telegram bridge. Drop or call stop() to shut down.
 pub struct TelegramBridge {
@@ -98,10 +101,7 @@ pub async fn verify_bot_token(token: &str) -> Result<(String, i64), String> {
 
     if resp["ok"].as_bool() == Some(true) {
         let result = &resp["result"];
-        let username = result["username"]
-            .as_str()
-            .unwrap_or("unknown")
-            .to_string();
+        let username = result["username"].as_str().unwrap_or("unknown").to_string();
         let id = result["id"].as_i64().unwrap_or(0);
         Ok((username, id))
     } else {
@@ -186,6 +186,29 @@ fn parse_allowed_chat_ids(s: &str) -> HashSet<i64> {
         .collect()
 }
 
+fn is_get_updates_conflict(description: &str) -> bool {
+    let normalized = description.trim().to_ascii_lowercase();
+    normalized.contains("conflict")
+        && normalized.contains("getupdates")
+        && normalized.contains("only one bot instance")
+}
+
+fn conflict_backoff_base_secs(retry_count: u32) -> u64 {
+    let exponent = retry_count.saturating_sub(1).min(6);
+    (TELEGRAM_CONFLICT_BASE_BACKOFF_SECS.saturating_mul(1u64 << exponent))
+        .min(TELEGRAM_CONFLICT_MAX_BACKOFF_SECS)
+}
+
+fn conflict_backoff_duration(retry_count: u32) -> Duration {
+    let base_secs = conflict_backoff_base_secs(retry_count);
+    let jitter_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_millis() as u64
+        % TELEGRAM_CONFLICT_JITTER_MAX_MS;
+    Duration::from_secs(base_secs) + Duration::from_millis(jitter_ms)
+}
+
 /// The main polling loop.
 async fn telegram_poll_loop(
     config: TelegramConfig,
@@ -221,6 +244,7 @@ async fn telegram_poll_loop(
     }
 
     let mut last_update_id: i64 = 0;
+    let mut conflict_retries: u32 = 0;
 
     // Use a dedicated session for Telegram conversations per chat
     loop {
@@ -249,9 +273,34 @@ async fn telegram_poll_loop(
             Ok(resp) => {
                 match resp.json::<serde_json::Value>().await {
                     Ok(val) if val["ok"].as_bool() == Some(true) => {
+                        conflict_retries = 0;
                         val["result"].as_array().cloned().unwrap_or_default()
                     }
                     Ok(val) => {
+                        let description = val
+                            .get("description")
+                            .and_then(|d| d.as_str())
+                            .unwrap_or("unknown telegram api error");
+                        if is_get_updates_conflict(description) {
+                            conflict_retries = conflict_retries.saturating_add(1);
+                            let backoff = conflict_backoff_duration(conflict_retries);
+                            tracing::warn!(
+                                retry = conflict_retries,
+                                backoff_secs = backoff.as_secs_f32(),
+                                "Telegram getUpdates conflict: {}. Retrying with backoff.",
+                                description
+                            );
+
+                            let shutdown_during_backoff = tokio::select! {
+                                _ = tokio::time::sleep(backoff) => false,
+                                _ = shutdown_rx.changed() => true,
+                            };
+                            if shutdown_during_backoff {
+                                tracing::info!("Telegram bridge shutting down (signal during conflict backoff)");
+                                break;
+                            }
+                            continue;
+                        }
                         tracing::warn!("Telegram API error: {:?}", val.get("description"));
                         tokio::time::sleep(Duration::from_secs(5)).await;
                         continue;
@@ -370,7 +419,11 @@ async fn telegram_poll_loop(
 }
 
 /// Process a single message through the full agent pipeline.
-async fn process_message(
+/// Process a single Telegram-style message through the full agent pipeline.
+///
+/// This is reused by the desktop's local HTTP bridge so external Telegram MCP
+/// servers can forward incoming messages into the in-process agent loop.
+pub async fn process_message(
     text: &str,
     chat_id: i64,
     from_name: &str,
@@ -539,10 +592,48 @@ async fn process_message(
     let fact_mgr = crate::memory::facts::FactManager::new(memory_store, vectors, embeddings);
     match fact_mgr.extract_from_turn(text, &full_response) {
         Ok(ids) if !ids.is_empty() => {
-            tracing::info!(count = ids.len(), "telegram: extracted facts from conversation");
+            tracing::info!(
+                count = ids.len(),
+                "telegram: extracted facts from conversation"
+            );
         }
         _ => {}
     }
 
     full_response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_get_updates_conflict_message() {
+        let msg = "Conflict: terminated by other getUpdates request; make sure that only one bot instance is running";
+        assert!(is_get_updates_conflict(msg));
+    }
+
+    #[test]
+    fn ignores_non_conflict_messages() {
+        assert!(!is_get_updates_conflict("Unauthorized"));
+        assert!(!is_get_updates_conflict("Bad Request: chat not found"));
+    }
+
+    #[test]
+    fn conflict_backoff_base_grows_and_caps() {
+        assert_eq!(conflict_backoff_base_secs(1), 2);
+        assert_eq!(conflict_backoff_base_secs(2), 4);
+        assert_eq!(conflict_backoff_base_secs(3), 8);
+        assert_eq!(conflict_backoff_base_secs(7), 90);
+        assert_eq!(conflict_backoff_base_secs(20), 90);
+    }
+
+    #[test]
+    fn conflict_backoff_duration_has_bounded_jitter() {
+        let d = conflict_backoff_duration(1);
+        let base = Duration::from_secs(conflict_backoff_base_secs(1));
+        let max = base + Duration::from_millis(TELEGRAM_CONFLICT_JITTER_MAX_MS - 1);
+        assert!(d >= base);
+        assert!(d <= max);
+    }
 }

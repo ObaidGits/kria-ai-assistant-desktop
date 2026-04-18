@@ -1,5 +1,5 @@
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use sha2::{Sha256, Digest};
 use tokio::io::AsyncWriteExt;
 
 /// Model file metadata.
@@ -46,14 +46,19 @@ impl ModelManager {
                 let path = entry.path();
                 if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                     if extensions.contains(&ext) {
-                        let name = path.file_stem()
+                        let name = path
+                            .file_stem()
                             .and_then(|s| s.to_str())
                             .unwrap_or("unknown")
                             .to_string();
                         let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
                         models.push(ModelInfo {
                             name,
-                            file: path.file_name().unwrap_or_default().to_string_lossy().into(),
+                            file: path
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .into(),
                             size_bytes: size,
                             path,
                         });

@@ -12,7 +12,7 @@ Usage:
 Environment variables:
     TELEGRAM_BOT_TOKEN  — Telegram bot API token (from @BotFather)
     TELEGRAM_CHAT_IDS   — Comma-separated allowed chat IDs (security restriction)
-    KRIA_API_URL        — KRIA server URL for forwarding messages (default: http://127.0.0.1:8088)
+    KRIA_API_URL        — KRIA server URL for forwarding messages (default: http://127.0.0.1:3001)
 """
 
 import asyncio
@@ -36,7 +36,10 @@ logger = logging.getLogger("kria.telegram_mcp")
 TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 BOT_TOKEN: str = ""
 ALLOWED_CHAT_IDS: set[int] = set()
-KRIA_API_URL: str = "http://127.0.0.1:8088"
+KRIA_API_URL: str = "http://127.0.0.1:3001"
+TELEGRAM_CONFLICT_BASE_BACKOFF_SECS = 2
+TELEGRAM_CONFLICT_MAX_BACKOFF_SECS = 90
+TELEGRAM_CONFLICT_JITTER_MAX_MS = 1200
 
 # Track the last processed update to avoid duplicates
 _last_update_id: int = 0
@@ -82,6 +85,35 @@ async def get_bot_info() -> dict:
     """Get bot identity info."""
     result = await telegram_api("getMe")
     return result.get("result", {})
+
+
+async def check_kria_api() -> bool:
+    """Check whether KRIA's local HTTP bridge is reachable."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(f"{KRIA_API_URL}/api/health")
+            return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def is_get_updates_conflict(description: str) -> bool:
+    normalized = description.strip().lower()
+    return (
+        "conflict" in normalized
+        and "getupdates" in normalized
+        and "only one bot instance" in normalized
+    )
+
+
+def conflict_backoff_seconds(retry_count: int) -> float:
+    exponent = max(0, min(retry_count - 1, 6))
+    base = min(
+        TELEGRAM_CONFLICT_BASE_BACKOFF_SECS * (2 ** exponent),
+        TELEGRAM_CONFLICT_MAX_BACKOFF_SECS,
+    )
+    jitter = (int(time.time() * 1000) % TELEGRAM_CONFLICT_JITTER_MAX_MS) / 1000.0
+    return float(base) + jitter
 
 
 def _is_allowed_chat(chat_id: int) -> bool:
@@ -250,6 +282,7 @@ def _tool_error(text: str) -> dict:
 async def telegram_polling_loop():
     """Long-poll Telegram for new messages and forward to KRIA's chat API."""
     global _last_update_id
+    conflict_retries = 0
 
     logger.info("Starting Telegram polling loop (KRIA API: %s)", KRIA_API_URL)
 
@@ -260,6 +293,7 @@ async def telegram_polling_loop():
                 limit=10,
                 timeout=30,
             )
+            conflict_retries = 0
 
             for update in updates:
                 _last_update_id = update["update_id"]
@@ -313,6 +347,27 @@ async def telegram_polling_loop():
         except httpx.TimeoutException:
             # Normal for long polling
             continue
+        except httpx.HTTPStatusError as e:
+            description = ""
+            try:
+                body = e.response.json()
+                description = body.get("description", "")
+            except Exception:
+                description = e.response.text
+
+            if is_get_updates_conflict(description):
+                conflict_retries += 1
+                delay = conflict_backoff_seconds(conflict_retries)
+                logger.warning(
+                    "Telegram getUpdates conflict: %s. Retrying in %.1fs.",
+                    description,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            logger.error("Polling HTTP error: %s", description or str(e))
+            await asyncio.sleep(5)
         except Exception as e:
             logger.error("Polling error: %s", e)
             await asyncio.sleep(5)
@@ -420,7 +475,7 @@ async def main():
     global BOT_TOKEN, ALLOWED_CHAT_IDS, KRIA_API_URL
 
     BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    KRIA_API_URL = os.environ.get("KRIA_API_URL", "http://127.0.0.1:8088")
+    KRIA_API_URL = os.environ.get("KRIA_API_URL", "http://127.0.0.1:3001")
 
     chat_ids_str = os.environ.get("TELEGRAM_CHAT_IDS", "")
     if chat_ids_str:
@@ -438,6 +493,14 @@ async def main():
         logger.info("Connected as @%s (id: %s)", info.get("username"), info.get("id"))
     except Exception as e:
         logger.error("Failed to verify bot token: %s", e)
+
+    if await check_kria_api():
+        logger.info("KRIA API bridge reachable at %s", KRIA_API_URL)
+    else:
+        logger.warning(
+            "KRIA API bridge is not reachable at %s. Incoming Telegram messages will fail until KRIA starts its local API bridge.",
+            KRIA_API_URL,
+        )
 
     # Run MCP stdio handler + Telegram polling concurrently
     await asyncio.gather(

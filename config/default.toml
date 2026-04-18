@@ -19,10 +19,22 @@ tier = "low"
 
 [voice]
 enabled = false
+mode = "push_to_talk"
 stt_model = "ggml-base.en.bin"
 tts_voice = "en_US-lessac-high"
-sample_rate = 16000
-vad_threshold = 0.01
+vad_silence_ms = 1000
+energy_threshold = 0.02
+mic_device = "auto"
+speaker_device = "auto"
+push_to_talk_key = "ctrl+space"
+language = "auto"
+partial_update_ms = 2000
+confidence_threshold = 0.30
+noise_suppression_mode = "off"
+follow_system_default_mic = true
+follow_system_default_speaker = true
+persist_transcripts = true
+persist_raw_audio = false
 
 [memory]
 max_facts = 10000

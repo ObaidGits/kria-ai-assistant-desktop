@@ -1,5 +1,5 @@
+use kria_server::{build_router, ServerState};
 use std::sync::Arc;
-use kria_server::{ServerState, build_router};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -9,11 +9,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = kria_core::config::KriaConfig::load(None)?;
-    let bind_addr = format!(
-        "{}:{}",
-        config.server.host,
-        config.server.port,
-    );
+    let bind_addr = format!("{}:{}", config.server.host, config.server.port,);
 
     let state = Arc::new(ServerState { config });
     let app = build_router(state);

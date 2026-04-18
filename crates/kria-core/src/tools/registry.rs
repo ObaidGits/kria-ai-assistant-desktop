@@ -1,8 +1,8 @@
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
-use async_trait::async_trait;
 use crate::infra::ToolResult;
 use crate::safety::RiskLevel;
+use async_trait::async_trait;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 /// Tool parameter schema for LLM function-calling format.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -35,10 +35,13 @@ impl ToolDef {
         let mut required = Vec::new();
 
         for p in &self.parameters {
-            props.insert(p.name.clone(), serde_json::json!({
-                "type": p.param_type,
-                "description": p.description,
-            }));
+            props.insert(
+                p.name.clone(),
+                serde_json::json!({
+                    "type": p.param_type,
+                    "description": p.description,
+                }),
+            );
             if p.required {
                 required.push(serde_json::Value::String(p.name.clone()));
             }
@@ -84,23 +87,42 @@ impl ToolRegistry {
     /// Thread-safe: can be called concurrently from background tasks.
     pub fn register(&self, def: ToolDef, handler: Arc<dyn ToolHandler>) {
         let name = def.name.clone();
-        self.defs.write().expect("tool registry defs lock poisoned").insert(name.clone(), def);
-        self.handlers.write().expect("tool registry handlers lock poisoned").insert(name, handler);
+        self.defs
+            .write()
+            .expect("tool registry defs lock poisoned")
+            .insert(name.clone(), def);
+        self.handlers
+            .write()
+            .expect("tool registry handlers lock poisoned")
+            .insert(name, handler);
     }
 
     /// Get a tool definition by name.
     pub fn get_def(&self, name: &str) -> Option<ToolDef> {
-        self.defs.read().expect("tool registry defs lock poisoned").get(name).cloned()
+        self.defs
+            .read()
+            .expect("tool registry defs lock poisoned")
+            .get(name)
+            .cloned()
     }
 
     /// Get a tool handler by name.
     pub fn get_handler(&self, name: &str) -> Option<Arc<dyn ToolHandler>> {
-        self.handlers.read().expect("tool registry handlers lock poisoned").get(name).cloned()
+        self.handlers
+            .read()
+            .expect("tool registry handlers lock poisoned")
+            .get(name)
+            .cloned()
     }
 
     /// List all tool definitions (for LLM system prompt).
     pub fn list_defs(&self) -> Vec<ToolDef> {
-        self.defs.read().expect("tool registry defs lock poisoned").values().cloned().collect()
+        self.defs
+            .read()
+            .expect("tool registry defs lock poisoned")
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// List tool definitions filtered by hardware tier.
@@ -115,14 +137,24 @@ impl ToolRegistry {
             }
         };
         let rank = tier_rank(hw_tier);
-        self.defs.read().expect("tool registry defs lock poisoned")
-            .values().filter(|d| tier_rank(d.min_tier) <= rank).cloned().collect()
+        self.defs
+            .read()
+            .expect("tool registry defs lock poisoned")
+            .values()
+            .filter(|d| tier_rank(d.min_tier) <= rank)
+            .cloned()
+            .collect()
     }
 
     /// List tools by category.
     pub fn list_by_category(&self, category: &str) -> Vec<ToolDef> {
-        self.defs.read().expect("tool registry defs lock poisoned")
-            .values().filter(|d| d.category == category).cloned().collect()
+        self.defs
+            .read()
+            .expect("tool registry defs lock poisoned")
+            .values()
+            .filter(|d| d.category == category)
+            .cloned()
+            .collect()
     }
 
     /// Get all category names.
@@ -136,16 +168,25 @@ impl ToolRegistry {
 
     /// Generate the function schemas array for the LLM.
     pub fn function_schemas(&self, hw_tier: &str) -> Vec<serde_json::Value> {
-        self.list_for_tier(hw_tier).iter().map(|d| d.to_function_schema()).collect()
+        self.list_for_tier(hw_tier)
+            .iter()
+            .map(|d| d.to_function_schema())
+            .collect()
     }
 
     /// Total number of registered tools.
     pub fn len(&self) -> usize {
-        self.defs.read().expect("tool registry defs lock poisoned").len()
+        self.defs
+            .read()
+            .expect("tool registry defs lock poisoned")
+            .len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.defs.read().expect("tool registry defs lock poisoned").is_empty()
+        self.defs
+            .read()
+            .expect("tool registry defs lock poisoned")
+            .is_empty()
     }
 }
 
@@ -155,7 +196,9 @@ pub fn build_default_registry() -> ToolRegistry {
 }
 
 /// Build with MemoryStore only (no RAG).
-pub fn build_registry_with_store(store: Option<std::sync::Arc<crate::memory::store::MemoryStore>>) -> ToolRegistry {
+pub fn build_registry_with_store(
+    store: Option<std::sync::Arc<crate::memory::store::MemoryStore>>,
+) -> ToolRegistry {
     build_registry_full(store, None, None)
 }
 

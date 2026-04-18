@@ -28,3 +28,5 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 rusqlite = { workspace = true }
 reqwest = { workspace = true }
+async-trait = { workspace = true }
+axum = { version = "0.8", features = ["json"] }

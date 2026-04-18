@@ -2,7 +2,6 @@
 ///
 /// Validates: SearXNG tool registration, weather/news/exchange/calculator tools,
 /// time zone computation, math expression evaluator safety, and tool registry completeness.
-
 use kria_core::tools::registry;
 
 // ── Tool registration ──────────────────────────────────────────
@@ -31,20 +30,43 @@ fn phase2_internet_tools_registered() {
 #[test]
 fn phase2_tools_are_green_tier() {
     let reg = registry::build_default_registry();
-    let green_tools = ["searxng_search", "get_current_time", "get_weather", "get_news", "get_exchange_rate", "calculate"];
+    let green_tools = [
+        "searxng_search",
+        "get_current_time",
+        "get_weather",
+        "get_news",
+        "get_exchange_rate",
+        "calculate",
+    ];
     for name in &green_tools {
-        let def = reg.get_def(name).unwrap_or_else(|| panic!("missing tool: {name}"));
-        assert_eq!(def.default_tier, kria_core::safety::RiskLevel::Green, "{name} should be GREEN tier");
+        let def = reg
+            .get_def(name)
+            .unwrap_or_else(|| panic!("missing tool: {name}"));
+        assert_eq!(
+            def.default_tier,
+            kria_core::safety::RiskLevel::Green,
+            "{name} should be GREEN tier"
+        );
     }
 }
 
 #[test]
 fn phase2_tools_have_correct_categories() {
     let reg = registry::build_default_registry();
-    let names = ["searxng_search", "get_current_time", "get_weather", "get_news", "get_exchange_rate", "calculate"];
+    let names = [
+        "searxng_search",
+        "get_current_time",
+        "get_weather",
+        "get_news",
+        "get_exchange_rate",
+        "calculate",
+    ];
     for name in &names {
         let def = reg.get_def(name).unwrap();
-        assert_eq!(def.category, "internet", "{name} should be in 'internet' category");
+        assert_eq!(
+            def.category, "internet",
+            "{name} should be in 'internet' category"
+        );
     }
 }
 
@@ -60,12 +82,22 @@ fn phase2_tools_generate_function_schemas() {
     let reg = registry::build_default_registry();
     let schemas = reg.function_schemas("lite");
     // All new tools should appear in schemas for lite tier
-    let names: Vec<String> = schemas.iter()
+    let names: Vec<String> = schemas
+        .iter()
         .filter_map(|s| s["function"]["name"].as_str().map(String::from))
         .collect();
-    assert!(names.contains(&"get_weather".to_string()), "weather tool missing from schemas");
-    assert!(names.contains(&"calculate".to_string()), "calculate tool missing from schemas");
-    assert!(names.contains(&"get_current_time".to_string()), "time tool missing from schemas");
+    assert!(
+        names.contains(&"get_weather".to_string()),
+        "weather tool missing from schemas"
+    );
+    assert!(
+        names.contains(&"calculate".to_string()),
+        "calculate tool missing from schemas"
+    );
+    assert!(
+        names.contains(&"get_current_time".to_string()),
+        "time tool missing from schemas"
+    );
 }
 
 // ── GetCurrentTime ─────────────────────────────────────────────
@@ -85,7 +117,9 @@ async fn current_time_utc() {
 async fn current_time_est() {
     let reg = registry::build_default_registry();
     let handler = reg.get_handler("get_current_time").unwrap().clone();
-    let result = handler.execute(serde_json::json!({"timezone": "EST"})).await;
+    let result = handler
+        .execute(serde_json::json!({"timezone": "EST"}))
+        .await;
     assert!(result.success);
     assert!(result.data["timezone"].as_str().unwrap().contains("EST"));
 }
@@ -94,7 +128,9 @@ async fn current_time_est() {
 async fn current_time_jst() {
     let reg = registry::build_default_registry();
     let handler = reg.get_handler("get_current_time").unwrap().clone();
-    let result = handler.execute(serde_json::json!({"timezone": "JST"})).await;
+    let result = handler
+        .execute(serde_json::json!({"timezone": "JST"}))
+        .await;
     assert!(result.success);
     assert!(result.data["timezone"].as_str().unwrap().contains("JST"));
 }
@@ -114,7 +150,9 @@ async fn calculate_basic_arithmetic() {
     let reg = registry::build_default_registry();
     let handler = reg.get_handler("calculate").unwrap().clone();
 
-    let result = handler.execute(serde_json::json!({"expression": "2 + 3 * 4"})).await;
+    let result = handler
+        .execute(serde_json::json!({"expression": "2 + 3 * 4"}))
+        .await;
     assert!(result.success);
     assert_eq!(result.data["result"].as_f64().unwrap(), 14.0);
 }
@@ -124,7 +162,9 @@ async fn calculate_parentheses() {
     let reg = registry::build_default_registry();
     let handler = reg.get_handler("calculate").unwrap().clone();
 
-    let result = handler.execute(serde_json::json!({"expression": "(2 + 3) * 4"})).await;
+    let result = handler
+        .execute(serde_json::json!({"expression": "(2 + 3) * 4"}))
+        .await;
     assert!(result.success);
     assert_eq!(result.data["result"].as_f64().unwrap(), 20.0);
 }
@@ -134,7 +174,9 @@ async fn calculate_power() {
     let reg = registry::build_default_registry();
     let handler = reg.get_handler("calculate").unwrap().clone();
 
-    let result = handler.execute(serde_json::json!({"expression": "2^10"})).await;
+    let result = handler
+        .execute(serde_json::json!({"expression": "2^10"}))
+        .await;
     assert!(result.success);
     assert_eq!(result.data["result"].as_f64().unwrap(), 1024.0);
 }
@@ -144,7 +186,9 @@ async fn calculate_sqrt_function() {
     let reg = registry::build_default_registry();
     let handler = reg.get_handler("calculate").unwrap().clone();
 
-    let result = handler.execute(serde_json::json!({"expression": "sqrt(144)"})).await;
+    let result = handler
+        .execute(serde_json::json!({"expression": "sqrt(144)"}))
+        .await;
     assert!(result.success);
     assert_eq!(result.data["result"].as_f64().unwrap(), 12.0);
 }
@@ -154,7 +198,9 @@ async fn calculate_pi_constant() {
     let reg = registry::build_default_registry();
     let handler = reg.get_handler("calculate").unwrap().clone();
 
-    let result = handler.execute(serde_json::json!({"expression": "pi * 2"})).await;
+    let result = handler
+        .execute(serde_json::json!({"expression": "pi * 2"}))
+        .await;
     assert!(result.success);
     let val = result.data["result"].as_f64().unwrap();
     assert!((val - std::f64::consts::TAU).abs() < 0.001);
@@ -165,7 +211,9 @@ async fn calculate_complex_expression() {
     let reg = registry::build_default_registry();
     let handler = reg.get_handler("calculate").unwrap().clone();
 
-    let result = handler.execute(serde_json::json!({"expression": "2^10 + sqrt(144)"})).await;
+    let result = handler
+        .execute(serde_json::json!({"expression": "2^10 + sqrt(144)"}))
+        .await;
     assert!(result.success);
     assert_eq!(result.data["result"].as_f64().unwrap(), 1036.0);
 }
@@ -175,7 +223,9 @@ async fn calculate_division_by_zero() {
     let reg = registry::build_default_registry();
     let handler = reg.get_handler("calculate").unwrap().clone();
 
-    let result = handler.execute(serde_json::json!({"expression": "1 / 0"})).await;
+    let result = handler
+        .execute(serde_json::json!({"expression": "1 / 0"}))
+        .await;
     assert!(!result.success);
 }
 
@@ -184,7 +234,9 @@ async fn calculate_rejects_invalid_chars() {
     let reg = registry::build_default_registry();
     let handler = reg.get_handler("calculate").unwrap().clone();
 
-    let result = handler.execute(serde_json::json!({"expression": "system('ls')"})).await;
+    let result = handler
+        .execute(serde_json::json!({"expression": "system('ls')"}))
+        .await;
     assert!(!result.success, "should reject shell injection");
 }
 
@@ -193,7 +245,9 @@ async fn calculate_negative_numbers() {
     let reg = registry::build_default_registry();
     let handler = reg.get_handler("calculate").unwrap().clone();
 
-    let result = handler.execute(serde_json::json!({"expression": "-5 + 3"})).await;
+    let result = handler
+        .execute(serde_json::json!({"expression": "-5 + 3"}))
+        .await;
     assert!(result.success);
     assert_eq!(result.data["result"].as_f64().unwrap(), -2.0);
 }
@@ -213,16 +267,32 @@ fn config_has_search_defaults() {
 #[test]
 fn system_prompt_includes_datetime() {
     let prompt = kria_core::agent::prompts::build_system_prompt(
-        "tools here", "TestUser", "linux", "standard", "apt", ""
+        "tools here",
+        "TestUser",
+        "linux",
+        "standard",
+        "apt",
+        "",
     );
-    assert!(prompt.contains("Current Date/Time:"), "prompt should include datetime");
-    assert!(prompt.contains("TestUser"), "prompt should include user name");
+    assert!(
+        prompt.contains("Current Date/Time:"),
+        "prompt should include datetime"
+    );
+    assert!(
+        prompt.contains("TestUser"),
+        "prompt should include user name"
+    );
 }
 
 #[test]
 fn system_prompt_news_rules_include_freshness_and_region_controls() {
     let prompt = kria_core::agent::prompts::build_system_prompt(
-        "tools here", "TestUser", "linux", "standard", "apt", ""
+        "tools here",
+        "TestUser",
+        "linux",
+        "standard",
+        "apt",
+        "",
     );
     assert!(
         prompt.contains("freshness_mode=live"),

@@ -16,7 +16,7 @@ pub fn build_system_prompt(
     let datetime = now.format("%A, %B %d, %Y at %H:%M %Z").to_string();
 
     format!(
-r#"You are K.R.I.A. (Kernel-Responsive Intelligent Agent), a desktop AI assistant controlling {user_name}'s {os_name} computer.
+        r#"You are K.R.I.A. (Kernel-Responsive Intelligent Agent), a desktop AI assistant controlling {user_name}'s {os_name} computer.
 Package Manager: {package_manager}
 Hardware Tier: {hw_tier}
 Current Date/Time: {datetime}
@@ -51,6 +51,7 @@ Current Date/Time: {datetime}
 26. Before finalizing, verify completion using observed tool evidence. If evidence is missing or conflicting, say so clearly and either retry or ask one precise clarification question.
 27. When uncertain, prefer a targeted clarification question over a guess. Never present uncertain assumptions as facts.
 28. For news requests, always call `search_news` first and tune parameters to intent: use `freshness_mode=live` for breaking updates, and use `country`/`region` plus `source_profile=authentic` or `india_authentic` when the user asks for region-specific trustworthy coverage.
+29. For Google Workspace requests (Gmail, Calendar, Drive, Docs, Sheets, Slides, Forms), call the corresponding Google tools directly. Do NOT respond with manual shell/IMAP/API setup instructions unless the user explicitly asks for setup help.
 
 ## Application Management Rules
 - ALWAYS call `search_package` before installing. Never install blind with a name the user typed.
@@ -94,7 +95,7 @@ When done, provide a final response to the user."#
 pub fn build_planning_prompt(task: &str, available_tools: &[&str]) -> String {
     let tools_list = available_tools.join(", ");
     format!(
-r#"Plan the following task step by step.
+        r#"Plan the following task step by step.
 Task: {task}
 Available tools: {tools_list}
 
@@ -116,7 +117,7 @@ pub fn build_summarize_prompt(tool_name: &str, output: &str, max_chars: usize) -
         output
     };
     format!(
-r#"Summarize this tool output concisely for the user.
+        r#"Summarize this tool output concisely for the user.
 Tool: {tool_name}
 Output (may be truncated):
 {truncated}

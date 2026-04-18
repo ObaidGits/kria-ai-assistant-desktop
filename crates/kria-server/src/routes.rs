@@ -1,11 +1,10 @@
+use crate::ServerState;
 use axum::{
-    Router,
-    Json,
     extract::State,
     routing::{get, post},
+    Json, Router,
 };
 use std::sync::Arc;
-use crate::ServerState;
 
 pub fn api_routes() -> Router<Arc<ServerState>> {
     Router::new()
@@ -60,9 +59,7 @@ async fn list_sessions() -> Json<Vec<serde_json::Value>> {
     Json(vec![])
 }
 
-async fn list_models(
-    State(state): State<Arc<ServerState>>,
-) -> Json<serde_json::Value> {
+async fn list_models(State(state): State<Arc<ServerState>>) -> Json<serde_json::Value> {
     let paths = match state.config.resolve_paths() {
         Ok(p) => p,
         Err(_) => return Json(serde_json::json!({"models": []})),
@@ -72,9 +69,7 @@ async fn list_models(
     Json(serde_json::json!({ "models": models }))
 }
 
-async fn get_settings(
-    State(state): State<Arc<ServerState>>,
-) -> Json<serde_json::Value> {
+async fn get_settings(State(state): State<Arc<ServerState>>) -> Json<serde_json::Value> {
     Json(serde_json::to_value(&state.config).unwrap_or_default())
 }
 

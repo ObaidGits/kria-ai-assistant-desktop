@@ -6,8 +6,8 @@
   "build": {
     "frontendDist": "../../ui/dist",
     "devUrl": "http://localhost:1420",
-    "beforeDevCommand": "npm run dev --prefix ../ui",
-    "beforeBuildCommand": "npm run build --prefix ../ui"
+    "beforeDevCommand": "if [ -f ui/package.json ]; then npm run dev --prefix ui; elif [ -f ../ui/package.json ]; then npm run dev --prefix ../ui; else npm run dev --prefix ../../ui; fi",
+    "beforeBuildCommand": "if [ -f ui/package.json ]; then npm run build --prefix ui; elif [ -f ../ui/package.json ]; then npm run build --prefix ../ui; else npm run build --prefix ../../ui; fi"
   },
   "app": {
     "enableGTKAppId": true,

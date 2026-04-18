@@ -1,6 +1,6 @@
-use crate::memory::store::{MemoryStore, MemoryFact};
-use crate::memory::vectors::VectorIndex;
 use crate::memory::embeddings::EmbeddingModel;
+use crate::memory::store::{MemoryFact, MemoryStore};
+use crate::memory::vectors::VectorIndex;
 
 /// Hybrid context builder: vector similarity + relational scoring.
 pub struct ContextBuilder<'a> {
@@ -16,8 +16,16 @@ pub struct RetrievedFact {
 }
 
 impl<'a> ContextBuilder<'a> {
-    pub fn new(store: &'a MemoryStore, vectors: &'a VectorIndex, embeddings: &'a EmbeddingModel) -> Self {
-        Self { store, vectors, embeddings }
+    pub fn new(
+        store: &'a MemoryStore,
+        vectors: &'a VectorIndex,
+        embeddings: &'a EmbeddingModel,
+    ) -> Self {
+        Self {
+            store,
+            vectors,
+            embeddings,
+        }
     }
 
     /// Build context for a user message: retrieve relevant facts.
@@ -57,7 +65,10 @@ impl<'a> ContextBuilder<'a> {
             let frequency = (fact.access_count as f64 + 1.0).ln() / 10.0;
 
             // Link strength: average strength of connected links
-            let links = self.store.get_links(fact.id.unwrap_or(0)).unwrap_or_default();
+            let links = self
+                .store
+                .get_links(fact.id.unwrap_or(0))
+                .unwrap_or_default();
             let link_strength = if links.is_empty() {
                 0.0
             } else {
@@ -72,7 +83,11 @@ impl<'a> ContextBuilder<'a> {
             scored.push(RetrievedFact { fact, score });
         }
 
-        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         scored.truncate(limit);
 
         // Update access counts for retrieved facts

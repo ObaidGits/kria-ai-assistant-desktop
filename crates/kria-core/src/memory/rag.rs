@@ -1,7 +1,7 @@
-/// RAG (Retrieval-Augmented Generation) — document chunking, hybrid retrieval, citations.
-use crate::memory::store::{MemoryStore, DocumentChunk};
-use crate::memory::vectors::VectorIndex;
 use crate::memory::embeddings::EmbeddingModel;
+/// RAG (Retrieval-Augmented Generation) — document chunking, hybrid retrieval, citations.
+use crate::memory::store::{DocumentChunk, MemoryStore};
+use crate::memory::vectors::VectorIndex;
 use chrono::Utc;
 use std::sync::Arc;
 
@@ -13,7 +13,10 @@ pub struct ChunkConfig {
 
 impl Default for ChunkConfig {
     fn default() -> Self {
-        Self { chunk_size: 512, overlap: 64 }
+        Self {
+            chunk_size: 512,
+            overlap: 64,
+        }
     }
 }
 
@@ -35,14 +38,31 @@ pub struct RagEngine {
 }
 
 impl RagEngine {
-    pub fn new(store: Arc<MemoryStore>, vectors: Arc<VectorIndex>, embeddings: Arc<EmbeddingModel>) -> Self {
-        Self { store, vectors, embeddings }
+    pub fn new(
+        store: Arc<MemoryStore>,
+        vectors: Arc<VectorIndex>,
+        embeddings: Arc<EmbeddingModel>,
+    ) -> Self {
+        Self {
+            store,
+            vectors,
+            embeddings,
+        }
     }
 
     /// Ingest text into the knowledge base: chunk → embed → store.
     /// Returns the doc_id and number of chunks created.
-    pub fn ingest(&self, name: &str, doc_type: &str, text: &str, config: &ChunkConfig) -> anyhow::Result<(String, usize)> {
-        let doc_id = format!("doc_{}", uuid::Uuid::new_v4().to_string().replace('-', "")[..12].to_string());
+    pub fn ingest(
+        &self,
+        name: &str,
+        doc_type: &str,
+        text: &str,
+        config: &ChunkConfig,
+    ) -> anyhow::Result<(String, usize)> {
+        let doc_id = format!(
+            "doc_{}",
+            uuid::Uuid::new_v4().to_string().replace('-', "")[..12].to_string()
+        );
 
         // Delete existing chunks for same doc name (re-ingest)
         let existing = self.store.list_documents()?;
@@ -88,30 +108,39 @@ impl RagEngine {
 
         // Vector search over chunk vectors (negative IDs)
         let all_candidates = self.vectors.search(&query_vec, limit * 3);
-        let vector_hits: Vec<(i64, f32)> = all_candidates.into_iter()
+        let vector_hits: Vec<(i64, f32)> = all_candidates
+            .into_iter()
             .filter(|(id, _)| *id < 0) // Only chunk vectors
             .map(|(id, sim)| (-id, sim)) // Convert back to chunk ID
             .collect();
 
         // Keyword search
         // Build FTS5-safe query: quote each word
-        let fts_query = query.split_whitespace()
+        let fts_query = query
+            .split_whitespace()
             .map(|w| {
                 let clean: String = w.chars().filter(|c| c.is_alphanumeric()).collect();
-                if clean.is_empty() { String::new() } else { format!("\"{}\"", clean) }
+                if clean.is_empty() {
+                    String::new()
+                } else {
+                    format!("\"{}\"", clean)
+                }
             })
             .filter(|w| !w.is_empty())
             .collect::<Vec<_>>()
             .join(" OR ");
 
         let keyword_hits = if !fts_query.is_empty() {
-            self.store.search_chunks(&fts_query, limit * 2).unwrap_or_default()
+            self.store
+                .search_chunks(&fts_query, limit * 2)
+                .unwrap_or_default()
         } else {
             Vec::new()
         };
 
         // Merge scores: vector (0.6) + keyword (0.3) + recency (0.1)
-        let mut scored: std::collections::HashMap<i64, (f64, Option<DocumentChunk>)> = std::collections::HashMap::new();
+        let mut scored: std::collections::HashMap<i64, (f64, Option<DocumentChunk>)> =
+            std::collections::HashMap::new();
 
         for (chunk_id, sim) in &vector_hits {
             let entry = scored.entry(*chunk_id).or_insert((0.0, None));
@@ -140,7 +169,8 @@ impl RagEngine {
             }
         }
 
-        let mut results: Vec<RagResult> = scored.into_iter()
+        let mut results: Vec<RagResult> = scored
+            .into_iter()
             .filter_map(|(_id, (score, chunk_opt))| {
                 chunk_opt.map(|c| RagResult {
                     content: c.content,
@@ -152,7 +182,11 @@ impl RagEngine {
             })
             .collect();
 
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results.truncate(limit);
         Ok(results)
     }
@@ -214,10 +248,16 @@ pub fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<(usize, 
             chunks.push((start, chunk.to_string()));
         }
 
-        if actual_end >= text.len() { break; }
+        if actual_end >= text.len() {
+            break;
+        }
 
         // Advance with overlap
-        start = if actual_end > overlap { actual_end - overlap } else { actual_end };
+        start = if actual_end > overlap {
+            actual_end - overlap
+        } else {
+            actual_end
+        };
     }
 
     chunks

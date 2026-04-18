@@ -14,7 +14,8 @@ pub struct CodeInfo {
 impl CodeProcessor {
     /// Detect programming language from file extension.
     pub fn detect_language(path: &Path) -> String {
-        let ext = path.extension()
+        let ext = path
+            .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_lowercase();
@@ -44,7 +45,8 @@ impl CodeProcessor {
             "xml" => "xml",
             "md" | "markdown" => "markdown",
             _ => "unknown",
-        }.to_string()
+        }
+        .to_string()
     }
 
     /// Extract basic structure info from a source file.
@@ -56,7 +58,9 @@ impl CodeProcessor {
         let fn_pattern = match lang.as_str() {
             "rust" => r"(?m)^\s*(?:pub\s+)?(?:async\s+)?fn\s+(\w+)",
             "python" => r"(?m)^\s*def\s+(\w+)",
-            "javascript" | "typescript" | "react" => r"(?m)(?:function\s+(\w+)|(?:const|let)\s+(\w+)\s*=\s*(?:async\s+)?\()",
+            "javascript" | "typescript" | "react" => {
+                r"(?m)(?:function\s+(\w+)|(?:const|let)\s+(\w+)\s*=\s*(?:async\s+)?\()"
+            }
             "go" => r"(?m)^func\s+(\w+)",
             _ => r"$^", // match nothing
         };
@@ -72,13 +76,13 @@ impl CodeProcessor {
         let fn_re = regex::Regex::new(fn_pattern)?;
         let import_re = regex::Regex::new(import_pattern)?;
 
-        let functions: Vec<String> = fn_re.captures_iter(&content)
-            .filter_map(|cap| {
-                cap.get(1).or(cap.get(2)).map(|m| m.as_str().to_string())
-            })
+        let functions: Vec<String> = fn_re
+            .captures_iter(&content)
+            .filter_map(|cap| cap.get(1).or(cap.get(2)).map(|m| m.as_str().to_string()))
             .collect();
 
-        let imports: Vec<String> = import_re.captures_iter(&content)
+        let imports: Vec<String> = import_re
+            .captures_iter(&content)
             .filter_map(|cap| cap.get(1).map(|m| m.as_str().trim().to_string()))
             .collect();
 

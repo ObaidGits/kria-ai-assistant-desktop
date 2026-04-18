@@ -1,5 +1,5 @@
-use dashmap::DashMap;
 use chrono::{DateTime, Utc};
+use dashmap::DashMap;
 use serde::Serialize;
 
 /// Service health status.

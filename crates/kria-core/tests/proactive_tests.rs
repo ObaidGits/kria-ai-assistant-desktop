@@ -1,8 +1,7 @@
+use kria_core::automation::proactive::{AlertCategory, HealthThresholds, ProactiveEngine};
 /// Phase 13 — Proactive Intelligence & Smart Notifications Tests
 /// Tests system health monitoring, alert management, file watcher config, and proactive tools.
-
 use std::sync::Arc;
-use kria_core::automation::proactive::{ProactiveEngine, HealthThresholds, AlertCategory};
 
 fn make_engine() -> Arc<ProactiveEngine> {
     Arc::new(ProactiveEngine::new(HealthThresholds::default()))
@@ -20,7 +19,9 @@ async fn alerts_empty_initially() {
 #[tokio::test]
 async fn push_and_get_alert() {
     let engine = make_engine();
-    engine.push_alert(AlertCategory::Info, "Test Alert", "This is a test", None).await;
+    engine
+        .push_alert(AlertCategory::Info, "Test Alert", "This is a test", None)
+        .await;
     let alerts = engine.get_alerts().await;
     assert_eq!(alerts.len(), 1);
     assert_eq!(alerts[0].title, "Test Alert");
@@ -30,7 +31,9 @@ async fn push_and_get_alert() {
 #[tokio::test]
 async fn dismiss_alert() {
     let engine = make_engine();
-    engine.push_alert(AlertCategory::Alert, "Dismiss Me", "msg", None).await;
+    engine
+        .push_alert(AlertCategory::Alert, "Dismiss Me", "msg", None)
+        .await;
     let alerts = engine.get_alerts().await;
     let id = alerts[0].id.clone();
 
@@ -53,9 +56,15 @@ async fn dismiss_nonexistent_alert() {
 #[tokio::test]
 async fn push_multiple_alert_categories() {
     let engine = make_engine();
-    engine.push_alert(AlertCategory::Alert, "Alert 1", "msg", Some("fix it")).await;
-    engine.push_alert(AlertCategory::Suggestion, "Suggestion 1", "msg", None).await;
-    engine.push_alert(AlertCategory::Info, "Info 1", "msg", None).await;
+    engine
+        .push_alert(AlertCategory::Alert, "Alert 1", "msg", Some("fix it"))
+        .await;
+    engine
+        .push_alert(AlertCategory::Suggestion, "Suggestion 1", "msg", None)
+        .await;
+    engine
+        .push_alert(AlertCategory::Info, "Info 1", "msg", None)
+        .await;
     let alerts = engine.get_alerts().await;
     assert_eq!(alerts.len(), 3);
 }
@@ -63,7 +72,14 @@ async fn push_multiple_alert_categories() {
 #[tokio::test]
 async fn alert_suggestion_field() {
     let engine = make_engine();
-    engine.push_alert(AlertCategory::Alert, "Low disk", "10% free", Some("Clean up files")).await;
+    engine
+        .push_alert(
+            AlertCategory::Alert,
+            "Low disk",
+            "10% free",
+            Some("Clean up files"),
+        )
+        .await;
     let alerts = engine.get_alerts().await;
     assert_eq!(alerts[0].suggestion.as_deref(), Some("Clean up files"));
 }
@@ -72,10 +88,16 @@ async fn alert_suggestion_field() {
 async fn alert_cap_at_100() {
     let engine = make_engine();
     for i in 0..120 {
-        engine.push_alert(AlertCategory::Info, &format!("Alert {i}"), "msg", None).await;
+        engine
+            .push_alert(AlertCategory::Info, &format!("Alert {i}"), "msg", None)
+            .await;
     }
     let all = engine.get_all_alerts().await;
-    assert!(all.len() <= 100, "expected max 100 alerts, got {}", all.len());
+    assert!(
+        all.len() <= 100,
+        "expected max 100 alerts, got {}",
+        all.len()
+    );
 }
 
 // ── Health Thresholds ──
@@ -126,7 +148,11 @@ fn proactive_tools_registered() {
     let engine = make_engine();
     let reg = kria_core::tools::registry::build_registry_full(None, None, Some(engine));
     let proactive_tools = reg.list_by_category("proactive");
-    assert!(proactive_tools.len() >= 6, "expected at least 6 proactive tools, got {}", proactive_tools.len());
+    assert!(
+        proactive_tools.len() >= 6,
+        "expected at least 6 proactive tools, got {}",
+        proactive_tools.len()
+    );
 }
 
 #[test]
@@ -199,7 +225,9 @@ async fn watch_directory_tool_invalid_path() {
     let engine = make_engine();
     let reg = kria_core::tools::registry::build_registry_full(None, None, Some(engine));
     let handler = reg.get_handler("watch_directory").unwrap();
-    let result = handler.execute(serde_json::json!({ "path": "/nonexistent/dir/xyz" })).await;
+    let result = handler
+        .execute(serde_json::json!({ "path": "/nonexistent/dir/xyz" }))
+        .await;
     assert!(!result.success);
 }
 

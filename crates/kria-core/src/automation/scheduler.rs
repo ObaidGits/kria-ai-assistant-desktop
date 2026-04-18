@@ -37,7 +37,9 @@ impl AutomationScheduler {
         task_id: &str,
         callback: impl Fn(String) + Send + Sync + 'static,
     ) -> anyhow::Result<()> {
-        let task = self.tasks.get(task_id)
+        let task = self
+            .tasks
+            .get(task_id)
             .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?
             .clone();
 

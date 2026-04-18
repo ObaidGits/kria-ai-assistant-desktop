@@ -1,7 +1,7 @@
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex as StdMutex};
 use ort::session::Session;
 use ort::value::Tensor;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use crate::voice::capture::AudioChunk;
 
@@ -34,8 +34,17 @@ struct SileroState {
 impl VoiceActivityDetector {
     /// Create a new VAD with energy-based detection (no ONNX model).
     pub fn new(energy_threshold: f32) -> Self {
+        let normalized_threshold = normalize_energy_threshold(energy_threshold);
+        if (normalized_threshold - energy_threshold).abs() > f32::EPSILON {
+            tracing::info!(
+                configured = energy_threshold,
+                normalized = normalized_threshold,
+                "voice VAD: normalized legacy energy threshold"
+            );
+        }
+
         Self {
-            energy_threshold,
+            energy_threshold: normalized_threshold,
             speech_threshold: 0.5,
             min_speech_chunks: 3,
             silence_timeout_chunks: 10,
@@ -96,10 +105,11 @@ impl VoiceActivityDetector {
         }
         // Fallback: map energy to a 0..1 range using the threshold as midpoint
         let energy = rms_energy(&chunk.samples);
-        if energy > self.energy_threshold {
-            (0.5 + 0.5 * (energy - self.energy_threshold) / self.energy_threshold).min(1.0)
+        let threshold = self.energy_threshold.max(f32::EPSILON);
+        if energy > threshold {
+            (0.5 + 0.5 * (energy - threshold) / threshold).min(1.0)
         } else {
-            (0.5 * energy / self.energy_threshold).max(0.0)
+            (0.5 * energy / threshold).max(0.0)
         }
     }
 
@@ -241,20 +251,23 @@ fn silero_infer_window(state: &mut SileroState, samples: &[f32], sample_rate: u3
     match state.session.run(inputs) {
         Ok(outputs) => {
             // Output: "output" float32 [1,1], "hn" float32 [2,1,64], "cn" float32 [2,1,64]
-            let prob = outputs.get("output")
+            let prob = outputs
+                .get("output")
                 .and_then(|v| v.try_extract_tensor::<f32>().ok())
                 .map(|(_shape, data)| if data.is_empty() { 0.0 } else { data[0] })
                 .unwrap_or(0.0);
 
             // Update LSTM hidden states
-            if let Some((_shape, data)) = outputs.get("hn")
+            if let Some((_shape, data)) = outputs
+                .get("hn")
                 .and_then(|v| v.try_extract_tensor::<f32>().ok())
             {
                 if data.len() == state.h.len() {
                     state.h.copy_from_slice(data);
                 }
             }
-            if let Some((_shape, data)) = outputs.get("cn")
+            if let Some((_shape, data)) = outputs
+                .get("cn")
                 .and_then(|v| v.try_extract_tensor::<f32>().ok())
             {
                 if data.len() == state.c.len() {
@@ -277,4 +290,18 @@ fn rms_energy(samples: &[f32]) -> f32 {
     }
     let sum: f32 = samples.iter().map(|s| s * s).sum();
     (sum / samples.len() as f32).sqrt()
+}
+
+fn normalize_energy_threshold(raw: f32) -> f32 {
+    if !raw.is_finite() || raw <= 0.0 {
+        return 0.02;
+    }
+
+    // Backward compatibility: historical configs used int16-style amplitudes
+    // (e.g. 2000), but capture now uses normalized float samples in [-1, 1].
+    if raw > 1.0 {
+        return (raw / 32768.0).clamp(0.005, 0.35);
+    }
+
+    raw.clamp(0.0005, 1.0)
 }

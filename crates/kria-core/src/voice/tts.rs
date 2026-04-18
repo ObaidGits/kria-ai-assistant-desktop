@@ -30,9 +30,12 @@ impl TextToSpeech {
         if let Some(ref binary) = self.binary_path {
             let mut child = tokio::process::Command::new(binary)
                 .args([
-                    "--model", &self.model_path.to_string_lossy(),
-                    "--config", &self.config_path.to_string_lossy(),
-                    "--output_file", &output_path.to_string_lossy(),
+                    "--model",
+                    &self.model_path.to_string_lossy(),
+                    "--config",
+                    &self.config_path.to_string_lossy(),
+                    "--output_file",
+                    &output_path.to_string_lossy(),
                 ])
                 .stdin(std::process::Stdio::piped())
                 .spawn()?;

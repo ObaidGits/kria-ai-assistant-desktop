@@ -1,8 +1,8 @@
+use crate::config::KriaConfig;
+use crate::llm::{cloud::CloudBackend, local::LocalBackend, LlmBackend};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use crate::llm::{LlmBackend, local::LocalBackend, cloud::CloudBackend};
-use crate::config::KriaConfig;
 
 /// Routing modes for model selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,7 +55,10 @@ impl ModelRouter {
         };
 
         // Create a vision-capable backend if a vision model is explicitly defined
-        let vision_local = config.llm.models.iter()
+        let vision_local = config
+            .llm
+            .models
+            .iter()
             .find(|m| m.capabilities.contains(&"vision".to_string()) && m.mmproj_file.is_some())
             .map(|vm| {
                 Arc::new(LocalBackend::new(
@@ -129,7 +132,8 @@ impl ModelRouter {
             return None;
         }
         let body: serde_json::Value = resp.json().await.ok()?;
-        body["data"].as_array()
+        body["data"]
+            .as_array()
             .and_then(|arr| arr.first())
             .and_then(|m| m["id"].as_str())
             .map(|s| s.to_string())
@@ -153,12 +157,16 @@ impl ModelRouter {
             RoutingMode::Local => self.local.clone(),
             RoutingMode::Gemini => {
                 let clients = self.cloud_clients.read().await;
-                clients.get("gemini").cloned()
+                clients
+                    .get("gemini")
+                    .cloned()
                     .or_else(|| self.local.clone())
             }
             RoutingMode::External => {
                 let clients = self.cloud_clients.read().await;
-                clients.get("external").cloned()
+                clients
+                    .get("external")
+                    .cloned()
                     .or_else(|| clients.values().next().cloned())
                     .or_else(|| self.local.clone())
             }

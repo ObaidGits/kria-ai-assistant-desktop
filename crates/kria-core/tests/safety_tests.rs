@@ -4,9 +4,9 @@
 //! HITL approval/denial flow, and audit logging. Tests both happy
 //! paths and edge cases (blocked commands, timeout, unknown actions).
 
-use kria_core::safety::policy::{PolicyEngine, RiskLevel};
 use kria_core::safety::blacklist::BlacklistChecker;
-use kria_core::safety::hitl::{HitlGateway, ApprovalResponse};
+use kria_core::safety::hitl::{ApprovalResponse, HitlGateway};
+use kria_core::safety::policy::{PolicyEngine, RiskLevel};
 use std::sync::Arc;
 
 // ── Policy Engine — risk classification ─────────────────────────────
@@ -15,12 +15,7 @@ use std::sync::Arc;
 fn green_risk_for_read_only_actions() {
     let engine = PolicyEngine::new();
 
-    let green_actions = [
-        "read_file",
-        "get_clipboard",
-        "web_search",
-        "list_directory",
-    ];
+    let green_actions = ["read_file", "get_clipboard", "web_search", "list_directory"];
 
     for action in &green_actions {
         let decision = engine.evaluate(action, &serde_json::json!({}));
@@ -84,17 +79,10 @@ fn path_escalation_to_red_for_protected_paths() {
 fn blacklist_blocks_dangerous_commands() {
     let checker = BlacklistChecker::new();
 
-    let blocked = [
-        "rm -rf /",
-        "mimikatz",
-        "mkfs.ext4 /dev/sda",
-    ];
+    let blocked = ["rm -rf /", "mimikatz", "mkfs.ext4 /dev/sda"];
 
     for cmd in &blocked {
-        assert!(
-            checker.is_blocked(cmd),
-            "'{cmd}' should be blocked"
-        );
+        assert!(checker.is_blocked(cmd), "'{cmd}' should be blocked");
     }
 }
 
@@ -105,10 +93,7 @@ fn blacklist_allows_safe_commands() {
     let safe = ["ls -la", "cat readme.md", "echo hello"];
 
     for cmd in &safe {
-        assert!(
-            !checker.is_blocked(cmd),
-            "'{cmd}' should NOT be blocked"
-        );
+        assert!(!checker.is_blocked(cmd), "'{cmd}' should NOT be blocked");
     }
 }
 

@@ -53,7 +53,8 @@ impl TokenBudget {
         }
 
         // Proportional allocation
-        pieces.iter()
+        pieces
+            .iter()
             .map(|p| {
                 let est = Self::estimate_tokens(p);
                 (est as f64 / total_est as f64 * available as f64) as usize
