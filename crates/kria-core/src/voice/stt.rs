@@ -181,7 +181,7 @@ fn estimate_confidence(text: &str, duration_ms: u64) -> f32 {
 }
 
 fn clamp01(v: f32) -> f32 {
-    v.max(0.0).min(1.0)
+    v.clamp(0.0, 1.0)
 }
 
 fn default_whisper_threads() -> usize {
@@ -217,7 +217,7 @@ fn write_wav(path: &std::path::Path, samples: &[f32], sample_rate: u32) -> anyho
 
     // Convert f32 to i16
     for &sample in samples {
-        let clamped = sample.max(-1.0).min(1.0);
+        let clamped = sample.clamp(-1.0, 1.0);
         let i16_val = (clamped * 32767.0) as i16;
         file.write_all(&i16_val.to_le_bytes())?;
     }

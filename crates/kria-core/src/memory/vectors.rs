@@ -82,7 +82,7 @@ impl VectorIndex {
     pub fn save(&self) -> anyhow::Result<()> {
         if let Some(ref path) = self.path {
             let vecs = self.vectors.lock().unwrap();
-            let data = bincode_serialize(&*vecs)?;
+            let data = bincode_serialize(&vecs)?;
             std::fs::write(path, data)?;
         }
         Ok(())

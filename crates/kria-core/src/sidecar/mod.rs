@@ -1,3 +1,4 @@
+pub mod bootstrap;
 pub mod bridge;
 pub mod health;
 pub mod protocol;

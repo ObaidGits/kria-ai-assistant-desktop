@@ -12,6 +12,7 @@ const [isThinking, setIsThinking] = createSignal(false);
 const [showSettings, setShowSettings] = createSignal(false);
 const [showHitl, setShowHitl] = createSignal(false);
 const [hitlRequest, setHitlRequest] = createSignal<HitlRequest | null>(null);
+const [toolChoiceRequest, setToolChoiceRequest] = createSignal<ToolChoiceRequest | null>(null);
 const [voiceActive, setVoiceActive] = createSignal(false);
 const [voiceState, setVoiceState] = createSignal<"idle" | "listening" | "processing" | "speaking">("idle");
 const [voiceLiveTranscript, setVoiceLiveTranscript] = createSignal("");
@@ -37,6 +38,10 @@ const [workflows, setWorkflows] = createSignal<WorkflowInfo[]>([]);
 const [hardwareInfo, setHardwareInfo] = createSignal<HardwareInfoData | null>(null);
 const [knowledgeBase, setKnowledgeBase] = createSignal<KnowledgeDoc[]>([]);
 const [alerts, setAlerts] = createSignal<ProactiveAlert[]>([]);
+
+// Orchestrator swap state
+const [isSwapping, setIsSwapping] = createSignal(false);
+const [degradationLevel, setDegradationLevel] = createSignal<string | null>(null);
 
 let healthLoadInFlight = false;
 let healthLoadQueued = false;
@@ -97,6 +102,20 @@ export interface HitlRequest {
   args: Record<string, unknown>;
   riskLevel: string;
   reason: string;
+}
+
+export interface ToolChoiceCandidate {
+  name: string;
+  label: string;
+  reason: string;
+  confidence: number;
+}
+
+export interface ToolChoiceRequest {
+  query: string;
+  confidence: number;
+  minConfidence: number;
+  candidates: ToolChoiceCandidate[];
 }
 
 export interface McpServer {
@@ -182,6 +201,8 @@ export interface AssistantStatus {
 // --- Actions ---
 async function sendMessage(text: string) {
   if (!text.trim()) return;
+
+  setToolChoiceRequest(null);
 
   const userMsg: Message = {
     id: crypto.randomUUID(),
@@ -565,13 +586,13 @@ export interface GoogleWorkspaceCapabilities {
   docs: boolean;
   sheets: boolean;
   slides: boolean;
+  forms: boolean;
   meet: boolean;
   meet_via_calendar: boolean;
 }
 
 export interface GoogleWorkspaceStatus {
   connected: boolean;
-  legacy_connected?: boolean;
   account: string;
   credentials_configured: boolean;
   token_present: boolean;
@@ -580,6 +601,7 @@ export interface GoogleWorkspaceStatus {
   gw_client_wired: boolean;
   mcp: GoogleWorkspaceMcpStatus;
   capabilities: GoogleWorkspaceCapabilities;
+  config_dir?: string;
   meet_support_mode: string;
   warnings: string[];
 }
@@ -605,9 +627,32 @@ async function connectGoogle(account?: string): Promise<{ status: string; messag
   return result;
 }
 
+async function setGoogleAccount(account: string): Promise<{ account: string; updated: boolean }> {
+  return invoke<{ account: string; updated: boolean }>("set_google_workspace_account", { account });
+}
+
+async function reconcileMcpRuntime() {
+  return invoke<Record<string, unknown>>("reconcile_mcp_runtime");
+}
+
+async function restartMcpServerRuntime(name: string) {
+  return invoke<Record<string, unknown>>("restart_mcp_server_runtime", { name });
+}
+
 async function disconnectGoogle(account?: string) {
   await invoke("disconnect_google_workspace", { account: account ?? null });
   await loadGoogleStatus(account);
+}
+
+function submitToolChoice(candidateName: string) {
+  const req = toolChoiceRequest();
+  if (!req) return;
+  setToolChoiceRequest(null);
+  void sendMessage(`#tool:${candidateName} ${req.query}`);
+}
+
+function dismissToolChoice() {
+  setToolChoiceRequest(null);
 }
 
 // --- Settings management ---
@@ -718,21 +763,121 @@ async function createSession() {
   }
 }
 
+function normalizeRole(role: string): Message["role"] {
+  if (role === "user" || role === "assistant" || role === "system" || role === "tool") {
+    return role;
+  }
+  return "assistant";
+}
+
+function parseStoredToolCall(
+  toolName: string,
+  rawToolResult: string | null | undefined
+): ToolCall {
+  let parsed: any = null;
+  if (rawToolResult) {
+    try {
+      parsed = JSON.parse(rawToolResult);
+    } catch {
+      parsed = rawToolResult;
+    }
+  }
+
+  const args =
+    parsed &&
+    typeof parsed === "object" &&
+    parsed.args &&
+    typeof parsed.args === "object" &&
+    !Array.isArray(parsed.args)
+      ? (parsed.args as Record<string, unknown>)
+      : {};
+
+  const success =
+    parsed && typeof parsed === "object" && typeof parsed.success === "boolean"
+      ? parsed.success
+      : true;
+
+  const result =
+    parsed && typeof parsed === "object" && "result" in parsed
+      ? parsed.result
+      : parsed ?? null;
+
+  const metadataRaw = parsed && typeof parsed === "object" ? parsed.metadata : null;
+  const metadata: ToolResultMetadata | undefined =
+    metadataRaw && typeof metadataRaw === "object"
+      ? {
+          confidence: typeof metadataRaw.confidence === "number" ? metadataRaw.confidence : undefined,
+          sourceCount: typeof metadataRaw.source_count === "number" ? metadataRaw.source_count : undefined,
+          freshnessAgeHours:
+            typeof metadataRaw.freshness_age_hours === "number" || metadataRaw.freshness_age_hours === null
+              ? metadataRaw.freshness_age_hours
+              : undefined,
+          regionMatch:
+            typeof metadataRaw.region_match === "boolean" || metadataRaw.region_match === null
+              ? metadataRaw.region_match
+              : undefined,
+        }
+      : undefined;
+
+  return {
+    name: toolName,
+    args,
+    result,
+    status: (success ? "done" : "error") as ToolCall["status"],
+    metadata,
+  };
+}
+
 async function switchSession(sessionId: string) {
   try {
     await invoke("switch_session", { sessionId });
     setCurrentSession(sessionId);
     // Load history for this session
-    const history = await invoke<{ role: string; content: string; timestamp: string }[]>(
+    const history = await invoke<{
+      role: string;
+      content: string;
+      timestamp: string;
+      tool_name?: string | null;
+      tool_result?: string | null;
+    }[]>(
       "get_session_history",
       { sessionId }
     );
-    const mapped: Message[] = history.map((t) => ({
-      id: crypto.randomUUID(),
-      role: t.role as Message["role"],
-      content: t.content,
-      timestamp: new Date(t.timestamp).getTime() || Date.now(),
-    }));
+
+    const mapped: Message[] = [];
+    for (const t of history) {
+      const ts = new Date(t.timestamp).getTime() || Date.now();
+
+      if (t.role === "tool" && t.tool_name) {
+        const tc = parseStoredToolCall(t.tool_name, t.tool_result);
+        const last = mapped[mapped.length - 1];
+
+        if (last?.role === "assistant") {
+          mapped[mapped.length - 1] = {
+            ...last,
+            toolCalls: [...(last.toolCalls || []), tc],
+            timestamp: Math.max(last.timestamp, ts),
+          };
+        } else {
+          mapped.push({
+            id: crypto.randomUUID(),
+            role: "assistant",
+            content: "",
+            timestamp: ts,
+            toolCalls: [tc],
+          });
+        }
+        continue;
+      }
+
+      mapped.push({
+        id: crypto.randomUUID(),
+        role: normalizeRole(t.role),
+        content: t.content,
+        timestamp: ts,
+      });
+    }
+
     setMessages(mapped);
   } catch (e) {
     console.error("Failed to switch session:", e);
@@ -798,6 +943,11 @@ function initListeners() {
   listen<HitlRequest>("agent:approval_required", (event) => {
     setHitlRequest(event.payload);
     setShowHitl(true);
+  });
+
+  listen<ToolChoiceRequest>("agent:tool_choice_required", (event) => {
+    setToolChoiceRequest(event.payload);
+    setIsThinking(false);
   });
 
   // Tool call started — add to last assistant message's toolCalls
@@ -932,6 +1082,25 @@ function initListeners() {
     };
     setMessages((prev) => [...prev, errMsg]);
   });
+
+  // Orchestrator events — track GPU swap state
+  listen<{ from_ngl: number; to_ngl: number; emergency: boolean }>(
+    "orchestrator:swap_started",
+    () => {
+      setIsSwapping(true);
+    }
+  );
+
+  listen<{ new_ngl: number; new_context: number; duration_ms: number }>(
+    "orchestrator:swap_completed",
+    () => {
+      setIsSwapping(false);
+    }
+  );
+
+  listen<{ level: string }>("orchestrator:degradation_changed", (event) => {
+    setDegradationLevel(event.payload.level);
+  });
 }
 
 // Initialize listeners on import
@@ -959,6 +1128,7 @@ export const appStore = {
   setShowSettings,
   showHitl,
   hitlRequest,
+  toolChoiceRequest,
   voiceActive,
   voiceState,
   voiceLiveTranscript,
@@ -1019,6 +1189,13 @@ export const appStore = {
   stopTelegramMcp,
   googleStatus,
   loadGoogleStatus,
+  setGoogleAccount,
   connectGoogle,
   disconnectGoogle,
+  reconcileMcpRuntime,
+  restartMcpServerRuntime,
+  submitToolChoice,
+  dismissToolChoice,
+  isSwapping,
+  degradationLevel,
 };

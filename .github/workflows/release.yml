@@ -7,80 +7,206 @@ on:
 
 permissions:
   contents: write
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+  LLAMA_CPP_TAG: b5300
 
 jobs:
-  build:
+  # ── Desktop builds (Tauri) ──────────────────────────────────
+  build-desktop:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - platform: ubuntu-22.04
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-          - platform: windows-latest
+            arch: x86_64
+            label: linux-x86_64
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-gnu
+            arch: aarch64
+            label: linux-aarch64
+            cross: true
+          - os: windows-2022
             target: x86_64-pc-windows-msvc
-          - platform: macos-latest
+            arch: x86_64
+            label: windows-x86_64
+          - os: macos-14
             target: aarch64-apple-darwin
+            arch: universal
+            label: macos-universal
 
-    runs-on: ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    name: Desktop (${{ matrix.label }})
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust stable
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install Linux dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libappindicator3-dev \
-            librsvg2-dev \
-            patchelf \
-            libasound2-dev \
-            libssl-dev \
-            pkg-config
-
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: 22
 
-      - name: Install frontend deps
-        working-directory: ui
-        run: npm ci
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
+            librsvg2-dev patchelf libasound2-dev libssl-dev pkg-config
 
-      - name: Build frontend
-        working-directory: ui
-        run: npm run build
+      - name: Install cross-compilation tools (aarch64)
+        if: matrix.cross
+        run: |
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          echo "PKG_CONFIG_SYSROOT_DIR=/usr/aarch64-linux-gnu" >> $GITHUB_ENV
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
 
       - name: Install Tauri CLI
-        run: cargo install tauri-cli --version "^2.0"
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: ui
+
+      - name: Build frontend
+        run: npm run build
+        working-directory: ui
+
+      - name: Stage resource binaries
+        shell: bash
+        run: |
+          mkdir -p crates/kria-desktop/resources
+          echo "Resources directory created for ${{ matrix.label }}"
+
+      - name: Build kria-modules wheel
+        if: runner.os != 'Windows'
+        run: |
+          pip3 install build 2>/dev/null || true
+          python3 -m build --wheel --outdir crates/kria-desktop/resources kria-modules/ || true
 
       - name: Build Tauri app
-        working-directory: crates/kria-desktop
         run: cargo tauri build --target ${{ matrix.target }}
+        working-directory: crates/kria-desktop
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: kria-${{ matrix.target }}
+          name: desktop-${{ matrix.label }}
           path: |
-            target/${{ matrix.target }}/release/bundle/**
+            target/${{ matrix.target }}/release/bundle/**/*.deb
+            target/${{ matrix.target }}/release/bundle/**/*.AppImage
+            target/${{ matrix.target }}/release/bundle/**/*.msi
+            target/${{ matrix.target }}/release/bundle/**/*.dmg
+          if-no-files-found: warn
 
-  release:
-    needs: build
-    runs-on: ubuntu-latest
+  # ── Docker images ───────────────────────────────────────────
+  build-docker:
+    runs-on: ubuntu-22.04
+    name: Docker images
+
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build & push GPU image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}
+            ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}-gpu
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+      - name: Build & push CPU image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.cpu
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}-cpu
+            ghcr.io/${{ github.repository }}:latest-cpu
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+  # ── GitHub Release ──────────────────────────────────────────
+  release:
+    needs: [build-desktop, build-docker]
+    runs-on: ubuntu-22.04
+    name: Create release
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
 
-      - name: Create Release
+      - name: Generate changelog
+        id: changelog
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            CHANGES=$(git log "$PREV_TAG"..HEAD --oneline --no-decorate)
+          else
+            CHANGES=$(git log --oneline --no-decorate -20)
+          fi
+          {
+            echo "changes<<EOF"
+            echo "$CHANGES"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          draft: true
-          files: |
-            kria-*/**
+          body: |
+            ## K.R.I.A. ${{ github.ref_name }}
+
+            ### Changes
+            ${{ steps.changelog.outputs.changes }}
+
+            ### Docker
+            ```bash
+            # GPU (NVIDIA)
+            docker pull ghcr.io/${{ github.repository }}:latest
+            docker compose up -d
+
+            # CPU only
+            docker pull ghcr.io/${{ github.repository }}:latest-cpu
+            docker compose -f docker-compose.yml -f docker-compose.cpu.yml up -d
+            ```
+          files: artifacts/**/*
+          generate_release_notes: true

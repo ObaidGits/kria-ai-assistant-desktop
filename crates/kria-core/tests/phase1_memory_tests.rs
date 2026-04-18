@@ -139,7 +139,7 @@ fn search_conversations_fts() {
         .unwrap();
 
     let results = store.search_conversations("quantum", 10).unwrap();
-    assert!(results.len() >= 1, "FTS should find 'quantum'");
+    assert!(!results.is_empty(), "FTS should find 'quantum'");
 }
 
 // ── MemoryStore: Facts ─────────────────────────────────────────
@@ -475,9 +475,8 @@ fn context_builder_retrieves_relevant_facts() {
     let embeddings = EmbeddingModel::load(128).unwrap();
 
     // Add some facts with vectors
-    for (_i, text) in ["Rust is fast", "Python is flexible", "KRIA uses local LLMs"]
+    for text in ["Rust is fast", "Python is flexible", "KRIA uses local LLMs"]
         .iter()
-        .enumerate()
     {
         let id = store
             .store_fact(&MemoryFact {

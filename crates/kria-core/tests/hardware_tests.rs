@@ -48,7 +48,7 @@ fn classify_tier_high() {
 fn tier_from_str_roundtrip() {
     use kria_core::platform::detect::HardwareTier;
     for name in &["lite", "standard", "performance", "high"] {
-        let tier = HardwareTier::from_str(name);
+        let tier = name.parse::<HardwareTier>().unwrap_or(HardwareTier::Standard);
         assert_eq!(tier.as_str(), *name);
     }
 }
@@ -56,7 +56,9 @@ fn tier_from_str_roundtrip() {
 #[test]
 fn tier_from_str_invalid_defaults_standard() {
     use kria_core::platform::detect::HardwareTier;
-    let tier = HardwareTier::from_str("nonexistent");
+    let tier = "nonexistent"
+        .parse::<HardwareTier>()
+        .unwrap_or(HardwareTier::Standard);
     assert_eq!(tier, HardwareTier::Standard);
 }
 
@@ -155,7 +157,7 @@ fn tool_registry_filters_by_tier() {
     assert!(all.len() >= standard.len());
     assert!(standard.len() >= lite.len());
     // Lite should still have basic system tools
-    assert!(lite.len() > 0);
+    assert!(!lite.is_empty());
 }
 
 #[test]

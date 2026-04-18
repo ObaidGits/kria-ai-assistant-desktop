@@ -13,6 +13,7 @@ use kria_core::config::KriaConfig;
 use kria_core::infra::health::{HealthRegistry, ServiceStatus};
 use kria_core::infra::EventBus;
 use kria_core::llm::{ChatMessage, ImageAttachment, ModelRouter};
+use kria_core::llm::orchestrator::Orchestrator;
 use kria_core::mcp::client::McpServerState;
 use kria_core::mcp::server_manager::McpServerStatus;
 use kria_core::mcp::McpServerManager;
@@ -33,7 +34,7 @@ use kria_core::voice::{
     default_input_device_name, default_output_device_name, list_input_devices, list_output_devices,
     SpeechToText, TextToSpeech, VoicePipeline, VoicePipelineEvent, VoicePipelineState,
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::RwLock;
@@ -43,6 +44,9 @@ use kria_core::platform::telegram::TelegramBridge;
 const AGENT_EVENT_IDLE_TIMEOUT_SECS: u64 = 180;
 const AGENT_TIMEOUT_MESSAGE: &str = "⚠️ Timed out waiting for model output. Please verify the model runtime is healthy and try again.";
 const IMAGE_PREANALYSIS_TIMEOUT_SECS: u64 = 35;
+const GOOGLE_MCP_CONFIG_DIR_ENV: &str = "GOOGLE_MCP_CONFIG_DIR";
+const GOOGLE_ACCOUNT_ENV_KEY: &str = "KRIA_GW_ACCOUNT";
+const GOOGLE_DEFAULT_ACCOUNT: &str = "personal";
 
 // 1x1 white PPM probe image used for sidecar OCR capability checks.
 const OCR_HEALTH_PROBE_IMAGE_BYTES: &[u8] = b"P3\n1 1\n255\n255 255 255\n";
@@ -88,7 +92,7 @@ async fn finalize_ocr_probe_schedule(success: bool) {
 
 fn encode_base64_bytes(data: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut result = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
@@ -210,6 +214,72 @@ fn sync_telegram_mcp_server_config(config: &mut KriaConfig) -> bool {
             changed |=
                 update_server_env_var(&mut server.env, "KRIA_API_URL", Some(desired_api_url));
         }
+    }
+
+    changed
+}
+
+fn default_google_mcp_config_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    PathBuf::from(home).join(".google-mcp")
+}
+
+fn configured_google_workspace_server(
+    config: &KriaConfig,
+) -> Option<&kria_core::config::McpServerConfig> {
+    config
+        .mcp
+        .servers
+        .iter()
+        .find(|s| s.name.eq_ignore_ascii_case("gworkspace"))
+}
+
+fn google_mcp_config_dir_from_config(config: &KriaConfig) -> PathBuf {
+    configured_google_workspace_server(config)
+        .and_then(|server| server.env.get(GOOGLE_MCP_CONFIG_DIR_ENV).cloned())
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(default_google_mcp_config_dir)
+}
+
+fn google_account_from_config(config: &KriaConfig) -> String {
+    configured_google_workspace_server(config)
+        .and_then(|server| server.env.get(GOOGLE_ACCOUNT_ENV_KEY).cloned())
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| std::env::var(GOOGLE_ACCOUNT_ENV_KEY).ok())
+        .unwrap_or_else(|| GOOGLE_DEFAULT_ACCOUNT.into())
+}
+
+fn apply_google_runtime_env_from_config(config: &KriaConfig) {
+    let account = google_account_from_config(config);
+    let config_dir = google_mcp_config_dir_from_config(config);
+
+    std::env::set_var(GOOGLE_ACCOUNT_ENV_KEY, account);
+    std::env::set_var(
+        GOOGLE_MCP_CONFIG_DIR_ENV,
+        config_dir.to_string_lossy().to_string(),
+    );
+}
+
+fn sync_google_workspace_server_config(config: &mut KriaConfig, account: Option<&str>) -> bool {
+    let mut changed = false;
+    let desired_account = account
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| google_account_from_config(config));
+
+    if let Some(server) = config
+        .mcp
+        .servers
+        .iter_mut()
+        .find(|s| s.name.eq_ignore_ascii_case("gworkspace"))
+    {
+        changed |= update_server_env_var(
+            &mut server.env,
+            GOOGLE_ACCOUNT_ENV_KEY,
+            Some(desired_account),
+        );
     }
 
     changed
@@ -419,7 +489,49 @@ fn parse_relative_age_hours(age: &str) -> Option<f64> {
 }
 
 fn clamp01(v: f64) -> f64 {
-    v.max(0.0).min(1.0)
+    v.clamp(0.0, 1.0)
+}
+
+fn count_items_in_value(value: &serde_json::Value) -> u64 {
+    if let Some(arr) = value.as_array() {
+        return arr.len() as u64;
+    }
+
+    if let Some(v) = value.get("count").and_then(|v| v.as_u64()) {
+        return v;
+    }
+
+    for key in ["results", "items", "messages", "events", "files", "rows"] {
+        if let Some(arr) = value.get(key).and_then(|v| v.as_array()) {
+            return arr.len() as u64;
+        }
+    }
+
+    0
+}
+
+fn infer_google_kind(name: &str, result: &serde_json::Value) -> String {
+    if let Some(kind) = result.get("kind").and_then(|v| v.as_str()) {
+        return kind.to_string();
+    }
+
+    if name.contains("gmail") {
+        "gmail".into()
+    } else if name.contains("calendar") {
+        "calendar".into()
+    } else if name.contains("drive") {
+        "drive".into()
+    } else if name.contains("docs") {
+        "docs".into()
+    } else if name.contains("sheets") {
+        "sheets".into()
+    } else if name.contains("slides") {
+        "slides".into()
+    } else if name.contains("forms") {
+        "forms".into()
+    } else {
+        "google_workspace".into()
+    }
 }
 
 fn compute_tool_result_metadata(name: &str, result: &serde_json::Value) -> serde_json::Value {
@@ -558,6 +670,30 @@ fn compute_tool_result_metadata(name: &str, result: &serde_json::Value) -> serde
                 "region_match": serde_json::Value::Null,
             })
         }
+        _ if name.starts_with("gw_")
+            || result
+                .get("provider")
+                .and_then(|v| v.as_str())
+                .map(|p| p.eq_ignore_ascii_case("google_workspace"))
+                .unwrap_or(false) =>
+        {
+            let payload = result.get("data").unwrap_or(result);
+            let source_count = count_items_in_value(payload);
+            let kind = infer_google_kind(name, result);
+
+            let mut confidence = if source_count > 0 { 0.80 } else { 0.58 };
+            if ["create", "edit", "send", "delete"].iter().any(|k| name.contains(k)) {
+                confidence = 0.74;
+            }
+
+            serde_json::json!({
+                "confidence": clamp01(confidence),
+                "source_count": source_count,
+                "freshness_age_hours": serde_json::Value::Null,
+                "region_match": serde_json::Value::Null,
+                "kind": kind,
+            })
+        }
         _ => serde_json::Value::Null,
     }
 }
@@ -574,6 +710,46 @@ fn build_tool_result_event_payload(
         "success": success,
         "metadata": metadata,
     })
+}
+
+fn summarize_tool_turn_for_history(
+    name: &str,
+    success: bool,
+    result: &serde_json::Value,
+    metadata: &serde_json::Value,
+) -> String {
+    if !success {
+        let err = result
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown error");
+        let clipped: String = err.chars().take(180).collect();
+        return format!("Tool '{name}' failed: {clipped}");
+    }
+
+    let payload = result.get("data").unwrap_or(result);
+    let source_count = metadata.get("source_count").and_then(|v| v.as_u64());
+
+    if name == "gw_gmail_inbox" || name == "gw_gmail_search" {
+        let returned = payload
+            .get("returned_count")
+            .and_then(|v| v.as_u64())
+            .or_else(|| {
+                payload
+                    .get("messages")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.len() as u64)
+            })
+            .or(source_count)
+            .unwrap_or(0);
+        return format!("Tool '{name}' returned {returned} Gmail message(s).");
+    }
+
+    if let Some(count) = source_count {
+        return format!("Tool '{name}' completed with {count} item(s).");
+    }
+
+    format!("Tool '{name}' completed successfully.")
 }
 
 fn extract_image_preanalysis_summary(tool_data: &serde_json::Value) -> Option<String> {
@@ -1036,7 +1212,9 @@ fn resolve_hardware_info(
         let env_tier = env_tier.trim();
         if !env_tier.is_empty() {
             let mut hw = detect_hardware();
-            hw.tier = HardwareTier::from_str(env_tier);
+            hw.tier = env_tier
+                .parse::<HardwareTier>()
+                .unwrap_or(HardwareTier::Standard);
             return (hw, format!("env:KRIA_TIER={env_tier}"));
         }
     }
@@ -1044,7 +1222,11 @@ fn resolve_hardware_info(
     // Next precedence: config override.
     if !config.hardware.tier.trim().is_empty() {
         let mut hw = detect_hardware();
-        hw.tier = HardwareTier::from_str(&config.hardware.tier);
+        hw.tier = config
+            .hardware
+            .tier
+            .parse::<HardwareTier>()
+            .unwrap_or(HardwareTier::Standard);
         return (hw, format!("config.hardware.tier={}", config.hardware.tier));
     }
 
@@ -1098,6 +1280,9 @@ pub struct AppState {
     pub mcp_manager: Arc<tokio::sync::Mutex<McpServerManager>>,
     /// Lazy Google Workspace MCP client reference used by gw_* tool handlers.
     pub gw_client_ref: gw::GwClientRef,
+    /// Hardware orchestrator — manages llama-server lifecycle and dynamic GPU offloading.
+    #[allow(dead_code)]
+    pub orchestrator: Option<Arc<Orchestrator>>,
 }
 
 fn build_voice_pipeline(
@@ -1230,6 +1415,99 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
         }
     });
 
+    // ── Hardware Orchestrator (optional, manages llama-server lifecycle) ───────
+    // Helper: resolve a model filename against multiple candidate directories.
+    // Checks ~/.kria/models/llm/ first, then the workspace models/llm/ (for dev).
+    let resolve_model_file = |filename: &str| -> String {
+        // 1. ~/.kria/models/llm/
+        let p = paths.llm_models.join(filename);
+        if p.exists() {
+            return p.to_string_lossy().to_string();
+        }
+        // 2. Walk up from CWD to find workspace models/llm/ (Tauri dev runs from a sub-crate)
+        if let Ok(cwd) = std::env::current_dir() {
+            let mut dir = Some(cwd.as_path());
+            while let Some(d) = dir {
+                let candidate = d.join("models").join("llm").join(filename);
+                if candidate.exists() {
+                    return candidate.to_string_lossy().to_string();
+                }
+                dir = d.parent();
+            }
+        }
+        // 3. Return as-is (could be an absolute path already)
+        filename.to_string()
+    };
+
+    let orchestrator: Option<Arc<Orchestrator>> = if config.orchestrator.enabled {
+        tracing::info!(
+            model_count = config.llm.models.len(),
+            "orchestrator: config loaded, checking models"
+        );
+        // Resolve the model .gguf path from config
+        let model_path = config
+            .llm
+            .models
+            .first()
+            .map(|m| {
+                let resolved = resolve_model_file(&m.file);
+                tracing::info!(raw = %m.file, resolved = %resolved, "orchestrator: resolved model path");
+                resolved
+            })
+            .unwrap_or_default();
+
+        let mmproj_path = config
+            .llm
+            .models
+            .iter()
+            .find_map(|m| m.mmproj_file.as_ref())
+            .map(|f| {
+                let resolved = resolve_model_file(f);
+                tracing::info!(raw = %f, resolved = %resolved, "orchestrator: resolved mmproj path");
+                resolved
+            });
+
+        if model_path.is_empty() {
+            tracing::warn!("orchestrator: no model path configured — skipping startup");
+            None
+        } else {
+            match Orchestrator::start(
+                config.orchestrator.clone(),
+                model_path,
+                mmproj_path,
+                event_bus.clone(),
+                health.clone(),
+            )
+            .await
+            {
+                Ok(orch) => {
+                    // Wire the orchestrator's server manager into the model router
+                    // so local LLM requests use the dynamically managed URL.
+                    model_router.attach_server_manager(orch.server_manager.clone());
+                    tracing::info!(
+                        backend = ?orch.backend,
+                        api_url = %orch.api_url(),
+                        "orchestrator: started and attached to model router"
+                    );
+                    Some(orch)
+                }
+                Err(e) => {
+                    tracing::error!("orchestrator: failed to start (non-fatal): {e}");
+                    health.register("orchestrator");
+                    health.update(
+                        "orchestrator",
+                        ServiceStatus::Degraded,
+                        Some(format!("{e}")),
+                    );
+                    None
+                }
+            }
+        }
+    } else {
+        tracing::info!("orchestrator: disabled in config");
+        None
+    };
+
     // Initialize embedding model and vector index for fact extraction
     let embeddings = Arc::new(EmbeddingModel::load(384).unwrap_or_else(|e| {
         tracing::warn!("embedding model load error (using fallback): {}", e);
@@ -1268,6 +1546,8 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
         config = cfg;
     }
     sync_telegram_mcp_server_config(&mut config);
+    sync_google_workspace_server_config(&mut config, None);
+    apply_google_runtime_env_from_config(&config);
     let total_servers = config.mcp.servers.len();
     let enabled_servers = config.mcp.servers.iter().filter(|s| s.enabled).count();
     tracing::info!(
@@ -1326,6 +1606,8 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
 
     // Build the agent loop
     let max_tool_rounds = config.agent.max_tool_rounds.max(1);
+    let min_confidence_to_act = config.agent.min_confidence_to_act;
+    let clarify_threshold = config.agent.clarify_threshold;
     let agent_loop = Arc::new(
         AgentLoop::new(
             model_router.clone(),
@@ -1337,6 +1619,7 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
             rollback_mgr,
         )
         .with_max_tool_rounds(max_tool_rounds)
+        .with_confidence_thresholds(min_confidence_to_act, clarify_threshold)
         .with_hardware_tier(hardware_info.tier.as_str()),
     );
 
@@ -1497,7 +1780,7 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
         tool_registry: tool_registry.clone(),
         memory_store,
         hitl,
-        event_bus,
+        event_bus: event_bus.clone(),
         sidecar,
         embeddings,
         vectors,
@@ -1514,13 +1797,71 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
         telegram_bridge,
         mcp_manager: mcp_manager.clone(),
         gw_client_ref: gw_client_ref.clone(),
+        orchestrator: orchestrator.clone(),
     };
 
-    if let Err(_) = handle.state::<AppStateCell>().set(state) {
+    if handle.state::<AppStateCell>().set(state).is_err() {
         tracing::error!("[INIT] AppState was already initialized — this is a bug");
     }
 
     tracing::info!("[INIT] AppState set — frontend is now unblocked");
+
+    // ── Forward orchestrator events to Tauri frontend ─────────────────────────
+    if orchestrator.is_some() {
+        let handle_orch = handle.clone();
+        let mut rx = event_bus.subscribe();
+        tokio::spawn(async move {
+            use kria_core::infra::event_bus::KriaEvent;
+            loop {
+                match rx.recv().await {
+                    Ok(KriaEvent::LlmSwapStarted { from_ngl, to_ngl, emergency }) => {
+                        let _ = handle_orch.emit(
+                            "orchestrator:swap_started",
+                            serde_json::json!({
+                                "from_ngl": from_ngl,
+                                "to_ngl": to_ngl,
+                                "emergency": emergency,
+                            }),
+                        );
+                    }
+                    Ok(KriaEvent::LlmSwapCompleted { new_ngl, new_context, duration_ms }) => {
+                        let _ = handle_orch.emit(
+                            "orchestrator:swap_completed",
+                            serde_json::json!({
+                                "new_ngl": new_ngl,
+                                "new_context": new_context,
+                                "duration_ms": duration_ms,
+                            }),
+                        );
+                    }
+                    Ok(KriaEvent::LlmDegradationChanged { level }) => {
+                        let _ = handle_orch.emit(
+                            "orchestrator:degradation_changed",
+                            serde_json::json!({ "level": level }),
+                        );
+                    }
+                    Ok(KriaEvent::LlmStreamInterrupted) => {
+                        let _ = handle_orch.emit(
+                            "orchestrator:stream_interrupted",
+                            serde_json::json!({}),
+                        );
+                    }
+                    Ok(KriaEvent::VramPressure { free_vram_mb }) => {
+                        let _ = handle_orch.emit(
+                            "orchestrator:vram_pressure",
+                            serde_json::json!({ "free_vram_mb": free_vram_mb }),
+                        );
+                    }
+                    Ok(_) => {} // Ignore other events
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::debug!("orchestrator event forwarder lagged by {n}");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
     start_local_api_bridge(
         local_api_host,
         local_api_port,
@@ -1852,6 +2193,8 @@ pub async fn send_message(
     tauri::async_runtime::spawn(async move {
         let mut full_response = String::new();
         let mut saw_first_token = false;
+        let mut pending_tool_params: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::new();
 
         emit_agent_stage(
             &app_handle,
@@ -1910,6 +2253,7 @@ pub async fn send_message(
                 }
                 StreamEvent::ToolStart { name, params } => {
                     tracing::info!("Tool call: {} with {:?}", name, params);
+                    pending_tool_params.insert(name.clone(), params.clone());
                     emit_agent_stage(
                         &app_handle,
                         "tool_started",
@@ -1941,8 +2285,40 @@ pub async fn send_message(
                             "success": success,
                         })),
                     );
+                    let args = pending_tool_params
+                        .remove(&name)
+                        .unwrap_or_else(|| serde_json::json!({}));
                     let payload = build_tool_result_event_payload(&name, &result, success);
+                    let metadata = payload
+                        .get("metadata")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
                     let _ = app_handle.emit("agent:tool_result", payload);
+
+                    let persisted_payload = serde_json::json!({
+                        "name": name,
+                        "args": args,
+                        "success": success,
+                        "result": result,
+                        "metadata": metadata,
+                    });
+                    let _ = memory_store_clone.store_turn(&ConversationTurn {
+                        id: None,
+                        session_id: session_id_clone.clone(),
+                        role: "tool".into(),
+                        content: summarize_tool_turn_for_history(
+                            &name,
+                            success,
+                            &result,
+                            persisted_payload
+                                .get("metadata")
+                                .unwrap_or(&serde_json::Value::Null),
+                        ),
+                        tool_name: Some(name),
+                        tool_result: Some(persisted_payload.to_string()),
+                        tokens_used: None,
+                        timestamp: Utc::now(),
+                    });
                 }
                 StreamEvent::ApprovalRequired {
                     request_id,
@@ -1985,6 +2361,43 @@ pub async fn send_message(
                         serde_json::json!({
                             "action": action,
                             "approved": approved,
+                        }),
+                    );
+                }
+                StreamEvent::ToolChoiceRequired {
+                    query,
+                    confidence,
+                    min_confidence,
+                    candidates,
+                } => {
+                    emit_agent_stage(
+                        &app_handle,
+                        "tool_choice_required",
+                        "Low-confidence routing requires user tool selection",
+                        Some(serde_json::json!({
+                            "confidence": confidence,
+                            "min_confidence": min_confidence,
+                            "candidate_count": candidates.len(),
+                        })),
+                    );
+                    let list: Vec<serde_json::Value> = candidates
+                        .into_iter()
+                        .map(|c| {
+                            serde_json::json!({
+                                "name": c.name,
+                                "label": c.label,
+                                "reason": c.reason,
+                                "confidence": c.confidence,
+                            })
+                        })
+                        .collect();
+                    let _ = app_handle.emit(
+                        "agent:tool_choice_required",
+                        serde_json::json!({
+                            "query": query,
+                            "confidence": confidence,
+                            "minConfidence": min_confidence,
+                            "candidates": list,
                         }),
                     );
                 }
@@ -2104,12 +2517,16 @@ pub async fn send_message(
 
 #[tauri::command]
 pub async fn get_session_history(
+    session_id: Option<String>,
     state: State<'_, AppStateCell>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let state = state
         .get()
         .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
-    let session_id = state.current_session_id.read().await.clone();
+    let session_id = match session_id {
+        Some(id) if !id.trim().is_empty() => id,
+        _ => state.current_session_id.read().await.clone(),
+    };
     let turns = state
         .memory_store
         .get_recent_turns(&session_id, 100)
@@ -2121,6 +2538,7 @@ pub async fn get_session_history(
                 "role": t.role,
                 "content": t.content,
                 "tool_name": t.tool_name,
+                "tool_result": t.tool_result,
                 "timestamp": t.timestamp.to_rfc3339(),
             })
         })
@@ -2204,6 +2622,7 @@ pub async fn switch_session(
                 "role": t.role,
                 "content": t.content,
                 "tool_name": t.tool_name,
+                "tool_result": t.tool_result,
                 "timestamp": t.timestamp.to_rfc3339(),
             })
         })
@@ -2429,6 +2848,8 @@ pub async fn update_settings(
         .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
     let mut new_config: KriaConfig = serde_json::from_value(settings).map_err(|e| e.to_string())?;
     sync_telegram_mcp_server_config(&mut new_config);
+    sync_google_workspace_server_config(&mut new_config, None);
+    apply_google_runtime_env_from_config(&new_config);
     // Persist to disk first
     new_config.save().map_err(|e| e.to_string())?;
     // Then update in-memory config
@@ -2842,6 +3263,8 @@ pub async fn start_voice(state: State<'_, AppStateCell>, app: AppHandle) -> Resu
 
                     // Collect agent response for TTS
                     let mut full_response = String::new();
+                    let mut pending_tool_params: std::collections::HashMap<String, serde_json::Value> =
+                        std::collections::HashMap::new();
                     let app2 = app_handle.clone();
                     let ms2 = memory_store.clone();
                     let sid2 = session_id.clone();
@@ -2857,6 +3280,7 @@ pub async fn start_voice(state: State<'_, AppStateCell>, app: AppHandle) -> Resu
                                 let _ = app2.emit("agent:token", serde_json::json!({"text": t}));
                             }
                             StreamEvent::ToolStart { name, params } => {
+                                pending_tool_params.insert(name.clone(), params.clone());
                                 let _ = app2.emit(
                                     "agent:tool_call",
                                     serde_json::json!({"name": name, "params": params}),
@@ -2867,9 +3291,50 @@ pub async fn start_voice(state: State<'_, AppStateCell>, app: AppHandle) -> Resu
                                 result,
                                 success,
                             } => {
+                                let args = pending_tool_params
+                                    .remove(&name)
+                                    .unwrap_or_else(|| serde_json::json!({}));
                                 let payload =
                                     build_tool_result_event_payload(&name, &result, success);
+                                let metadata = payload
+                                    .get("metadata")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
                                 let _ = app2.emit("agent:tool_result", payload);
+
+                                let persisted_payload = serde_json::json!({
+                                    "name": name,
+                                    "args": args,
+                                    "success": success,
+                                    "result": result,
+                                    "metadata": metadata,
+                                });
+
+                                let _ = ms2.store_turn(&ConversationTurn {
+                                    id: None,
+                                    session_id: sid2.clone(),
+                                    role: "tool".into(),
+                                    content: summarize_tool_turn_for_history(
+                                        persisted_payload
+                                            .get("name")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("tool"),
+                                        success,
+                                        persisted_payload
+                                            .get("result")
+                                            .unwrap_or(&serde_json::Value::Null),
+                                        persisted_payload
+                                            .get("metadata")
+                                            .unwrap_or(&serde_json::Value::Null),
+                                    ),
+                                    tool_name: persisted_payload
+                                        .get("name")
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| s.to_string()),
+                                    tool_result: Some(persisted_payload.to_string()),
+                                    tokens_used: None,
+                                    timestamp: Utc::now(),
+                                });
                             }
                             StreamEvent::ApprovalRequired {
                                 request_id,
@@ -2883,6 +3348,33 @@ pub async fn start_voice(state: State<'_, AppStateCell>, app: AppHandle) -> Resu
                                 let _ = app2.emit(
                                     "agent:approval_result",
                                     serde_json::json!({"action": action, "approved": approved}),
+                                );
+                            }
+                            StreamEvent::ToolChoiceRequired {
+                                query,
+                                confidence,
+                                min_confidence,
+                                candidates,
+                            } => {
+                                let list: Vec<serde_json::Value> = candidates
+                                    .into_iter()
+                                    .map(|c| {
+                                        serde_json::json!({
+                                            "name": c.name,
+                                            "label": c.label,
+                                            "reason": c.reason,
+                                            "confidence": c.confidence,
+                                        })
+                                    })
+                                    .collect();
+                                let _ = app2.emit(
+                                    "agent:tool_choice_required",
+                                    serde_json::json!({
+                                        "query": query,
+                                        "confidence": confidence,
+                                        "minConfidence": min_confidence,
+                                        "candidates": list,
+                                    }),
                                 );
                             }
                             StreamEvent::Plan(plan) => {
@@ -3377,6 +3869,8 @@ pub async fn send_image_message(
     tauri::async_runtime::spawn(async move {
         let mut full_response = String::new();
         let mut saw_first_token = false;
+        let mut pending_tool_params: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::new();
 
         emit_agent_stage(
             &app_handle,
@@ -3429,6 +3923,7 @@ pub async fn send_image_message(
                     let _ = app_handle.emit("agent:token", serde_json::json!({ "text": text }));
                 }
                 StreamEvent::ToolStart { name, params } => {
+                    pending_tool_params.insert(name.clone(), params.clone());
                     emit_agent_stage(
                         &app_handle,
                         "tool_started",
@@ -3454,8 +3949,46 @@ pub async fn send_image_message(
                             "success": success,
                         })),
                     );
+                    let args = pending_tool_params
+                        .remove(&name)
+                        .unwrap_or_else(|| serde_json::json!({}));
                     let payload = build_tool_result_event_payload(&name, &result, success);
+                    let metadata = payload
+                        .get("metadata")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
                     let _ = app_handle.emit("agent:tool_result", payload);
+
+                    let persisted_payload = serde_json::json!({
+                        "name": name,
+                        "args": args,
+                        "success": success,
+                        "result": result,
+                        "metadata": metadata,
+                    });
+                    let tool_name = persisted_payload
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("tool");
+                    let _ = memory_store_clone.store_turn(&ConversationTurn {
+                        id: None,
+                        session_id: session_id_clone.clone(),
+                        role: "tool".into(),
+                        content: summarize_tool_turn_for_history(
+                            tool_name,
+                            success,
+                            persisted_payload
+                                .get("result")
+                                .unwrap_or(&serde_json::Value::Null),
+                            persisted_payload
+                                .get("metadata")
+                                .unwrap_or(&serde_json::Value::Null),
+                        ),
+                        tool_name: Some(tool_name.to_string()),
+                        tool_result: Some(persisted_payload.to_string()),
+                        tokens_used: None,
+                        timestamp: Utc::now(),
+                    });
                 }
                 StreamEvent::ApprovalRequired {
                     request_id,
@@ -3487,6 +4020,43 @@ pub async fn send_image_message(
                     let _ = app_handle.emit(
                         "agent:approval_result",
                         serde_json::json!({ "action": action, "approved": approved }),
+                    );
+                }
+                StreamEvent::ToolChoiceRequired {
+                    query,
+                    confidence,
+                    min_confidence,
+                    candidates,
+                } => {
+                    emit_agent_stage(
+                        &app_handle,
+                        "tool_choice_required",
+                        "Low-confidence routing requires user tool selection",
+                        Some(serde_json::json!({
+                            "confidence": confidence,
+                            "min_confidence": min_confidence,
+                            "candidate_count": candidates.len(),
+                        })),
+                    );
+                    let list: Vec<serde_json::Value> = candidates
+                        .into_iter()
+                        .map(|c| {
+                            serde_json::json!({
+                                "name": c.name,
+                                "label": c.label,
+                                "reason": c.reason,
+                                "confidence": c.confidence,
+                            })
+                        })
+                        .collect();
+                    let _ = app_handle.emit(
+                        "agent:tool_choice_required",
+                        serde_json::json!({
+                            "query": query,
+                            "confidence": confidence,
+                            "minConfidence": min_confidence,
+                            "candidates": list,
+                        }),
                     );
                 }
                 StreamEvent::Plan(plan) => {
@@ -4205,6 +4775,7 @@ struct GoogleWorkspaceRuntimeSnapshot {
 
 fn build_google_workspace_status_payload(
     account: &str,
+    config_dir: &Path,
     credentials_configured: bool,
     token_present: bool,
     runtime: GoogleWorkspaceRuntimeSnapshot,
@@ -4212,10 +4783,14 @@ fn build_google_workspace_status_payload(
     let auth_ready = token_present && credentials_configured;
     let runtime_ready = runtime.mcp_running && runtime.gw_client_wired;
     let connected = auth_ready && runtime_ready;
+    let credentials_display_path = config_dir.join("credentials.json");
 
     let mut warnings: Vec<String> = Vec::new();
     if !credentials_configured {
-        warnings.push("credentials.json missing at ~/.google-mcp/credentials.json".into());
+        warnings.push(format!(
+            "credentials.json missing at {}",
+            credentials_display_path.display()
+        ));
     }
     if !token_present {
         warnings.push(format!("OAuth token missing for account '{account}'"));
@@ -4235,7 +4810,6 @@ fn build_google_workspace_status_payload(
 
     serde_json::json!({
         "connected": connected,
-        "legacy_connected": token_present,
         "account": account,
         "credentials_configured": credentials_configured,
         "token_present": token_present,
@@ -4255,9 +4829,11 @@ fn build_google_workspace_status_payload(
             "docs": true,
             "sheets": true,
             "slides": true,
+            "forms": true,
             "meet": false,
             "meet_via_calendar": true,
         },
+        "config_dir": config_dir.to_string_lossy(),
         "meet_support_mode": "calendar_conference_link",
         "warnings": warnings,
     })
@@ -4275,11 +4851,11 @@ pub async fn get_google_workspace_status(
     let state = state
         .get()
         .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    let config_guard = state.config.read().await;
     let account = account
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| std::env::var("KRIA_GW_ACCOUNT").unwrap_or_else(|_| "personal".into()));
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-    let config_dir = std::path::PathBuf::from(&home).join(".google-mcp");
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| google_account_from_config(&config_guard));
+    let config_dir = google_mcp_config_dir_from_config(&config_guard);
     let token_path = config_dir.join("tokens").join(format!("{}.json", account));
     let credentials_path = config_dir.join("credentials.json");
 
@@ -4295,16 +4871,10 @@ pub async fn get_google_workspace_status(
             .find(|s| s.name == "gworkspace")
     };
 
-    let configured_enabled = {
-        let config = state.config.read().await;
-        config
-            .mcp
-            .servers
-            .iter()
-            .find(|s| s.name == "gworkspace")
-            .map(|s| s.enabled)
-            .unwrap_or(false)
-    };
+    let configured_enabled = configured_google_workspace_server(&config_guard)
+        .map(|s| s.enabled)
+        .unwrap_or(false);
+    drop(config_guard);
 
     let (mcp_state, mcp_tool_count, mcp_error, mcp_running) =
         if let Some(status) = gworkspace_runtime {
@@ -4321,6 +4891,7 @@ pub async fn get_google_workspace_status(
     let gw_client_wired = state.gw_client_ref.read().await.is_some();
     let payload = build_google_workspace_status_payload(
         &account,
+        &config_dir,
         credentials_configured,
         token_present,
         GoogleWorkspaceRuntimeSnapshot {
@@ -4356,27 +4927,82 @@ pub async fn get_google_workspace_status(
 /// `get_google_workspace_status` until `connected` becomes true.
 /// Events emitted: `gw:connected` on success, `gw:error` on failure.
 #[tauri::command]
+pub async fn set_google_workspace_account(
+    account: String,
+    state: State<'_, AppStateCell>,
+) -> Result<serde_json::Value, String> {
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+
+    let account = account.trim();
+    if account.is_empty() {
+        return Err("Google account name cannot be empty".into());
+    }
+
+    let mut config = state.config.write().await;
+    let updated = sync_google_workspace_server_config(&mut config, Some(account));
+    apply_google_runtime_env_from_config(&config);
+    if updated {
+        config.save().map_err(|e| e.to_string())?;
+    }
+    drop(config);
+
+    let runtime = apply_mcp_runtime_from_config(state).await;
+
+    Ok(serde_json::json!({
+        "account": account,
+        "updated": updated,
+        "runtime": runtime,
+    }))
+}
+
+#[tauri::command]
 pub async fn connect_google_workspace(
     account: Option<String>,
+    state: State<'_, AppStateCell>,
     app_handle: AppHandle,
 ) -> Result<serde_json::Value, String> {
-    let account = account
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| std::env::var("KRIA_GW_ACCOUNT").unwrap_or_else(|_| "personal".into()));
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-    let config_dir = format!("{}/.google-mcp", home);
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+
+    if let Some(requested) = account.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let mut config = state.config.write().await;
+        let changed = sync_google_workspace_server_config(&mut config, Some(requested));
+        apply_google_runtime_env_from_config(&config);
+        if changed {
+            config.save().map_err(|e| e.to_string())?;
+        }
+    }
+
+    let (account, config_dir) = {
+        let config = state.config.read().await;
+        let resolved_account = account
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| google_account_from_config(&config));
+        let resolved_dir = google_mcp_config_dir_from_config(&config);
+        (resolved_account, resolved_dir)
+    };
+    let config_dir_display = config_dir.to_string_lossy().to_string();
 
     // Fail fast if credentials.json is missing
-    let creds_path = std::path::PathBuf::from(&config_dir).join("credentials.json");
+    let creds_path = config_dir.join("credentials.json");
     if !creds_path.exists() {
         return Err(
-            "credentials.json not found at ~/.google-mcp/credentials.json. \
-             Please add your Google Cloud OAuth client credentials first."
-                .into(),
+            format!(
+                "credentials.json not found at {}. Please add your Google Cloud OAuth client credentials first.",
+                creds_path.display()
+            ),
         );
     }
 
     let account_clone = account.clone();
+    let config_dir_clone = config_dir_display.clone();
+    let mcp_manager = state.mcp_manager.clone();
+    let tool_registry = state.tool_registry.clone();
+    let gw_client_ref = state.gw_client_ref.clone();
+    let config_arc = state.config.clone();
     tokio::spawn(async move {
         tracing::info!("[GW] Starting OAuth flow for account '{}'", account_clone);
         let result = tokio::process::Command::new("npx")
@@ -4387,18 +5013,42 @@ pub async fn connect_google_workspace(
                 "add",
                 &account_clone,
             ])
-            .env("GOOGLE_MCP_CONFIG_DIR", &config_dir)
+            .env(GOOGLE_MCP_CONFIG_DIR_ENV, &config_dir_clone)
             // inherit stdio so the process can open the browser
             .status()
             .await;
 
         match result {
             Ok(status) if status.success() => {
+                let runtime_refresh_result = async {
+                    let desired = { config_arc.read().await.mcp.servers.clone() };
+                    let mut manager = mcp_manager.lock().await;
+                    let _ = manager.reconcile(desired, &tool_registry).await;
+                    let gw_client = manager.get_client("gworkspace").cloned();
+                    drop(manager);
+
+                    if let Some(client) = gw_client {
+                        gw::set_client(&gw_client_ref, client).await;
+                        Ok::<(), String>(())
+                    } else {
+                        *gw_client_ref.write().await = None;
+                        Err("gworkspace runtime not available after OAuth completion".into())
+                    }
+                }
+                .await;
+
                 tracing::info!("[GW] OAuth completed successfully for '{}'", account_clone);
                 let _ = app_handle.emit(
                     "gw:connected",
-                    serde_json::json!({ "account": account_clone }),
+                    serde_json::json!({
+                        "account": account_clone,
+                        "runtime_refreshed": runtime_refresh_result.is_ok(),
+                    }),
                 );
+
+                if let Err(msg) = runtime_refresh_result {
+                    let _ = app_handle.emit("gw:error", serde_json::json!({ "message": msg }));
+                }
             }
             Ok(status) => {
                 let msg = format!("OAuth process exited with: {status}");
@@ -4416,19 +5066,41 @@ pub async fn connect_google_workspace(
     Ok(serde_json::json!({
         "status": "pending",
         "account": account,
+        "config_dir": config_dir_display,
         "message": "Browser opened for Google sign-in. Complete authorization and return here.",
     }))
 }
 
 /// Remove the OAuth token for a Google Workspace account (sign out).
 #[tauri::command]
-pub async fn disconnect_google_workspace(account: Option<String>) -> Result<(), String> {
-    let account = account
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| std::env::var("KRIA_GW_ACCOUNT").unwrap_or_else(|_| "personal".into()));
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-    let token_path = std::path::PathBuf::from(home)
-        .join(".google-mcp")
+pub async fn disconnect_google_workspace(
+    account: Option<String>,
+    state: State<'_, AppStateCell>,
+) -> Result<(), String> {
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+
+    if let Some(requested) = account.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let mut config = state.config.write().await;
+        let changed = sync_google_workspace_server_config(&mut config, Some(requested));
+        apply_google_runtime_env_from_config(&config);
+        if changed {
+            config.save().map_err(|e| e.to_string())?;
+        }
+    }
+
+    let (account, config_dir) = {
+        let config = state.config.read().await;
+        (
+            account
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| google_account_from_config(&config)),
+            google_mcp_config_dir_from_config(&config),
+        )
+    };
+
+    let token_path = config_dir
         .join("tokens")
         .join(format!("{}.json", account));
 
@@ -4436,7 +5108,45 @@ pub async fn disconnect_google_workspace(account: Option<String>) -> Result<(), 
         std::fs::remove_file(&token_path).map_err(|e| format!("Failed to remove token: {e}"))?;
         tracing::info!("[GW] Disconnected Google account '{}'", account);
     }
+
+    let mut manager = state.mcp_manager.lock().await;
+    let _ = manager
+        .restart_server("gworkspace", &state.tool_registry)
+        .await;
+    let statuses = manager.status().await;
+    let gw_client = manager.get_client("gworkspace").cloned();
+    drop(manager);
+
+    sync_google_workspace_client_ref(state, gw_client).await;
+    update_mcp_health_status(state, &statuses).await;
     Ok(())
+}
+
+/// Return a snapshot of the hardware orchestrator state.
+#[tauri::command]
+pub async fn get_orchestrator_status(
+    state: State<'_, AppStateCell>,
+) -> Result<serde_json::Value, String> {
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    match &state.orchestrator {
+        Some(orch) => {
+            let snap = orch.snapshot();
+            Ok(serde_json::json!({
+                "enabled": true,
+                "backend": format!("{:?}", snap.backend),
+                "current_ngl": snap.current_ngl,
+                "current_context": snap.current_context,
+                "degradation": format!("{:?}", snap.degradation),
+                "server_healthy": snap.server_healthy,
+                "api_url": orch.api_url(),
+            }))
+        }
+        None => Ok(serde_json::json!({
+            "enabled": false,
+        })),
+    }
 }
 
 #[cfg(test)]
@@ -4449,6 +5159,7 @@ mod tests {
         LocalApiChatRequest, LocalApiResponder, OCR_HEALTH_PROBE_IMAGE_BYTES,
     };
     use async_trait::async_trait;
+    use std::path::Path;
 
     fn assert_confidence_range(metadata: &serde_json::Value) {
         let confidence = metadata
@@ -4475,6 +5186,7 @@ mod tests {
     fn google_status_requires_auth_and_runtime_readiness() {
         let payload = build_google_workspace_status_payload(
             "personal",
+            Path::new("/tmp/google-mcp"),
             true,
             true,
             GoogleWorkspaceRuntimeSnapshot {
@@ -4498,6 +5210,7 @@ mod tests {
     fn google_status_includes_meet_fallback_capabilities_and_runtime_warnings() {
         let payload = build_google_workspace_status_payload(
             "work",
+            Path::new("/tmp/google-mcp"),
             true,
             false,
             GoogleWorkspaceRuntimeSnapshot {
@@ -4515,6 +5228,7 @@ mod tests {
             serde_json::json!("calendar_conference_link")
         );
         assert_eq!(payload["capabilities"]["meet"], serde_json::json!(false));
+        assert_eq!(payload["capabilities"]["forms"], serde_json::json!(true));
         assert_eq!(
             payload["capabilities"]["meet_via_calendar"],
             serde_json::json!(true)
@@ -4876,4 +5590,125 @@ mod tests {
         assert_eq!(body.0["reply"], "echo: hello");
         assert_eq!(body.0["source"], "telegram");
     }
+}
+
+// ────────────────────────────────────────────────────────────────────────────────
+// Provisioning commands — first-boot setup wizard
+// ────────────────────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn get_provisioning_state() -> Result<serde_json::Value, String> {
+    let state = kria_core::infra::provisioning::ProvisioningState::load();
+    serde_json::to_value(&state).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn start_provisioning(handle: AppHandle) -> Result<serde_json::Value, String> {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let handle_clone = handle.clone();
+
+    let mut engine = kria_core::infra::provisioning::ProvisioningEngine::new(cancel);
+
+    // Run hardware detection synchronously (fast)
+    engine
+        .run_hardware_detection()
+        .map_err(|e| e.to_string())?;
+
+    let profile = engine
+        .state
+        .hardware_profile
+        .as_ref()
+        .ok_or("hardware detection failed")?;
+
+    let result = serde_json::json!({
+        "step": "hardware_detection",
+        "status": "done",
+        "profile": profile,
+    });
+
+    // Emit event to frontend
+    let _ = handle_clone.emit("provisioning:state_changed", &result);
+
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn set_provisioning_backend(
+    choice_type: String,
+    url: Option<String>,
+    api_key: Option<String>,
+    model_name: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let mut engine = kria_core::infra::provisioning::ProvisioningEngine::new(cancel);
+
+    let choice = match choice_type.as_str() {
+        "external" => {
+            let url = url.ok_or("url is required for external backend")?;
+            kria_core::infra::provisioning::BackendChoice::External {
+                url,
+                api_key,
+                model_name,
+            }
+        }
+        _ => kria_core::infra::provisioning::BackendChoice::Local,
+    };
+
+    engine.set_backend_choice(choice);
+    serde_json::to_value(&engine.state).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn run_provisioning_step(
+    handle: AppHandle,
+    step: String,
+) -> Result<serde_json::Value, String> {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let mut engine = kria_core::infra::provisioning::ProvisioningEngine::new(cancel);
+    let handle_clone = handle.clone();
+
+    let progress_callback = move |progress: kria_core::infra::download::DownloadProgress| {
+        let _ = handle_clone.emit("provisioning:progress", &progress);
+    };
+
+    match step.as_str() {
+        "model_download" => engine
+            .run_model_download(progress_callback)
+            .await
+            .map_err(|e| e.to_string())?,
+        "sidecar_setup" => engine
+            .run_sidecar_setup()
+            .await
+            .map_err(|e| e.to_string())?,
+        "server_verification" => engine
+            .run_server_verification(progress_callback)
+            .await
+            .map_err(|e| e.to_string())?,
+        _ => return Err(format!("unknown provisioning step: {step}")),
+    };
+
+    let _ = handle.emit(
+        "provisioning:state_changed",
+        serde_json::json!({ "step": step, "status": "done" }),
+    );
+
+    serde_json::to_value(&engine.state).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_provisioning_diagnostics() -> Result<String, String> {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let engine = kria_core::infra::provisioning::ProvisioningEngine::new(cancel);
+    Ok(engine.diagnostic_info())
+}
+
+#[tauri::command]
+pub async fn get_hardware_profile() -> Result<serde_json::Value, String> {
+    // Try loading saved profile first
+    if let Some(profile) = kria_core::infra::hardware_profiler::load_profile() {
+        return serde_json::to_value(&profile).map_err(|e| e.to_string());
+    }
+    // Otherwise, run detection
+    let profile = kria_core::infra::hardware_profiler::profile_hardware();
+    serde_json::to_value(&profile).map_err(|e| e.to_string())
 }

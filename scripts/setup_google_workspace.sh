@@ -19,6 +19,7 @@
 #     Docs API          → https://console.cloud.google.com/apis/api/docs.googleapis.com
 #     Sheets API        → https://console.cloud.google.com/apis/api/sheets.googleapis.com
 #     Slides API        → https://console.cloud.google.com/apis/api/slides.googleapis.com
+#     Forms API         → https://console.cloud.google.com/apis/api/forms.googleapis.com
 #
 #   After enabling each API, wait ~1 minute for Google to propagate the change.
 #
@@ -41,6 +42,7 @@ echo "  Drive    : https://console.cloud.google.com/apis/api/drive.googleapis.co
 echo "  Docs     : https://console.cloud.google.com/apis/api/docs.googleapis.com"
 echo "  Sheets   : https://console.cloud.google.com/apis/api/sheets.googleapis.com"
 echo "  Slides   : https://console.cloud.google.com/apis/api/slides.googleapis.com"
+echo "  Forms    : https://console.cloud.google.com/apis/api/forms.googleapis.com"
 echo "If any shows 'ENABLE', click it, wait 1 minute, then continue here."
 echo "────────────────────────────────────────────────────────"
 echo ""
@@ -85,7 +87,7 @@ GOOGLE_MCP_CONFIG_DIR="${CONFIG_DIR}" npx -y google-workspace-mcp setup || true
 echo ""
 echo "--- Adding Google account '${ACCOUNT_NAME}' ---"
 echo "A browser window will open. Sign in with your Google account and click Allow."
-echo "Grant ALL requested permissions (Gmail, Calendar, Drive, Docs, Sheets, Slides)."
+echo "Grant ALL requested permissions (Gmail, Calendar, Drive, Docs, Sheets, Slides, Forms)."
 echo ""
 GOOGLE_MCP_CONFIG_DIR="${CONFIG_DIR}" npx google-workspace-mcp accounts add "${ACCOUNT_NAME}"
 

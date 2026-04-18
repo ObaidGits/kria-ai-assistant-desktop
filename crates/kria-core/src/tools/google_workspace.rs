@@ -13,7 +13,8 @@
 //!            gw_drive_search, gw_drive_list, gw_drive_read
 //!   docs:    gw_docs_read, gw_docs_create, gw_docs_edit,
 //!            gw_sheets_read, gw_sheets_create, gw_sheets_edit,
-//!            gw_slides_read, gw_slides_create
+//!            gw_slides_read, gw_slides_create,
+//!            gw_forms_list, gw_forms_create
 //!   admin:   gw_gmail_send, gw_gmail_delete,
 //!            gw_drive_delete, gw_calendar_create, gw_calendar_delete
 
@@ -23,6 +24,7 @@ use crate::safety::RiskLevel;
 use crate::sidecar::SidecarBridge;
 use crate::tools::registry::{ParamDef, ToolDef, ToolHandler, ToolRegistry};
 use async_trait::async_trait;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Lazy reference to the gworkspace MCP client.
@@ -56,26 +58,437 @@ struct GwBridge {
     /// Lazy client ref — None until the gworkspace MCP server connects.
     mcp: GwClientRef,
     sidecar: Arc<SidecarBridge>,
-    /// Google account name as configured via `npx google-workspace-mcp accounts add <name>`.
-    /// Injected into every MCP call as the `account` parameter.
-    account: String,
+}
+
+fn active_google_account() -> String {
+    std::env::var("KRIA_GW_ACCOUNT").unwrap_or_else(|_| "personal".into())
+}
+
+const GMAIL_MAX_RESULTS_CAP: u64 = 200;
+const GMAIL_PAGE_SIZE_CAP: u64 = 50;
+const GMAIL_MAX_PAGE_FETCHES: usize = 6;
+
+fn gw_kind_for_tool(tool: &str) -> &'static str {
+    match tool {
+        t if t.contains("Gmail") => "gmail",
+        t if t.contains("Calendar") => "calendar",
+        t if t.contains("Spreadsheet") => "sheets",
+        t if t.contains("Presentation") || t.contains("Slides") => "slides",
+        t if t.contains("Form") => "forms",
+        t if t.contains("Document") || t.contains("GoogleDoc") => "docs",
+        t if t.contains("Folder") || t.contains("Drive") || t.contains("File") => "drive",
+        _ => "google_workspace",
+    }
+}
+
+fn parse_json_or_text(text: &str) -> serde_json::Value {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return serde_json::Value::Null;
+    }
+
+    serde_json::from_str::<serde_json::Value>(trimmed)
+        .unwrap_or_else(|_| serde_json::json!({ "text": trimmed }))
+}
+
+fn envelope_result(tool: &str, data: serde_json::Value, raw_text: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "provider": "google_workspace",
+        "kind": gw_kind_for_tool(tool),
+        "tool": tool,
+        "data": data,
+        "raw_text": raw_text.unwrap_or(""),
+    })
+}
+
+fn looks_like_drive_listing_phrase(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let has_list_intent = ["list", "show", "browse", "contents", "what is in", "what's in"]
+        .iter()
+        .any(|needle| lower.contains(needle));
+    let has_search_intent = ["search", "find", "look for", "locate"]
+        .iter()
+        .any(|needle| lower.contains(needle));
+
+    has_list_intent && !has_search_intent
+}
+
+fn looks_like_gmail_message_object(value: &serde_json::Value) -> bool {
+    value
+        .as_object()
+        .map(|obj| {
+            [
+                "id",
+                "messageId",
+                "message_id",
+                "threadId",
+                "subject",
+                "from",
+                "snippet",
+            ]
+            .iter()
+            .any(|key| obj.contains_key(*key))
+        })
+        .unwrap_or(false)
+}
+
+fn parse_gmail_heading_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if !(trimmed.starts_with("**") && trimmed.ends_with("**") && trimmed.len() > 4) {
+        return None;
+    }
+
+    let inner = &trimmed[2..trimmed.len() - 2];
+    let (index, rest) = inner.split_once(". ")?;
+    if !index.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+
+    let subject = rest.trim();
+    if subject.is_empty() {
+        None
+    } else {
+        Some(subject.to_string())
+    }
+}
+
+fn parse_gmail_labels(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .map(|label| label.to_string())
+        .collect()
+}
+
+fn parse_gmail_messages_from_text(raw: &str) -> Vec<serde_json::Value> {
+    let mut messages: Vec<serde_json::Value> = Vec::new();
+    let mut current: Option<serde_json::Map<String, serde_json::Value>> = None;
+
+    for line in raw.lines() {
+        if let Some(subject) = parse_gmail_heading_line(line) {
+            if let Some(msg) = current.take() {
+                messages.push(serde_json::Value::Object(msg));
+            }
+
+            let mut msg = serde_json::Map::new();
+            msg.insert("subject".into(), serde_json::Value::String(subject));
+            current = Some(msg);
+            continue;
+        }
+
+        let Some(msg) = current.as_mut() else {
+            continue;
+        };
+        let trimmed = line.trim();
+
+        if let Some(value) = trimmed.strip_prefix("From:") {
+            msg.insert(
+                "from".into(),
+                serde_json::Value::String(value.trim().to_string()),
+            );
+            continue;
+        }
+
+        if let Some(value) = trimmed.strip_prefix("Date:") {
+            msg.insert(
+                "date".into(),
+                serde_json::Value::String(value.trim().to_string()),
+            );
+            continue;
+        }
+
+        if let Some(value) = trimmed.strip_prefix("ID:") {
+            msg.insert(
+                "id".into(),
+                serde_json::Value::String(value.trim().to_string()),
+            );
+            continue;
+        }
+
+        if let Some(value) = trimmed.strip_prefix("Labels:") {
+            let labels = parse_gmail_labels(value.trim());
+            msg.insert(
+                "labels".into(),
+                serde_json::Value::Array(
+                    labels
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+            continue;
+        }
+
+        if let Some(value) = trimmed.strip_prefix("Preview:") {
+            msg.insert(
+                "preview".into(),
+                serde_json::Value::String(value.trim().to_string()),
+            );
+            continue;
+        }
+
+        if let Some(value) = trimmed.strip_prefix("Link:") {
+            msg.insert(
+                "url".into(),
+                serde_json::Value::String(value.trim().to_string()),
+            );
+            continue;
+        }
+    }
+
+    if let Some(msg) = current.take() {
+        messages.push(serde_json::Value::Object(msg));
+    }
+
+    messages
+}
+
+fn gmail_messages_from_payload(payload: &serde_json::Value) -> Vec<serde_json::Value> {
+    if let Some(messages) = payload.get("messages").and_then(|v| v.as_array()) {
+        return messages.clone();
+    }
+
+    if let Some(results) = payload.get("results").and_then(|v| v.as_array()) {
+        return results.clone();
+    }
+
+    if let Some(rows) = payload.as_array() {
+        return rows.clone();
+    }
+
+    if let Some(text) = payload.get("text").and_then(|v| v.as_str()) {
+        let parsed = parse_gmail_messages_from_text(text);
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+
+    if looks_like_gmail_message_object(payload) {
+        return vec![payload.clone()];
+    }
+
+    Vec::new()
+}
+
+fn gmail_next_page_token(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("nextPageToken")
+        .or_else(|| payload.get("next_page_token"))
+        .or_else(|| payload.get("nextPage"))
+        .or_else(|| {
+            payload
+                .get("pagination")
+                .and_then(|v| v.get("nextPageToken"))
+        })
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_string())
+}
+
+fn gmail_message_identifier(message: &serde_json::Value) -> Option<String> {
+    ["id", "messageId", "message_id", "threadId", "thread_id"]
+        .iter()
+        .find_map(|key| {
+            message
+                .get(*key)
+                .and_then(|v| v.as_str())
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        })
+}
+
+fn should_ignore_gmail_page_token_error(error: Option<&str>) -> bool {
+    let Some(raw) = error else {
+        return false;
+    };
+
+    let lower = raw.to_ascii_lowercase();
+    let mentions_page_token = lower.contains("pagetoken") || lower.contains("page token");
+    let looks_like_schema_error = lower.contains("unexpected parameter")
+        || lower.contains("additional properties")
+        || lower.contains("unknown")
+        || lower.contains("invalid argument");
+
+    mentions_page_token && looks_like_schema_error
+}
+
+fn find_string_field_recursive(value: &serde_json::Value, key: &str) -> Option<String> {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(found) = map
+                .get(key)
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+            {
+                return Some(found.to_string());
+            }
+
+            for child in map.values() {
+                if let Some(found) = find_string_field_recursive(child, key) {
+                    return Some(found);
+                }
+            }
+
+            None
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                if let Some(found) = find_string_field_recursive(item, key) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn extract_first_string_recursive(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| find_string_field_recursive(value, key))
+}
+
+fn extract_id_from_google_url(url: &str, marker: &str) -> Option<String> {
+    let (_, rest) = url.split_once(marker)?;
+    let id = rest
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .split('?')
+        .next()
+        .unwrap_or("")
+        .trim();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id.to_string())
+    }
+}
+
+fn extract_google_resource_id(
+    payload: &serde_json::Value,
+    id_keys: &[&str],
+    url_keys: &[&str],
+    url_marker: &str,
+) -> Option<String> {
+    if let Some(id) = extract_first_string_recursive(payload, id_keys) {
+        return Some(id);
+    }
+
+    for url_key in url_keys {
+        if let Some(url) = find_string_field_recursive(payload, url_key) {
+            if let Some(id) = extract_id_from_google_url(&url, url_marker) {
+                return Some(id);
+            }
+        }
+    }
+
+    None
+}
+
+fn build_google_resource_url(resource_kind: &str, resource_id: &str) -> Option<String> {
+    let id = resource_id.trim();
+    if id.is_empty() {
+        return None;
+    }
+
+    match resource_kind {
+        "document" => Some(format!("https://docs.google.com/document/d/{id}/edit")),
+        "spreadsheet" => Some(format!("https://docs.google.com/spreadsheets/d/{id}/edit")),
+        "presentation" => Some(format!("https://docs.google.com/presentation/d/{id}/edit")),
+        _ => None,
+    }
+}
+
+fn calendar_param_str(params: &serde_json::Value, primary: &str, fallback: &str) -> String {
+    params
+        .get(primary)
+        .and_then(|v| v.as_str())
+        .or_else(|| params.get(fallback).and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string()
+}
+
+fn calendar_create_args(params: &serde_json::Value, alternate_shape: bool) -> serde_json::Value {
+    let summary = params
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let start = calendar_param_str(params, "start", "startDateTime");
+    let end = calendar_param_str(params, "end", "endDateTime");
+    let description = params
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let location = params
+        .get("location")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let mut args = if alternate_shape {
+        serde_json::json!({
+            "summary": summary,
+            "startDateTime": start,
+            "endDateTime": end,
+            "description": description,
+            "location": location,
+        })
+    } else {
+        serde_json::json!({
+            "summary": summary,
+            "start": { "dateTime": start },
+            "end": { "dateTime": end },
+            "description": description,
+            "location": location,
+        })
+    };
+
+    if let Some(attendees) = params
+        .get("attendees")
+        .and_then(|v| v.as_array())
+        .filter(|arr| !arr.is_empty())
+    {
+        args["attendees"] = serde_json::Value::Array(attendees.clone());
+    }
+
+    args
+}
+
+fn should_retry_calendar_with_alternate_shape(error: Option<&str>) -> bool {
+    let Some(raw) = error else {
+        return true;
+    };
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("not connected") || lower.contains("mcp call failed") {
+        return false;
+    }
+    if lower.contains("rate limit") || lower.contains("quota") {
+        return false;
+    }
+    true
 }
 
 impl GwBridge {
     /// Inject the `account` field into the params object (required by every tool in
     /// `google-workspace-mcp`), then call the MCP tool.
-    async fn mcp_call(&self, tool: &str, mut args: serde_json::Value) -> ToolResult {
+    async fn mcp_call_raw(&self, tool: &str, mut args: serde_json::Value) -> ToolResult {
         // Ensure args is an object
         if !args.is_object() {
             args = serde_json::json!({});
         }
+        let account = active_google_account();
         // Inject account — never overwrite if the caller already set it
         if let Some(obj) = args.as_object_mut() {
             obj.entry("account")
-                .or_insert_with(|| serde_json::json!(self.account));
+                .or_insert_with(|| serde_json::json!(account));
         }
 
-        tracing::info!("[GW] mcp_call: tool='{}' account='{}'", tool, self.account);
+        tracing::info!("[GW] mcp_call: tool='{}' account='{}'", tool, account);
         tracing::debug!("[GW] mcp_call args: {}", args);
 
         let guard = self.mcp.read().await;
@@ -115,7 +528,11 @@ impl GwBridge {
                     let user_error = parse_gw_error(&text);
                     ToolResult {
                         success: false,
-                        data: serde_json::json!(user_error),
+                        data: envelope_result(
+                            tool,
+                            serde_json::json!({ "error": user_error.clone() }),
+                            Some(&text),
+                        ),
                         error: Some(user_error),
                     }
                 } else {
@@ -138,6 +555,20 @@ impl GwBridge {
         }
     }
 
+    async fn mcp_call(&self, tool: &str, args: serde_json::Value) -> ToolResult {
+        let raw = self.mcp_call_raw(tool, args).await;
+        if !raw.success {
+            return raw;
+        }
+
+        let raw_text = raw.data.as_str().unwrap_or("");
+        ToolResult {
+            success: true,
+            data: envelope_result(tool, parse_json_or_text(raw_text), Some(raw_text)),
+            error: None,
+        }
+    }
+
     /// Fetch-then-buffer: MCP call → raw data → sidecar digest.
     async fn fetch_and_buffer(
         &self,
@@ -150,17 +581,19 @@ impl GwBridge {
             mcp_tool,
             sidecar_method
         );
-        let raw_result = self.mcp_call(mcp_tool, mcp_args).await;
+        let raw_result = self.mcp_call_raw(mcp_tool, mcp_args).await;
         if !raw_result.success {
             return raw_result;
         }
+        let raw_text = raw_result.data.as_str().unwrap_or("").to_string();
+
         let buffer_params = serde_json::json!({ "raw": raw_result.data });
         match self.sidecar.request(sidecar_method, buffer_params).await {
             Ok(digest) => {
                 tracing::info!("[GW] sidecar '{}' digest produced", sidecar_method);
                 ToolResult {
                     success: true,
-                    data: digest,
+                    data: envelope_result(mcp_tool, digest, Some(&raw_text)),
                     error: None,
                 }
             }
@@ -170,8 +603,137 @@ impl GwBridge {
                     sidecar_method,
                     e
                 );
-                raw_result
+                ToolResult {
+                    success: true,
+                    data: envelope_result(mcp_tool, parse_json_or_text(&raw_text), Some(&raw_text)),
+                    error: None,
+                }
             }
+        }
+    }
+
+    async fn grounded_gmail_search(&self, query: String, requested_max: u64) -> ToolResult {
+        let requested_count = requested_max.clamp(1, GMAIL_MAX_RESULTS_CAP);
+        let page_size = requested_count.clamp(1, GMAIL_PAGE_SIZE_CAP);
+
+        let mut pages_fetched = 0usize;
+        let mut collected: Vec<serde_json::Value> = Vec::new();
+        let mut seen_ids: HashSet<String> = HashSet::new();
+        let mut raw_pages: Vec<String> = Vec::new();
+        let mut warnings: Vec<String> = Vec::new();
+        let mut partial_error: Option<String> = None;
+
+        let mut page_token: Option<String> = None;
+        let mut has_more_results = false;
+        let mut page_cap_reached = false;
+
+        while (collected.len() as u64) < requested_count {
+            if pages_fetched >= GMAIL_MAX_PAGE_FETCHES {
+                page_cap_reached = true;
+                break;
+            }
+
+            let mut args = serde_json::json!({
+                "query": query,
+                "maxResults": page_size,
+            });
+            if let Some(token) = page_token.clone() {
+                args["pageToken"] = serde_json::Value::String(token);
+            }
+
+            let page_result = self.mcp_call_raw("searchGmail", args).await;
+            if !page_result.success {
+                if pages_fetched > 0
+                    && should_ignore_gmail_page_token_error(page_result.error.as_deref())
+                {
+                    warnings.push(
+                        "Gmail pagination token replay was rejected by upstream schema; returning grounded results from fetched page(s).".into(),
+                    );
+                    break;
+                }
+
+                if collected.is_empty() {
+                    return page_result;
+                }
+
+                partial_error = page_result.error.clone();
+                break;
+            }
+
+            pages_fetched += 1;
+
+            let raw_text = page_result.data.as_str().unwrap_or("").to_string();
+            raw_pages.push(raw_text.clone());
+
+            let parsed = parse_json_or_text(&raw_text);
+            let page_messages = gmail_messages_from_payload(&parsed);
+            for message in page_messages {
+                if let Some(id) = gmail_message_identifier(&message) {
+                    if seen_ids.insert(id) {
+                        collected.push(message);
+                    }
+                } else {
+                    collected.push(message);
+                }
+
+                if (collected.len() as u64) >= requested_count {
+                    break;
+                }
+            }
+
+            page_token = gmail_next_page_token(&parsed);
+            has_more_results = page_token.is_some();
+
+            if (collected.len() as u64) >= requested_count || !has_more_results {
+                break;
+            }
+        }
+
+        let returned_count = collected.len() as u64;
+        if returned_count < requested_count {
+            warnings.push(format!(
+                "Requested {requested_count} message(s), but only {returned_count} grounded message(s) were returned by Gmail."
+            ));
+        }
+        if page_cap_reached {
+            warnings.push(
+                "Stopped Gmail retrieval after reaching safety page cap before satisfying full requested count.".into(),
+            );
+        }
+
+        let mut data = serde_json::json!({
+            "query": query,
+            "messages": collected,
+            "count": returned_count,
+            "requested_count": requested_count,
+            "returned_count": returned_count,
+            "fully_satisfied": returned_count >= requested_count,
+            "pages_fetched": pages_fetched,
+            "page_size": page_size,
+            "has_more_results": has_more_results,
+            "pagination_exhausted": !has_more_results,
+        });
+
+        if let Some(token) = page_token {
+            data["next_page_token"] = serde_json::Value::String(token);
+        }
+        if let Some(err) = partial_error {
+            data["partial_error"] = serde_json::Value::String(err);
+        }
+        if !warnings.is_empty() {
+            data["warnings"] = serde_json::Value::Array(
+                warnings
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            );
+        }
+
+        let raw_text = raw_pages.join("\n");
+        ToolResult {
+            success: true,
+            data: envelope_result("searchGmail", data, Some(&raw_text)),
+            error: None,
         }
     }
 }
@@ -181,7 +743,7 @@ fn gmail_max_results(params: &serde_json::Value, default: u64) -> u64 {
         .get("max_results")
         .and_then(|v| v.as_u64())
         .filter(|count| *count > 0)
-        .map(|count| count.min(50))
+    .map(|count| count.min(GMAIL_MAX_RESULTS_CAP))
         .unwrap_or(default)
 }
 
@@ -273,6 +835,12 @@ fn parse_gw_error(raw: &str) -> String {
         return "Google API rate limit or quota exceeded. Wait a minute and try again.".into();
     }
 
+    // transient upstream proxy/gateway failure
+    if raw.contains("Bad Gateway") || raw.contains("status code 502") {
+        return "Google API temporarily unavailable (502 Bad Gateway). Retry in a few seconds."
+            .into();
+    }
+
     // Fallback: trim to 300 chars
     if raw.len() > 300 {
         format!("{}…", &raw[..300])
@@ -294,11 +862,8 @@ impl ToolHandler for GwGmailInbox {
         // That is much more useful for "check my inbox" flows than listGmailMessages,
         // which only returns IDs and links.
         let query = normalize_gmail_inbox_query(params.get("query").and_then(|v| v.as_str()));
-        let args = serde_json::json!({
-            "query": query,
-            "maxResults": gmail_max_results(&params, 10),
-        });
-        self.0.mcp_call("searchGmail", args).await
+        let requested = gmail_max_results(&params, 10);
+        self.0.grounded_gmail_search(query, requested).await
     }
 }
 
@@ -308,11 +873,10 @@ impl ToolHandler for GwGmailSearch {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
         // searchGmail: account, query, maxResults?
         let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
-        let args = serde_json::json!({
-            "query": query,
-            "maxResults": gmail_max_results(&params, 10),
-        });
-        self.0.mcp_call("searchGmail", args).await
+        let requested = gmail_max_results(&params, 10);
+        self.0
+            .grounded_gmail_search(query.to_string(), requested)
+            .await
     }
 }
 
@@ -437,14 +1001,37 @@ struct GwCalendarCreate(GwBridge);
 #[async_trait]
 impl ToolHandler for GwCalendarCreate {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
-        let args = serde_json::json!({
-            "summary": params.get("summary").and_then(|v| v.as_str()).unwrap_or(""),
-            "start": { "dateTime": params.get("start").and_then(|v| v.as_str()).unwrap_or("") },
-            "end": { "dateTime": params.get("end").and_then(|v| v.as_str()).unwrap_or("") },
-            "description": params.get("description").and_then(|v| v.as_str()).unwrap_or(""),
-            "location": params.get("location").and_then(|v| v.as_str()).unwrap_or(""),
-        });
-        self.0.mcp_call("createCalendarEvent", args).await
+        let primary_args = calendar_create_args(&params, false);
+        let primary_result = self.0.mcp_call("createCalendarEvent", primary_args).await;
+        if primary_result.success || !should_retry_calendar_with_alternate_shape(primary_result.error.as_deref()) {
+            return primary_result;
+        }
+
+        tracing::warn!(
+            "[GW] calendar create primary argument shape failed; retrying with alternate datetime shape"
+        );
+        let alternate_result = self
+            .0
+            .mcp_call("createCalendarEvent", calendar_create_args(&params, true))
+            .await;
+        if alternate_result.success {
+            return alternate_result;
+        }
+
+        let merged_error = match (primary_result.error.as_deref(), alternate_result.error.as_deref()) {
+            (Some(primary), Some(alternate)) => {
+                format!("{primary} (alternate argument retry failed: {alternate})")
+            }
+            (Some(primary), None) => primary.to_string(),
+            (None, Some(alternate)) => alternate.to_string(),
+            (None, None) => "Calendar create failed for both supported argument shapes".to_string(),
+        };
+
+        ToolResult {
+            success: false,
+            data: alternate_result.data,
+            error: Some(merged_error),
+        }
     }
 }
 
@@ -473,6 +1060,17 @@ struct GwDriveSearch(GwBridge);
 impl ToolHandler for GwDriveSearch {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
         let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
+        if query.trim().is_empty() || looks_like_drive_listing_phrase(query) {
+            return self
+                .0
+                .fetch_and_buffer(
+                    "listFolderContents",
+                    serde_json::json!({}),
+                    "google.summarize_drive_folder",
+                )
+                .await;
+        }
+
         let args = serde_json::json!({ "query": query });
         self.0
             .fetch_and_buffer("searchGoogleDocs", args, "google.summarize_drive_folder")
@@ -544,9 +1142,68 @@ impl ToolHandler for GwDocsCreate {
             .get("title")
             .and_then(|v| v.as_str())
             .unwrap_or("Untitled");
-        self.0
-            .mcp_call("createDocument", serde_json::json!({ "title": title }))
-            .await
+
+        let create_result = self
+            .0
+            .mcp_call_raw("createDocument", serde_json::json!({ "title": title }))
+            .await;
+        if !create_result.success {
+            return create_result;
+        }
+
+        let create_raw = create_result.data.as_str().unwrap_or("").to_string();
+        let create_data = parse_json_or_text(&create_raw);
+
+        let document_id = extract_google_resource_id(
+            &create_data,
+            &["documentId", "document_id", "id"],
+            &["url", "documentUrl", "document_link", "link", "webViewLink"],
+            "/document/d/",
+        );
+
+        let mut result_data = serde_json::json!({
+            "resource": "document",
+            "title": title,
+            "status": "created_unverified",
+            "verified": false,
+            "create": create_data,
+            "document_id": document_id,
+            "url": document_id
+                .as_deref()
+                .and_then(|id| build_google_resource_url("document", id)),
+        });
+
+        if let Some(id) = document_id {
+            let verify_result = self
+                .0
+                .mcp_call_raw(
+                    "readGoogleDoc",
+                    serde_json::json!({ "documentId": id, "format": "markdown" }),
+                )
+                .await;
+
+            if verify_result.success {
+                result_data["status"] = serde_json::json!("created_verified");
+                result_data["verified"] = serde_json::json!(true);
+                result_data["verify"] = parse_json_or_text(verify_result.data.as_str().unwrap_or(""));
+            } else {
+                result_data["verification_error"] = serde_json::json!(
+                    verify_result
+                        .error
+                        .unwrap_or_else(|| "Document verification failed after create".into())
+                );
+            }
+        } else {
+            result_data["verification_error"] = serde_json::json!(
+                "Could not extract document ID from create response for post-create verification"
+            );
+        }
+
+        ToolResult {
+            success: true,
+            data: envelope_result("createDocument", result_data, Some(&create_raw)),
+            error: None,
+        }
     }
 }
 
@@ -598,9 +1255,68 @@ impl ToolHandler for GwSheetsCreate {
             .get("title")
             .and_then(|v| v.as_str())
             .unwrap_or("Untitled");
-        self.0
-            .mcp_call("createSpreadsheet", serde_json::json!({ "title": title }))
-            .await
+
+        let create_result = self
+            .0
+            .mcp_call_raw("createSpreadsheet", serde_json::json!({ "title": title }))
+            .await;
+        if !create_result.success {
+            return create_result;
+        }
+
+        let create_raw = create_result.data.as_str().unwrap_or("").to_string();
+        let create_data = parse_json_or_text(&create_raw);
+
+        let spreadsheet_id = extract_google_resource_id(
+            &create_data,
+            &["spreadsheetId", "spreadsheet_id", "id"],
+            &["url", "spreadsheetUrl", "spreadsheet_link", "link", "webViewLink"],
+            "/spreadsheets/d/",
+        );
+
+        let mut result_data = serde_json::json!({
+            "resource": "spreadsheet",
+            "title": title,
+            "status": "created_unverified",
+            "verified": false,
+            "create": create_data,
+            "spreadsheet_id": spreadsheet_id,
+            "url": spreadsheet_id
+                .as_deref()
+                .and_then(|id| build_google_resource_url("spreadsheet", id)),
+        });
+
+        if let Some(id) = spreadsheet_id {
+            let verify_result = self
+                .0
+                .mcp_call_raw(
+                    "readSpreadsheet",
+                    serde_json::json!({ "spreadsheetId": id }),
+                )
+                .await;
+
+            if verify_result.success {
+                result_data["status"] = serde_json::json!("created_verified");
+                result_data["verified"] = serde_json::json!(true);
+                result_data["verify"] = parse_json_or_text(verify_result.data.as_str().unwrap_or(""));
+            } else {
+                result_data["verification_error"] = serde_json::json!(
+                    verify_result
+                        .error
+                        .unwrap_or_else(|| "Spreadsheet verification failed after create".into())
+                );
+            }
+        } else {
+            result_data["verification_error"] = serde_json::json!(
+                "Could not extract spreadsheet ID from create response for post-create verification"
+            );
+        }
+
+        ToolResult {
+            success: true,
+            data: envelope_result("createSpreadsheet", result_data, Some(&create_raw)),
+            error: None,
+        }
     }
 }
 
@@ -659,8 +1375,96 @@ impl ToolHandler for GwSlidesCreate {
             .get("title")
             .and_then(|v| v.as_str())
             .unwrap_or("Untitled");
+
+        let create_result = self
+            .0
+            .mcp_call_raw("createPresentation", serde_json::json!({ "title": title }))
+            .await;
+        if !create_result.success {
+            return create_result;
+        }
+
+        let create_raw = create_result.data.as_str().unwrap_or("").to_string();
+        let create_data = parse_json_or_text(&create_raw);
+
+        let presentation_id = extract_google_resource_id(
+            &create_data,
+            &["presentationId", "presentation_id", "id"],
+            &["url", "presentationUrl", "presentation_link", "link", "webViewLink"],
+            "/presentation/d/",
+        );
+
+        let mut result_data = serde_json::json!({
+            "resource": "presentation",
+            "title": title,
+            "status": "created_unverified",
+            "verified": false,
+            "create": create_data,
+            "presentation_id": presentation_id,
+            "url": presentation_id
+                .as_deref()
+                .and_then(|id| build_google_resource_url("presentation", id)),
+        });
+
+        if let Some(id) = presentation_id {
+            let verify_result = self
+                .0
+                .mcp_call_raw(
+                    "readPresentation",
+                    serde_json::json!({ "presentationId": id }),
+                )
+                .await;
+
+            if verify_result.success {
+                result_data["status"] = serde_json::json!("created_verified");
+                result_data["verified"] = serde_json::json!(true);
+                result_data["verify"] = parse_json_or_text(verify_result.data.as_str().unwrap_or(""));
+            } else {
+                result_data["verification_error"] = serde_json::json!(
+                    verify_result
+                        .error
+                        .unwrap_or_else(|| "Presentation verification failed after create".into())
+                );
+            }
+        } else {
+            result_data["verification_error"] = serde_json::json!(
+                "Could not extract presentation ID from create response for post-create verification"
+            );
+        }
+
+        ToolResult {
+            success: true,
+            data: envelope_result("createPresentation", result_data, Some(&create_raw)),
+            error: None,
+        }
+    }
+}
+
+// ── Forms tools ───────────────────────────────────────────────────────────────
+// Real tool names: listForms, createForm
+
+struct GwFormsList(GwBridge);
+#[async_trait]
+impl ToolHandler for GwFormsList {
+    async fn execute(&self, params: serde_json::Value) -> ToolResult {
+        let mut args = serde_json::json!({});
+        if let Some(query) = params.get("query").and_then(|v| v.as_str()) {
+            args["query"] = serde_json::json!(query);
+        }
+        self.0.mcp_call("listForms", args).await
+    }
+}
+
+struct GwFormsCreate(GwBridge);
+#[async_trait]
+impl ToolHandler for GwFormsCreate {
+    async fn execute(&self, params: serde_json::Value) -> ToolResult {
+        let title = params
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Untitled Form");
         self.0
-            .mcp_call("createPresentation", serde_json::json!({ "title": title }))
+            .mcp_call("createForm", serde_json::json!({ "title": title }))
             .await
     }
 }
@@ -669,25 +1473,15 @@ impl ToolHandler for GwSlidesCreate {
 
 /// Register all Google Workspace tools.
 ///
-/// Always registers all 16 tools regardless of whether the MCP server is up.
+/// Always registers all curated Google Workspace tools regardless of whether the MCP server is up.
 /// Pass the `GwClientRef` returned by `new_client_ref()`; call `set_client()`
 /// after the MCP server connects so handlers start forwarding requests.
-///
-/// `account` is the name given to the Google account when running
-/// `npx google-workspace-mcp accounts add <account>` (e.g. "personal").
 pub fn register(reg: &ToolRegistry, mcp_ref: GwClientRef, sidecar: Arc<SidecarBridge>) {
-    // Default account name — user sets this up via CLI before starting KRIA
-    let account = std::env::var("KRIA_GW_ACCOUNT").unwrap_or_else(|_| "personal".into());
     tracing::info!(
-        "[GW] registering Google Workspace tools (account='{}', lazy MCP ref)",
-        account
+        "[GW] registering Google Workspace tools (account source=KRIA_GW_ACCOUNT, lazy MCP ref)"
     );
 
-    let gw = GwBridge {
-        mcp: mcp_ref,
-        sidecar,
-        account,
-    };
+    let gw = GwBridge { mcp: mcp_ref, sidecar };
 
     let tools: Vec<(ToolDef, Arc<dyn ToolHandler>)> = vec![
         // ── Ambient (always mounted) ─────────────────────
@@ -700,7 +1494,7 @@ pub fn register(reg: &ToolRegistry, mcp_ref: GwClientRef, sidecar: Arc<SidecarBr
                 min_tier: "lite",
                 parameters: vec![
                     param("query", "string", "Optional Gmail search filter (e.g. 'is:unread')", false),
-                    param("max_results", "integer", "Maximum messages to return (default 10, max 50)", false),
+                    param("max_results", "integer", "Maximum messages to return (default 10, max 200)", false),
                 ],
             },
             Arc::new(GwGmailInbox(gw.clone())),
@@ -714,7 +1508,7 @@ pub fn register(reg: &ToolRegistry, mcp_ref: GwClientRef, sidecar: Arc<SidecarBr
                 min_tier: "lite",
                 parameters: vec![
                     param("query", "string", "Gmail search query (e.g. 'from:boss subject:report')", true),
-                    param("max_results", "integer", "Maximum messages to return (default 10, max 50)", false),
+                    param("max_results", "integer", "Maximum messages to return (default 10, max 200)", false),
                 ],
             },
             Arc::new(GwGmailSearch(gw.clone())),
@@ -907,6 +1701,32 @@ pub fn register(reg: &ToolRegistry, mcp_ref: GwClientRef, sidecar: Arc<SidecarBr
             },
             Arc::new(GwSlidesCreate(gw.clone())),
         ),
+        (
+            ToolDef {
+                name: "gw_forms_list".into(),
+                description: "List Google Forms (optionally filtered by query).".into(),
+                category: "google_workspace".into(),
+                default_tier: RiskLevel::Green,
+                min_tier: "lite",
+                parameters: vec![
+                    param("query", "string", "Optional search query for forms", false),
+                ],
+            },
+            Arc::new(GwFormsList(gw.clone())),
+        ),
+        (
+            ToolDef {
+                name: "gw_forms_create".into(),
+                description: "Create a new Google Form.".into(),
+                category: "google_workspace".into(),
+                default_tier: RiskLevel::Yellow,
+                min_tier: "lite",
+                parameters: vec![
+                    param("title", "string", "Google Form title", true),
+                ],
+            },
+            Arc::new(GwFormsCreate(gw.clone())),
+        ),
 
         // ── Admin group (on-demand mount) ────────────────
         (
@@ -983,20 +1803,26 @@ pub fn register(reg: &ToolRegistry, mcp_ref: GwClientRef, sidecar: Arc<SidecarBr
         ),
     ];
 
+    let gw_tool_count = tools.len();
     for (def, handler) in tools {
         tracing::debug!("[GW] registering tool: {}", def.name);
         reg.register(def, handler);
     }
 
     tracing::info!(
-        "[GW] 22 Google Workspace tools registered (account='{}', MCP connection pending)",
-        gw.account
+        "[GW] {} Google Workspace tools registered (MCP connection pending)",
+        gw_tool_count
     );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{gmail_max_results, normalize_gmail_inbox_query};
+    use super::{
+        build_google_resource_url, calendar_create_args, extract_google_resource_id,
+        gmail_max_results, gmail_messages_from_payload, gmail_next_page_token,
+        looks_like_drive_listing_phrase, normalize_gmail_inbox_query,
+        parse_gmail_messages_from_text,
+    };
 
     #[test]
     fn gmail_inbox_query_defaults_to_inbox() {
@@ -1017,7 +1843,136 @@ mod tests {
         );
         assert_eq!(
             gmail_max_results(&serde_json::json!({"max_results": 500}), 10),
-            50
+            200
+        );
+    }
+
+    #[test]
+    fn gmail_helpers_extract_messages_and_next_page_token() {
+        let payload = serde_json::json!({
+            "messages": [
+                {"id": "m1", "subject": "A"},
+                {"id": "m2", "subject": "B"}
+            ],
+            "nextPageToken": "token-2"
+        });
+
+        let messages = gmail_messages_from_payload(&payload);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["id"], "m1");
+        assert_eq!(gmail_next_page_token(&payload).as_deref(), Some("token-2"));
+    }
+
+    #[test]
+    fn gmail_helpers_parse_text_search_results_into_messages() {
+        let raw = r#"
+**Search Results for:** "in:inbox is:unread"
+Total estimate: 201 messages
+
+**1. Invitation: Kria Presentation Pitching**
+   From: obaidullah zeeshan <obaidzeeshan.official@gmail.com>
+   Date: Sat, 18 Apr 2026 05:49:26 +0000
+   ID: 19d9f230a2e500b1
+   Labels: UNREAD, IMPORTANT, CATEGORY_PERSONAL, INBOX
+   Preview: You have been invited
+   Link: https://mail.google.com/mail/?authuser=personal#all/19d9f230a2e500b1
+
+**2. Meet the new Make Grid**
+   From: Make <info@make.com>
+   Date: Fri, 10 Apr 2026 10:47:32 +0000
+   ID: 19d770115374cefc
+   Labels: CATEGORY_PROMOTIONS, UNREAD, INBOX
+   Preview: You asked, we delivered
+   Link: https://mail.google.com/mail/?authuser=personal#all/19d770115374cefc
+"#;
+
+        let parsed = parse_gmail_messages_from_text(raw);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0]["id"], "19d9f230a2e500b1");
+        assert_eq!(parsed[1]["id"], "19d770115374cefc");
+        assert!(parsed[0].get("category").is_none());
+        assert!(parsed[1].get("category").is_none());
+        assert_eq!(parsed[0]["labels"][0], "UNREAD");
+        assert_eq!(parsed[1]["labels"][0], "CATEGORY_PROMOTIONS");
+
+        let wrapped = serde_json::json!({ "text": raw });
+        let wrapped_parsed = gmail_messages_from_payload(&wrapped);
+        assert_eq!(wrapped_parsed.len(), 2);
+    }
+
+    #[test]
+    fn drive_listing_phrase_detector_distinguishes_list_from_search() {
+        assert!(looks_like_drive_listing_phrase("list files in my google drive"));
+        assert!(looks_like_drive_listing_phrase("show drive contents"));
+        assert!(!looks_like_drive_listing_phrase("search drive for quarterly report"));
+    }
+
+    #[test]
+    fn calendar_create_args_supports_primary_and_alternate_shapes() {
+        let params = serde_json::json!({
+            "summary": "Google Meet",
+            "start": "2026-04-19T09:30:00Z",
+            "end": "2026-04-19T10:00:00Z",
+            "attendees": [{"email":"example@domain.com"}],
+        });
+
+        let primary = calendar_create_args(&params, false);
+        assert_eq!(primary["start"]["dateTime"], "2026-04-19T09:30:00Z");
+        assert_eq!(primary["end"]["dateTime"], "2026-04-19T10:00:00Z");
+        assert_eq!(primary["attendees"][0]["email"], "example@domain.com");
+
+        let alternate = calendar_create_args(&params, true);
+        assert_eq!(alternate["startDateTime"], "2026-04-19T09:30:00Z");
+        assert_eq!(alternate["endDateTime"], "2026-04-19T10:00:00Z");
+        assert_eq!(alternate["attendees"][0]["email"], "example@domain.com");
+    }
+
+    #[test]
+    fn extract_google_resource_id_supports_direct_and_url_based_ids() {
+        let direct_payload = serde_json::json!({
+            "documentId": "doc_direct_id"
+        });
+        assert_eq!(
+            extract_google_resource_id(
+                &direct_payload,
+                &["documentId", "id"],
+                &["url", "link"],
+                "/document/d/"
+            )
+            .as_deref(),
+            Some("doc_direct_id")
+        );
+
+        let url_payload = serde_json::json!({
+            "result": {
+                "link": "https://docs.google.com/document/d/doc_from_url/edit?usp=sharing"
+            }
+        });
+        assert_eq!(
+            extract_google_resource_id(
+                &url_payload,
+                &["documentId", "id"],
+                &["url", "link"],
+                "/document/d/"
+            )
+            .as_deref(),
+            Some("doc_from_url")
+        );
+    }
+
+    #[test]
+    fn build_google_resource_url_generates_edit_links() {
+        assert_eq!(
+            build_google_resource_url("document", "abc123").as_deref(),
+            Some("https://docs.google.com/document/d/abc123/edit")
+        );
+        assert_eq!(
+            build_google_resource_url("spreadsheet", "sheet456").as_deref(),
+            Some("https://docs.google.com/spreadsheets/d/sheet456/edit")
+        );
+        assert_eq!(
+            build_google_resource_url("presentation", "slide789").as_deref(),
+            Some("https://docs.google.com/presentation/d/slide789/edit")
         );
     }
 }

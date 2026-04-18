@@ -1,0 +1,30 @@
+# K.R.I.A. — Docker Compose (GPU / NVIDIA CUDA)
+# Usage: docker compose up -d
+
+services:
+  kria:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kria
+    volumes:
+      - ./models:/app/models
+      - kria-data:/app/data
+    ports:
+      - "3001:3001"
+    environment:
+      - KRIA_TIER=auto
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
+      - NVIDIA_VISIBLE_DEVICES=all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+volumes:
+  kria-data:

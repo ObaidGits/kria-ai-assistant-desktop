@@ -278,6 +278,23 @@ fn apply_noise_suppression(
     }
 }
 
+/// Handle to keep the audio stream alive. Drop to stop capture.
+pub struct AudioCaptureHandle {
+    _stream: cpal::Stream,
+    device_name: String,
+    stream_failed: Arc<AtomicBool>,
+}
+
+impl AudioCaptureHandle {
+    pub fn device_name(&self) -> &str {
+        &self.device_name
+    }
+
+    pub fn has_failed(&self) -> bool {
+        self.stream_failed.load(Ordering::Relaxed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{apply_noise_suppression, NoiseSuppressionMode, NoiseSuppressionState};
@@ -290,7 +307,8 @@ mod tests {
         // Approx 0.5 seconds of speech-like sine at moderate amplitude.
         let input: Vec<f32> = (0..8_000)
             .map(|i| {
-                0.05 * ((2.0 * std::f32::consts::PI * 220.0 * i as f32) / sample_rate as f32).sin()
+                0.05 * ((2.0 * std::f32::consts::PI * 220.0 * i as f32) / sample_rate as f32)
+                    .sin()
             })
             .collect();
 
@@ -319,22 +337,5 @@ mod tests {
     fn rms(samples: &[f32]) -> f32 {
         let sum: f32 = samples.iter().map(|s| s * s).sum();
         (sum / samples.len() as f32).sqrt()
-    }
-}
-
-/// Handle to keep the audio stream alive. Drop to stop capture.
-pub struct AudioCaptureHandle {
-    _stream: cpal::Stream,
-    device_name: String,
-    stream_failed: Arc<AtomicBool>,
-}
-
-impl AudioCaptureHandle {
-    pub fn device_name(&self) -> &str {
-        &self.device_name
-    }
-
-    pub fn has_failed(&self) -> bool {
-        self.stream_failed.load(Ordering::Relaxed)
     }
 }

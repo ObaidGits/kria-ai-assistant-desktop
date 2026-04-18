@@ -143,3 +143,9 @@ impl WorkflowEngine {
         Ok(())
     }
 }
+
+impl Default for WorkflowEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}

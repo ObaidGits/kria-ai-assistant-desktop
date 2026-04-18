@@ -143,8 +143,8 @@ fn resolve_image_path(raw: &str) -> Option<PathBuf> {
 }
 
 fn infer_image_intent(operations: &[&str]) -> &'static str {
-    let has_ocr = operations.iter().any(|op| *op == "ocr");
-    let has_features = operations.iter().any(|op| *op == "features");
+    let has_ocr = operations.contains(&"ocr");
+    let has_features = operations.contains(&"features");
 
     if has_ocr && has_features {
         "mixed"

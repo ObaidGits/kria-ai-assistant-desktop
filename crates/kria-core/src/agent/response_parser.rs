@@ -8,7 +8,7 @@ pub struct ParsedToolCall {
     pub arguments: serde_json::Value,
 }
 
-// ─── Tool call regexes (7 patterns) ───
+// ─── Tool call regexes ───
 
 /// Pattern 1: XML-style <tool_call>{"name": ..., "arguments": ...}</tool_call>
 static TOOL_CALL_RE: Lazy<Regex> =
@@ -22,9 +22,6 @@ static BRACKET_CALL_RE: Lazy<Regex> =
 static RAW_JSON_TOOL_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"\{"name"\s*:\s*"(\w+)"\s*,\s*"arguments"\s*:\s*(\{[^}]*\})\}"#).unwrap()
 });
-
-/// Pattern 4: Key-value style tool_name: key1=val1, key2=val2
-static KV_TOOL_CALL_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^(\w+):\s*(.+)$").unwrap());
 
 /// Pattern 7: Python-style positional call  tool_name("value")  or  tool_name(param="value")
 /// Last-resort fallback — only matched when all other patterns fail.
@@ -87,20 +84,6 @@ pub fn parse_tool_calls(text: &str) -> Vec<ParsedToolCall> {
         return calls;
     }
 
-    // Try Pattern 4: key=value style (only on lines)
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if let Some(cap) = KV_TOOL_CALL_RE.captures(trimmed) {
-            let name = cap
-                .get(1)
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_default();
-            let args_str = cap.get(2).map(|m| m.as_str()).unwrap_or("");
-            let arguments = parse_kv_args(args_str);
-            calls.push(ParsedToolCall { name, arguments });
-        }
-    }
-
     calls
 }
 
@@ -111,7 +94,7 @@ pub fn parse_tool_calls_with_known(
     text: &str,
     known_tools: &[(&str, &str)], // (tool_name, required_param_name) — single-param tools only
 ) -> Vec<ParsedToolCall> {
-    // Try Patterns 1-4 first (canonical path)
+    // Try canonical patterns first
     let calls = parse_tool_calls(text);
     if !calls.is_empty() {
         return calls;

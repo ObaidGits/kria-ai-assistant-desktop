@@ -23,8 +23,13 @@ const ChatView: Component = () => {
     toggleVoice,
     voiceActive,
     voiceState,
+    toolChoiceRequest,
+    submitToolChoice,
+    dismissToolChoice,
     currentSession,
     sessions,
+    isSwapping,
+    degradationLevel,
   } = appStore;
 
   // Derive the title of the current session for exports
@@ -260,6 +265,19 @@ const ChatView: Component = () => {
         <div ref={messagesEnd} />
       </div>
 
+      <Show when={isSwapping()}>
+        <div class="swap-overlay">
+          <div class="swap-overlay-content">
+            <span class="dot" /><span class="dot" /><span class="dot" />
+            <span class="swap-label">Optimizing GPU layers…</span>
+          </div>
+        </div>
+      </Show>
+
+      <Show when={degradationLevel() && degradationLevel() !== "Full"}>
+        <div class="degradation-pill">{degradationLevel()}</div>
+      </Show>
+
       <Show when={pendingImage()}>
         <div class="image-preview-bar">
           <img
@@ -319,7 +337,7 @@ const ChatView: Component = () => {
         <textarea
           ref={textareaRef}
           class="chat-input"
-          placeholder={pendingImage() ? "Describe what you want to know about this image..." : "Ask KRIA anything… (type / for commands)"}
+          placeholder={isSwapping() ? "Model is swapping GPU layers…" : pendingImage() ? "Describe what you want to know about this image..." : "Ask KRIA anything… (type / for commands)"}
           value={inputText()}
           onInput={(e) => {
             setInputText(e.currentTarget.value);
@@ -328,11 +346,52 @@ const ChatView: Component = () => {
           onKeyDown={handleKeyDown}
           onPaste={handlePaste}
           rows={1}
+          disabled={isSwapping()}
         />
-        <button type="submit" class="send-btn" disabled={!inputText().trim() && !pendingImage()}>
+        <button type="submit" class="send-btn" disabled={isSwapping() || (!inputText().trim() && !pendingImage())}>
           Send
         </button>
       </form>
+
+      <Show when={toolChoiceRequest()}>
+        {(req) => (
+          <div class="modal-overlay tool-choice-overlay">
+            <div class="modal tool-choice-modal">
+              <div class="modal-header">
+                <h2>Choose a Tool</h2>
+              </div>
+              <div class="modal-body">
+                <p>
+                  Confidence {Math.round(req().confidence * 100)}% is below the auto-run threshold
+                  ({Math.round(req().minConfidence * 100)}%). Pick the tool to continue.
+                </p>
+                <div class="tool-choice-list">
+                  <For each={req().candidates}>
+                    {(candidate) => (
+                      <button
+                        class="tool-choice-item"
+                        type="button"
+                        onClick={() => submitToolChoice(candidate.name)}
+                      >
+                        <span class="tool-choice-title">{candidate.label}</span>
+                        <span class="tool-choice-meta">
+                          {candidate.name} • {Math.round(candidate.confidence * 100)}%
+                        </span>
+                        <span class="tool-choice-reason">{candidate.reason}</span>
+                      </button>
+                    )}
+                  </For>
+                </div>
+              </div>
+              <div class="modal-footer">
+                <button class="btn-secondary" type="button" onClick={dismissToolChoice}>
+                  Cancel
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </Show>
     </div>
   );
 };

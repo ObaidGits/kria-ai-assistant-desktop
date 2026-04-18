@@ -498,6 +498,12 @@ impl PolicyEngine {
     }
 }
 
+impl Default for PolicyEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{PolicyEngine, RiskLevel};

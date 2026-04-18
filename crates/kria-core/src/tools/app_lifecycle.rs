@@ -109,7 +109,7 @@ impl ToolHandler for CloseApplication {
         let mut sys = sysinfo::System::new();
         sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
         let mut killed = 0;
-        for (_pid, proc_) in sys.processes() {
+        for proc_ in sys.processes().values() {
             if proc_
                 .name()
                 .to_string_lossy()

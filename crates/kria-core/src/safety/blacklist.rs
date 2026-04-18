@@ -80,6 +80,12 @@ impl BlacklistChecker {
     }
 }
 
+impl Default for BlacklistChecker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

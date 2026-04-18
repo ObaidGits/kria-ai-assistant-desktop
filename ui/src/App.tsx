@@ -1,10 +1,12 @@
 import { Component, Show, For, createSignal, createMemo, onMount, onCleanup } from "solid-js";
 import { appStore } from "./stores/app";
+import { provisioningStore } from "./stores/provisioning";
 import ChatView from "./components/ChatView";
 import SessionSidebar from "./components/SessionSidebar";
 import SettingsModal from "./components/SettingsModal";
 import HitlModal from "./components/HitlModal";
 import VoiceOverlay from "./components/VoiceOverlay";
+import SetupWizard from "./components/SetupWizard";
 
 interface Toast {
   id: number;
@@ -27,6 +29,8 @@ const [toasts, setToasts] = createSignal<Toast[]>([]);
 const App: Component = () => {
   const { showSettings, showHitl, voiceActive, setShowSettings } = appStore;
   const [showShortcuts, setShowShortcuts] = createSignal(false);
+  const [showWizard, setShowWizard] = createSignal(false);
+  const [wizardLoading, setWizardLoading] = createSignal(true);
 
   const assistantStatus = createMemo(() => appStore.assistantStatus());
   const connectedMcpServers = createMemo(
@@ -105,6 +109,16 @@ const App: Component = () => {
 
   onMount(() => {
     document.addEventListener("keydown", handleGlobalKeydown);
+
+    // Check provisioning state before loading main app
+    void (async () => {
+      const state = await provisioningStore.loadState();
+      if (state && state.current_step !== "complete") {
+        setShowWizard(true);
+      }
+      setWizardLoading(false);
+    })();
+
     appStore.loadHealth();
     appStore.loadMcpServers();
     appStore.loadAlerts();
@@ -116,6 +130,22 @@ const App: Component = () => {
 
   return (
     <div class="app">
+      <Show when={wizardLoading()}>
+        <div class="setup-wizard">
+          <div class="wizard-content">
+            <div class="wizard-spinner-row">
+              <div class="wizard-spinner" />
+              <span>Loading…</span>
+            </div>
+          </div>
+        </div>
+      </Show>
+
+      <Show when={!wizardLoading() && showWizard()}>
+        <SetupWizard onComplete={() => setShowWizard(false)} />
+      </Show>
+
+      <Show when={!wizardLoading() && !showWizard()}>
       <div class="app-layout">
         <SessionSidebar />
         <main class="main-content">
@@ -183,6 +213,7 @@ const App: Component = () => {
             ))}
           </div>
         </div>
+      </Show>
       </Show>
 
       {/* Toast notifications */}

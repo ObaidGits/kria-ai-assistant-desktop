@@ -45,7 +45,7 @@ impl SidecarBridge {
     /// Spawn the Python sidecar process and wait for the `ready` signal.
     pub async fn spawn(&self) -> anyhow::Result<()> {
         let python = if let Some(ref venv) = self.venv_path {
-            let venv_python = format!("{}/bin/python", venv);
+            let venv_python = Self::venv_python_path(venv);
             if tokio::fs::metadata(&venv_python).await.is_ok() {
                 tracing::info!("sidecar: using venv python at {}", venv_python);
                 venv_python
@@ -97,7 +97,7 @@ impl SidecarBridge {
                 if existing.is_empty() {
                     src.into_owned()
                 } else {
-                    format!("{}:{}", src, existing)
+                    format!("{}{}{}", src, Self::path_separator(), existing)
                 }
             });
 
@@ -383,8 +383,8 @@ impl SidecarBridge {
         }
         tracing::info!("sidecar setup: venv created");
 
-        let venv_python = format!("{venv_dir}/bin/python");
-        let venv_pip = format!("{venv_dir}/bin/pip");
+        let venv_python = Self::venv_python_path(venv_dir);
+        let venv_pip = Self::venv_pip_path(venv_dir);
 
         // 2. Upgrade pip quietly
         let _ = tokio::process::Command::new(&venv_pip)
@@ -485,5 +485,35 @@ impl std::fmt::Debug for SidecarBridge {
             .field("python_cmd", &self.python_cmd)
             .field("alive", &self.health.is_alive())
             .finish()
+    }
+}
+
+// ── Cross-platform path helpers ──────────────────────────────────────
+impl SidecarBridge {
+    /// Return the platform-correct path to the `python` binary inside a venv.
+    fn venv_python_path(venv_dir: &str) -> String {
+        if cfg!(target_os = "windows") {
+            format!("{}\\Scripts\\python.exe", venv_dir)
+        } else {
+            format!("{}/bin/python", venv_dir)
+        }
+    }
+
+    /// Return the platform-correct path to the `pip` binary inside a venv.
+    fn venv_pip_path(venv_dir: &str) -> String {
+        if cfg!(target_os = "windows") {
+            format!("{}\\Scripts\\pip.exe", venv_dir)
+        } else {
+            format!("{}/bin/pip", venv_dir)
+        }
+    }
+
+    /// Platform-correct separator for `PYTHONPATH` entries.
+    fn path_separator() -> &'static str {
+        if cfg!(target_os = "windows") {
+            ";"
+        } else {
+            ":"
+        }
     }
 }

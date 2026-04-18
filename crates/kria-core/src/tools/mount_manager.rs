@@ -198,6 +198,10 @@ impl ToolMountManager {
                 "gworkspace_docs",
             ),
             (
+                &["form", "forms", "google form", "google forms"],
+                "gworkspace_docs",
+            ),
+            (
                 &[
                     "share file",
                     "share document",
@@ -210,15 +214,16 @@ impl ToolMountManager {
         ];
 
         for (keywords, group) in heuristics {
-            if !self.active.contains(*group) && self.groups.contains_key(*group) {
-                if keywords.iter().any(|kw| lower.contains(kw)) {
-                    self.active.insert(group.to_string());
-                    newly_mounted.push(group.to_string());
-                    tracing::info!(
-                        group = group,
-                        "auto-mounted tool group from message keywords"
-                    );
-                }
+            if !self.active.contains(*group)
+                && self.groups.contains_key(*group)
+                && keywords.iter().any(|kw| lower.contains(kw))
+            {
+                self.active.insert(group.to_string());
+                newly_mounted.push(group.to_string());
+                tracing::info!(
+                    group = group,
+                    "auto-mounted tool group from message keywords"
+                );
             }
         }
 
@@ -285,6 +290,8 @@ pub fn build_default_mount_manager() -> ToolMountManager {
             "gw_sheets_edit".into(),
             "gw_slides_read".into(),
             "gw_slides_create".into(),
+            "gw_forms_list".into(),
+            "gw_forms_create".into(),
         ],
         false,
     );

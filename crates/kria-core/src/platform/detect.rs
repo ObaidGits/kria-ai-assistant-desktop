@@ -20,6 +20,20 @@ pub enum HardwareTier {
     High,
 }
 
+impl std::str::FromStr for HardwareTier {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let tier = match s.to_lowercase().as_str() {
+            "lite" => Self::Lite,
+            "performance" => Self::Performance,
+            "high" => Self::High,
+            _ => Self::Standard,
+        };
+        Ok(tier)
+    }
+}
+
 /// Detected package manager on the host system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -72,16 +86,6 @@ impl HardwareTier {
             Self::Standard => "standard",
             Self::Performance => "performance",
             Self::High => "high",
-        }
-    }
-
-    /// Parse from string, defaulting to Standard.
-    pub fn from_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "lite" => Self::Lite,
-            "performance" => Self::Performance,
-            "high" => Self::High,
-            _ => Self::Standard,
         }
     }
 

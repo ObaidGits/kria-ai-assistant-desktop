@@ -90,3 +90,9 @@ impl MacroRecorder {
         Ok(())
     }
 }
+
+impl Default for MacroRecorder {
+    fn default() -> Self {
+        Self::new()
+    }
+}

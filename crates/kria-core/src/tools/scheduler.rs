@@ -65,7 +65,7 @@ impl ToolHandler for CreateScheduledTask {
 
         let mut child = match child {
             Ok(c) => c,
-            Err(e) => return ToolResult::err(&format!("failed to spawn crontab: {e}")),
+            Err(e) => return ToolResult::err(format!("failed to spawn crontab: {e}")),
         };
 
         if let Some(mut stdin) = child.stdin.take() {
@@ -74,7 +74,7 @@ impl ToolHandler for CreateScheduledTask {
         }
         let status = match child.wait().await {
             Ok(s) => s,
-            Err(e) => return ToolResult::err(&format!("crontab wait failed: {e}")),
+            Err(e) => return ToolResult::err(format!("crontab wait failed: {e}")),
         };
 
         if status.success() {
@@ -112,7 +112,7 @@ impl ToolHandler for DeleteScheduledTask {
 
         let mut child = match child {
             Ok(c) => c,
-            Err(e) => return ToolResult::err(&format!("failed to spawn crontab: {e}")),
+            Err(e) => return ToolResult::err(format!("failed to spawn crontab: {e}")),
         };
 
         if let Some(mut stdin) = child.stdin.take() {
@@ -121,7 +121,7 @@ impl ToolHandler for DeleteScheduledTask {
         }
         let status = match child.wait().await {
             Ok(s) => s,
-            Err(e) => return ToolResult::err(&format!("crontab wait failed: {e}")),
+            Err(e) => return ToolResult::err(format!("crontab wait failed: {e}")),
         };
 
         if status.success() {

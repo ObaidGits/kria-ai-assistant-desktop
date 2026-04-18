@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// Root configuration loaded from TOML.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct KriaConfig {
     pub llm: LlmConfig,
@@ -17,6 +17,7 @@ pub struct KriaConfig {
     pub mcp: McpConfig,
     pub telegram: TelegramConfig,
     pub hardware: HardwareConfig,
+    pub orchestrator: OrchestratorConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,7 +168,7 @@ impl Default for TelegramConfig {
 }
 
 /// MCP (Model Context Protocol) configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct McpConfig {
     pub servers: Vec<McpServerConfig>,
@@ -215,6 +216,110 @@ impl Default for HardwareConfig {
     }
 }
 
+/// Hardware orchestrator configuration — manages llama-server lifecycle and
+/// dynamic GPU layer offloading based on real-time VRAM/RAM telemetry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OrchestratorConfig {
+    /// Enable the hardware orchestrator. When false, llama-server is not managed.
+    pub enabled: bool,
+    /// Telemetry polling interval in seconds.
+    pub poll_interval_secs: u64,
+    /// Free VRAM (MB) below which a yield swap is triggered (sustained).
+    pub yield_threshold_mb: u64,
+    /// Free VRAM (MB) below which an emergency swap fires immediately.
+    pub emergency_threshold_mb: u64,
+    /// Free VRAM (MB) above which recovery to higher ngl is allowed (sustained).
+    pub recover_threshold_mb: u64,
+    /// Minimum seconds between non-emergency transitions.
+    pub cooldown_secs: u64,
+    /// Maximum swap transitions per hour before locking state.
+    pub max_transitions_per_hour: u32,
+    /// Minimum |Δngl| required to trigger a swap (prevents micro-adjustments).
+    pub min_ngl_delta: u32,
+    /// VRAM safety margin (MB) reserved to prevent OOM.
+    pub safety_margin_mb: u64,
+    /// Path or name of the llama-server binary.
+    pub llama_server_binary: String,
+    /// Enable flash attention in llama-server.
+    pub flash_attention: bool,
+    /// Lock model weights in RAM (mlock).
+    pub mlock: bool,
+    /// Batch size for llama-server.
+    pub batch_size: u32,
+    /// macOS: free RAM (MB) below which a yield triggers.
+    pub macos_yield_ram_mb: u64,
+    /// macOS: free RAM (MB) below which an emergency triggers.
+    pub macos_emergency_ram_mb: u64,
+    /// macOS: free RAM (MB) above which recovery is allowed.
+    pub macos_recover_ram_mb: u64,
+    /// Model profile for VRAM budget calculations.
+    pub model_profile: ModelProfile,
+}
+
+/// Per-model memory profile used by the layer strategy calculator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelProfile {
+    /// Total transformer layers in the model.
+    pub total_layers: u32,
+    /// Approximate VRAM per offloaded layer (MB).
+    pub per_layer_vram_mb: u32,
+    /// Base VRAM overhead for CUDA context + embeddings (MB).
+    pub base_vram_overhead_mb: u32,
+    /// KV cache VRAM per 1024 context tokens (MB).
+    pub kv_per_1k_ctx_mb: u32,
+    /// Minimum context window (hard floor — never go below).
+    pub min_context: u32,
+    /// Maximum context window.
+    pub max_context: u32,
+    /// Whether the model has a vision projector (mmproj).
+    pub has_vision_projector: bool,
+    /// Approximate VRAM used by the vision projector (MB). Only relevant when
+    /// `has_vision_projector` is true.
+    #[serde(default)]
+    pub mmproj_vram_mb: u32,
+}
+
+impl Default for OrchestratorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            poll_interval_secs: 2,
+            yield_threshold_mb: 512,
+            emergency_threshold_mb: 128,
+            recover_threshold_mb: 2048,
+            cooldown_secs: 60,
+            max_transitions_per_hour: 6,
+            min_ngl_delta: 3,
+            safety_margin_mb: 256,
+            llama_server_binary: "llama-server".into(),
+            flash_attention: true,
+            mlock: true,
+            batch_size: 256,
+            macos_yield_ram_mb: 2048,
+            macos_emergency_ram_mb: 1024,
+            macos_recover_ram_mb: 4096,
+            model_profile: ModelProfile::default(),
+        }
+    }
+}
+
+impl Default for ModelProfile {
+    fn default() -> Self {
+        Self {
+            total_layers: 28,
+            per_layer_vram_mb: 165,
+            base_vram_overhead_mb: 200,
+            kv_per_1k_ctx_mb: 100,
+            min_context: 2048,
+            max_context: 8192,
+            has_vision_projector: true,
+            mmproj_vram_mb: 1300,
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -224,32 +329,6 @@ fn default_trust_level() -> String {
 }
 
 // ── Defaults ────────────────────────────────────────────────────────
-
-impl Default for KriaConfig {
-    fn default() -> Self {
-        Self {
-            llm: LlmConfig::default(),
-            voice: VoiceConfig::default(),
-            memory: MemoryConfig::default(),
-            safety: SafetyConfig::default(),
-            agent: AgentConfig::default(),
-            server: ServerConfig::default(),
-            ui: UiConfig::default(),
-            search: SearchConfig::default(),
-            mcp: McpConfig::default(),
-            telegram: TelegramConfig::default(),
-            hardware: HardwareConfig::default(),
-        }
-    }
-}
-
-impl Default for McpConfig {
-    fn default() -> Self {
-        Self {
-            servers: Vec::new(),
-        }
-    }
-}
 
 impl Default for LlmConfig {
     fn default() -> Self {
@@ -375,10 +454,69 @@ impl Default for SearchConfig {
 
 impl KriaConfig {
     /// Load config from default paths (convenience method).
+    ///
+    /// Searches for the project's `config/default.toml` by walking up from the
+    /// current exe / CWD (covers both dev and installed layouts). If found it is
+    /// used as the base config and `~/.kria/config.toml` is merged on top as a
+    /// user override.  If no project default is found, `~/.kria/config.toml` is
+    /// used as the sole config (production fallback).
     pub fn load(override_path: Option<&Path>) -> anyhow::Result<Self> {
         let paths = crate::platform::paths::KriaPaths::resolve();
-        let default_path = paths.config_dir.join("config.toml");
-        load_config(&default_path, override_path)
+        let user_config = paths.user_config();
+
+        // Try to locate the project's config/default.toml by walking up from exe
+        // and CWD (whichever finds it first).
+        let project_default = Self::find_project_default();
+
+        match project_default {
+            Some(ref base_path) => {
+                eprintln!("[config] using project default: {}", base_path.display());
+                // Use project default.toml as base, merge user config on top
+                let user_override = if user_config.exists() {
+                    eprintln!("[config] merging user override: {}", user_config.display());
+                    Some(user_config.as_path())
+                } else {
+                    None
+                };
+                let cfg = load_config(base_path, override_path.or(user_override))?;
+                eprintln!("[config] loaded {} model(s), orchestrator.enabled={}", cfg.llm.models.len(), cfg.orchestrator.enabled);
+                Ok(cfg)
+            }
+            None => {
+                eprintln!("[config] no project default.toml found, falling back to {}", user_config.display());
+                // No project default found → fall back to user config as sole source
+                load_config(&user_config, override_path)
+            }
+        }
+    }
+
+    /// Walk up from the current exe and CWD looking for `config/default.toml`.
+    fn find_project_default() -> Option<std::path::PathBuf> {
+        let mut roots: Vec<std::path::PathBuf> = Vec::new();
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(parent) = exe.parent() {
+                roots.push(parent.to_path_buf());
+            }
+        }
+        if let Ok(cwd) = std::env::current_dir() {
+            roots.push(cwd);
+        }
+
+        for start in roots {
+            let mut dir = Some(start.as_path());
+            while let Some(d) = dir {
+                let candidate = d.join("config").join("default.toml");
+                if candidate.exists() {
+                    return Some(candidate);
+                }
+                dir = d.parent();
+                // Don't walk all the way to /
+                if dir.map(|d| d == std::path::Path::new("/")).unwrap_or(true) {
+                    break;
+                }
+            }
+        }
+        None
     }
 
     /// Resolve standard data paths.

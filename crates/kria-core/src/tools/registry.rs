@@ -190,6 +190,12 @@ impl ToolRegistry {
     }
 }
 
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Build the full tool registry with all built-in tools.
 pub fn build_default_registry() -> ToolRegistry {
     build_registry_with_store(None)

@@ -85,3 +85,9 @@ dirs = "5"
 
 # Open URLs/files in default app
 open = "5"
+
+# GPU telemetry (NVIDIA)
+nvml-wrapper = "0.10"
+
+# Async utilities (CancellationToken)
+tokio-util = "0.7"

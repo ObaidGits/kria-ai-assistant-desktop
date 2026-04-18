@@ -71,6 +71,12 @@ impl AudioPlayer {
     }
 }
 
+impl Default for AudioPlayer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Enumerate available output device names.
 pub fn list_output_devices() -> anyhow::Result<Vec<String>> {
     let host = cpal::default_host();

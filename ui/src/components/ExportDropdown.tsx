@@ -28,6 +28,16 @@ const roleLabel = (role: Message["role"]) => {
   }
 };
 
+const toolResultText = (result: unknown): string => {
+  if (result == null) return "";
+  if (typeof result === "string") return result;
+  try {
+    return JSON.stringify(result, null, 2);
+  } catch {
+    return String(result);
+  }
+};
+
 /** Build plain-text export content */
 const buildText = (msgs: Message[], title: string): string => {
   const lines: string[] = [
@@ -43,7 +53,8 @@ const buildText = (msgs: Message[], title: string): string => {
       for (const tc of msg.toolCalls) {
         lines.push(`  ▸ Tool: ${tc.name} [${tc.status}]`);
         if (tc.result) {
-          const preview = tc.result.length > 200 ? tc.result.slice(0, 200) + "…" : tc.result;
+          const resultText = toolResultText(tc.result);
+          const preview = resultText.length > 200 ? resultText.slice(0, 200) + "…" : resultText;
           lines.push(`    Result: ${preview}`);
         }
       }
@@ -83,7 +94,8 @@ const buildMarkdown = (msgs: Message[], title: string): string => {
           lines.push("");
           lines.push("**Result:**");
           lines.push("```");
-          const preview = tc.result.length > 500 ? tc.result.slice(0, 500) + "\n…(truncated)" : tc.result;
+          const resultText = toolResultText(tc.result);
+          const preview = resultText.length > 500 ? resultText.slice(0, 500) + "\n…(truncated)" : resultText;
           lines.push(preview);
           lines.push("```");
         }
@@ -117,9 +129,10 @@ const buildHtml = (msgs: Message[], title: string): string => {
     if (msg.toolCalls && msg.toolCalls.length > 0) {
       const items = msg.toolCalls
         .map((tc) => {
+          const resultText = toolResultText(tc.result);
           const result = tc.result
             ? `<div class="tc-result"><strong>Result:</strong><pre>${escHtml(
-                tc.result.length > 300 ? tc.result.slice(0, 300) + "…" : tc.result
+                resultText.length > 300 ? resultText.slice(0, 300) + "…" : resultText
               )}</pre></div>`
             : "";
           return `<div class="tc"><span class="tc-name">${escHtml(tc.name)}</span> <span class="tc-status">[${tc.status}]</span>${result}</div>`;

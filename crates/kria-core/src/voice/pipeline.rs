@@ -267,7 +267,9 @@ impl VoicePipeline {
                         }
 
                         let result = vad.process(&chunk);
-                        if chunk_count % 20 == 0 || matches!(result, VadResult::SpeechStart | VadResult::SpeechEnd) {
+                        if chunk_count.is_multiple_of(20)
+                            || matches!(result, VadResult::SpeechStart | VadResult::SpeechEnd)
+                        {
                             tracing::debug!(
                                 ?result,
                                 rms,
@@ -549,7 +551,7 @@ fn estimate_partial_stability(sample_count: usize, sample_rate: u32, confidence:
 }
 
 fn clamp01(v: f32) -> f32 {
-    v.max(0.0).min(1.0)
+    v.clamp(0.0, 1.0)
 }
 
 fn rms_energy(samples: &[f32]) -> f32 {

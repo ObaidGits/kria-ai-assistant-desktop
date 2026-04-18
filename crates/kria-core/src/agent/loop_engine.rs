@@ -1,4 +1,4 @@
-use chrono::{Datelike, Duration, Local, TimeZone};
+use chrono::{Datelike, Duration, Local, SecondsFormat, TimeZone, Utc};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::collections::HashSet;
@@ -43,6 +43,23 @@ static TITLE_MARKER_RE: Lazy<Regex> = Lazy::new(|| {
         .expect("valid title marker regex")
 });
 
+static CREATE_TITLE_CONTEXT_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?i)\b(?:create|new|start|make|build|draft|write)\b.*\b(?:google\s+(?:doc|docs|sheet|sheets|slides|form|forms)|document|spreadsheet|presentation|deck|form)\b",
+    )
+    .expect("valid title context regex")
+});
+
+static CREATE_TITLE_FALLBACK_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\b(?:for|about)\s+([^\n\r,.;!?]+)")
+        .expect("valid title fallback regex")
+});
+
+static TITLE_DURATION_ONLY_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)^\d{1,3}\s*(?:minute|minutes|min|hour|hours|hr|hrs)\b")
+        .expect("valid title duration regex")
+});
+
 static CALENDAR_TIME_AMPM_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b").expect("valid calendar ampm time regex")
 });
@@ -55,6 +72,31 @@ static CALENDAR_DURATION_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)\bfor\s+(\d{1,3})\s*(minute|minutes|min|hour|hours|hr|hrs)\b")
         .expect("valid calendar duration regex")
 });
+
+static CALENDAR_ATTENDEE_EMAIL_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\b([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})\b")
+        .expect("valid calendar attendee email regex")
+});
+
+static FORCED_TOOL_DIRECTIVE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?is)^\s*#tool:\s*([a-zA-Z0-9_]+)\s*(.*)$")
+        .expect("valid forced tool directive regex")
+});
+
+static FENCED_CODE_BLOCK_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?is)```(?:[a-z0-9_+\-]+)?\s*(.*?)\s*```")
+        .expect("valid fenced code block regex")
+});
+
+static SENSITIVE_JSON_FIELD_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"(?i)"([^"]*(?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|secret)[^"]*)"\s*:\s*"([^"\n]{12,})""#,
+    )
+    .expect("valid sensitive json field regex")
+});
+
+static MULTI_NEWLINE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\n{3,}").expect("valid multi newline regex"));
 
 fn detect_package_intent(user_text: &str) -> Option<PackageIntent> {
     let text = user_text.to_lowercase();
@@ -231,6 +273,352 @@ fn infer_gmail_list_query(user_text: &str) -> String {
     filters.join(" ")
 }
 
+fn looks_like_raw_gmail_payload_json(block: &str) -> bool {
+    let lower = block.to_ascii_lowercase();
+    if !lower.contains("\"messages\"") {
+        return false;
+    }
+
+    let has_payload_shape_markers = lower.contains("\"query\"")
+        || lower.contains("\"requested_count\"")
+        || lower.contains("\"returned_count\"")
+        || lower.contains("\"llm_visible_message_count\"")
+        || lower.contains("\"count\"")
+        || lower.contains("\"fully_satisfied\"")
+        || lower.contains("\"has_more_results\"");
+
+    let has_gmail_row_markers = lower.contains("\"from\"")
+        || lower.contains("\"subject\"")
+        || lower.contains("\"preview\"")
+        || lower.contains("\"labels\"")
+        || lower.contains("\"date\"")
+        || lower.contains("\"id\"");
+
+    has_payload_shape_markers && has_gmail_row_markers
+}
+
+fn contains_forbidden_payload_markers(block: &str) -> bool {
+    let lower = block.to_ascii_lowercase();
+    [
+        "\"toolbench_rapidapi_key\"",
+        "\"toolbench_rapidapi_url\"",
+        "\"x-rapidapi-key\"",
+        "\"rapidapi_key\"",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+        || SENSITIVE_JSON_FIELD_RE.is_match(block)
+}
+
+fn should_filter_code_block(block: &str) -> bool {
+    let trimmed = block.trim();
+    let json_like = trimmed.starts_with('{') || trimmed.starts_with('[');
+    if !json_like {
+        return false;
+    }
+
+    contains_forbidden_payload_markers(trimmed) || looks_like_raw_gmail_payload_json(trimmed)
+}
+
+fn sanitize_assistant_text_response(text: &str) -> String {
+    if text.trim().is_empty() {
+        return String::new();
+    }
+
+    let filtered_blocks = FENCED_CODE_BLOCK_RE
+        .replace_all(text, |caps: &regex::Captures| {
+            let block = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            if should_filter_code_block(block) {
+                "[Filtered unsafe raw payload omitted.]".to_string()
+            } else {
+                caps.get(0)
+                    .map(|m| m.as_str().to_string())
+                    .unwrap_or_default()
+            }
+        })
+        .to_string();
+
+    let redacted_inline = SENSITIVE_JSON_FIELD_RE
+        .replace_all(&filtered_blocks, |caps: &regex::Captures| {
+            let key = caps.get(1).map(|m| m.as_str()).unwrap_or("secret");
+            format!(r#""{key}": "[REDACTED]""#)
+        })
+        .to_string();
+
+    MULTI_NEWLINE_RE
+        .replace_all(redacted_inline.trim(), "\n\n")
+        .to_string()
+}
+
+fn build_tool_call_history_content(tool_calls: &[ParsedToolCall]) -> String {
+    tool_calls
+        .iter()
+        .map(|call| {
+            format!(
+                "<tool_call>\n{{\"name\":\"{}\",\"arguments\":{}}}\n</tool_call>",
+                call.name, call.arguments
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn is_gmail_tool_name(tool_name: &str) -> bool {
+    matches!(tool_name, "gw_gmail_inbox" | "gw_gmail_search" | "gw_gmail_read")
+}
+
+fn looks_like_spurious_gmail_capability_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    let unsupported = lower.contains("not directly supported")
+        || lower.contains("not supported by the current interface")
+        || lower.contains("use a web browser")
+        || lower.contains("third-party application");
+    let gmail_context = lower.contains("gmail") || lower.contains("email") || lower.contains("inbox");
+    unsupported && gmail_context
+}
+
+fn strip_spurious_gmail_error_lines(text: &str) -> String {
+    let filtered = text
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            let lower = trimmed.to_ascii_lowercase();
+            !lower.starts_with("tool_error:") && !looks_like_spurious_gmail_capability_line(trimmed)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    MULTI_NEWLINE_RE
+        .replace_all(filtered.trim(), "\n\n")
+        .to_string()
+}
+
+fn extract_grounded_gmail_counts(tool_result: &serde_json::Value) -> Option<(u64, u64)> {
+    let payload = tool_result.get("data").unwrap_or(tool_result);
+
+    let requested = payload.get("requested_count").and_then(|v| v.as_u64());
+    let returned = payload.get("returned_count").and_then(|v| v.as_u64()).or_else(|| {
+        payload
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .map(|messages| messages.len() as u64)
+    });
+
+    match (requested, returned) {
+        (Some(req), Some(ret)) => Some((req, ret)),
+        (None, Some(ret)) => Some((ret, ret)),
+        _ => None,
+    }
+}
+
+fn build_grounded_gmail_count_summary(tool_result: &serde_json::Value) -> Option<String> {
+    let (requested, returned) = extract_grounded_gmail_counts(tool_result)?;
+
+    if requested == returned {
+        Some(format!(
+            "I retrieved {returned} grounded Gmail message(s)."
+        ))
+    } else {
+        Some(format!(
+            "I retrieved {returned} grounded Gmail message(s) out of {requested} requested."
+        ))
+    }
+}
+
+fn contains_gmail_placeholder_scaffold(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let has_bracket_placeholders = [
+        "[sender's name]",
+        "[sender’s name]",
+        "[subject of the email]",
+        "[preview of the email]",
+        "[subject]",
+        "[preview]",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+
+    if has_bracket_placeholders {
+        return true;
+    }
+
+    [
+        "the exact content of the second",
+        "the exact content of the third",
+        "is not provided in the available data",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn extract_prefixed_value_case_insensitive<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let trimmed = line.trim();
+    let (prefix, value) = trimmed.split_once(':')?;
+    if !prefix.trim().eq_ignore_ascii_case(key) {
+        return None;
+    }
+
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn normalize_gmail_row_value_for_dedup(value: &str) -> String {
+    compact_text_for_llm(value, LLM_GMAIL_FIELD_MAX_CHARS).to_ascii_lowercase()
+}
+
+fn contains_duplicate_gmail_rows(text: &str) -> bool {
+    let mut seen_ids: HashSet<String> = HashSet::new();
+    let mut id_occurrences = 0usize;
+    let mut duplicate_ids = 0usize;
+
+    let mut seen_from_subject_pairs: HashSet<String> = HashSet::new();
+    let mut duplicate_pairs = 0usize;
+    let mut pending_from: Option<String> = None;
+    let mut pending_subject: Option<String> = None;
+
+    for line in text.lines() {
+        if let Some(id) = extract_prefixed_value_case_insensitive(line, "id") {
+            let normalized_id = normalize_gmail_row_value_for_dedup(id);
+            if !normalized_id.is_empty() {
+                id_occurrences += 1;
+                if !seen_ids.insert(normalized_id) {
+                    duplicate_ids += 1;
+                }
+            }
+        }
+
+        if let Some(from) = extract_prefixed_value_case_insensitive(line, "from") {
+            pending_from = Some(normalize_gmail_row_value_for_dedup(from));
+        }
+
+        if let Some(subject) = extract_prefixed_value_case_insensitive(line, "subject") {
+            pending_subject = Some(normalize_gmail_row_value_for_dedup(subject));
+        }
+
+        if let (Some(from), Some(subject)) = (pending_from.as_ref(), pending_subject.as_ref()) {
+            let signature = format!("{from}|{subject}");
+            if !seen_from_subject_pairs.insert(signature) {
+                duplicate_pairs += 1;
+            }
+            pending_from = None;
+            pending_subject = None;
+        }
+    }
+
+    (id_occurrences >= 2 && duplicate_ids > 0) || duplicate_pairs > 0
+}
+
+fn dedupe_grounded_gmail_messages(messages: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+    let mut deduped: Vec<&serde_json::Value> = Vec::with_capacity(messages.len());
+    let mut seen_ids: HashSet<String> = HashSet::new();
+    let mut seen_from_subject_pairs: HashSet<String> = HashSet::new();
+
+    for message in messages {
+        if let Some(id) = first_non_empty_string_field(
+            message,
+            &["id", "messageId", "message_id", "threadId", "thread_id"],
+            LLM_GMAIL_FIELD_MAX_CHARS,
+        ) {
+            let key = normalize_gmail_row_value_for_dedup(&id);
+            if key.is_empty() || seen_ids.insert(key) {
+                deduped.push(message);
+            }
+            continue;
+        }
+
+        let from = first_non_empty_string_field(
+            message,
+            &["from", "sender", "organizer"],
+            LLM_GMAIL_FIELD_MAX_CHARS,
+        )
+        .unwrap_or_default();
+
+        let subject = first_non_empty_string_field(
+            message,
+            &["subject", "title", "summary"],
+            LLM_GMAIL_FIELD_MAX_CHARS,
+        )
+        .unwrap_or_default();
+
+        let signature = format!(
+            "{}|{}",
+            normalize_gmail_row_value_for_dedup(&from),
+            normalize_gmail_row_value_for_dedup(&subject)
+        );
+
+        if signature == "|" || seen_from_subject_pairs.insert(signature) {
+            deduped.push(message);
+        }
+    }
+
+    deduped
+}
+
+fn build_grounded_gmail_message_list_summary(tool_result: &serde_json::Value) -> Option<String> {
+    let payload = tool_result.get("data").unwrap_or(tool_result);
+    let messages = payload
+        .get("messages")
+        .or_else(|| payload.get("results"))
+        .and_then(|v| v.as_array())?;
+
+    if messages.is_empty() {
+        return build_grounded_gmail_count_summary(tool_result);
+    }
+
+    let deduped_messages = dedupe_grounded_gmail_messages(messages);
+    if deduped_messages.is_empty() {
+        return build_grounded_gmail_count_summary(tool_result);
+    }
+
+    let (requested, returned) = extract_grounded_gmail_counts(tool_result)
+        .unwrap_or((deduped_messages.len() as u64, deduped_messages.len() as u64));
+
+    let returned_for_display = returned.min(deduped_messages.len() as u64);
+    let visible_count = returned_for_display as usize;
+    let mut lines = Vec::with_capacity(1 + visible_count * 3);
+
+    if requested == returned_for_display {
+        lines.push(format!("I retrieved {returned_for_display} grounded Gmail message(s):"));
+    } else {
+        lines.push(format!(
+            "I retrieved {returned_for_display} grounded Gmail message(s) out of {requested} requested:"
+        ));
+    }
+
+    for (index, message) in deduped_messages.iter().take(visible_count).enumerate() {
+        let from = first_non_empty_string_field(
+            message,
+            &["from", "sender", "organizer"],
+            LLM_GMAIL_FIELD_MAX_CHARS,
+        )
+        .unwrap_or_else(|| "Unknown sender".to_string());
+
+        let subject = first_non_empty_string_field(
+            message,
+            &["subject", "title", "summary"],
+            LLM_GMAIL_FIELD_MAX_CHARS,
+        )
+        .unwrap_or_else(|| "(No subject)".to_string());
+
+        let preview = first_non_empty_string_field(
+            message,
+            &["preview", "snippet", "description", "text", "content", "body"],
+            LLM_GMAIL_PREVIEW_MAX_CHARS,
+        )
+        .unwrap_or_else(|| "No preview available.".to_string());
+
+        lines.push(format!("{}. From: {}", index + 1, from));
+        lines.push(format!("   Subject: {}", subject));
+        lines.push(format!("   Preview: {}", preview));
+    }
+
+    Some(lines.join("\n"))
+}
+
 fn has_gmail_list_signal(text_lower: &str) -> bool {
     [
         "unread",
@@ -325,7 +713,65 @@ fn infer_title(user_text: &str, default_title: &str) -> String {
         }
     }
 
+    if let Some(title) = infer_title_from_creation_context(trimmed) {
+        return title;
+    }
+
     default_title.to_string()
+}
+
+fn clean_title_candidate(candidate: &str) -> String {
+    let mut title = candidate
+        .trim()
+        .trim_matches(|c: char| c == '"' || c == '\'' || c == '`')
+        .trim()
+        .to_string();
+
+    loop {
+        let before = title.clone();
+        for prefix in ["a ", "an ", "the "] {
+            if title.to_ascii_lowercase().starts_with(prefix) {
+                title = title[prefix.len()..].trim_start().to_string();
+            }
+        }
+        if title == before {
+            break;
+        }
+    }
+
+    for suffix in [" please", " now", " for me"] {
+        while title.to_ascii_lowercase().ends_with(suffix) {
+            title = title[..title.len().saturating_sub(suffix.len())]
+                .trim_end()
+                .to_string();
+        }
+    }
+
+    title
+}
+
+fn infer_title_from_creation_context(user_text: &str) -> Option<String> {
+    if !CREATE_TITLE_CONTEXT_RE.is_match(user_text) {
+        return None;
+    }
+
+    let caps = CREATE_TITLE_FALLBACK_RE.captures(user_text)?;
+    let candidate = caps.get(1)?.as_str();
+    let title = clean_title_candidate(candidate);
+    if title.is_empty() {
+        return None;
+    }
+
+    let lower = title.to_ascii_lowercase();
+    if TITLE_DURATION_ONLY_RE.is_match(&lower)
+        || ["today", "tomorrow", "next week", "this week"]
+            .iter()
+            .any(|kw| lower == *kw)
+    {
+        return None;
+    }
+
+    Some(title)
 }
 
 fn infer_calendar_time(text_lower: &str) -> Option<(u32, u32)> {
@@ -386,6 +832,20 @@ fn looks_like_google_workspace_request(text_lower: &str) -> bool {
     .any(|needle| text_lower.contains(needle))
 }
 
+fn looks_like_drive_list_request(text_lower: &str) -> bool {
+    let has_drive_context = ["google drive", "drive"]
+        .iter()
+        .any(|needle| text_lower.contains(needle));
+    let has_list_intent = ["list", "show", "browse", "contents", "what is in", "what's in"]
+        .iter()
+        .any(|needle| text_lower.contains(needle));
+    let has_search_intent = ["search", "find", "look for", "locate"]
+        .iter()
+        .any(|needle| text_lower.contains(needle));
+
+    has_drive_context && has_list_intent && !has_search_intent
+}
+
 fn infer_calendar_duration_minutes(text_lower: &str) -> i64 {
     if text_lower.contains("half hour") {
         return 30;
@@ -436,7 +896,25 @@ fn infer_calendar_window(user_text: &str) -> Option<(String, String)> {
         .single()?;
     let end = start + Duration::minutes(infer_calendar_duration_minutes(&lower));
 
-    Some((start.to_rfc3339(), end.to_rfc3339()))
+    let start_utc = start.with_timezone(&Utc);
+    let end_utc = end.with_timezone(&Utc);
+    Some((
+        start_utc.to_rfc3339_opts(SecondsFormat::Secs, true),
+        end_utc.to_rfc3339_opts(SecondsFormat::Secs, true),
+    ))
+}
+
+fn infer_calendar_attendees(user_text: &str) -> Vec<String> {
+    let mut attendees = Vec::new();
+    for caps in CALENDAR_ATTENDEE_EMAIL_RE.captures_iter(user_text) {
+        if let Some(matched) = caps.get(1) {
+            let email = matched.as_str().trim().to_ascii_lowercase();
+            if !email.is_empty() && !attendees.iter().any(|e: &String| e == &email) {
+                attendees.push(email);
+            }
+        }
+    }
+    attendees
 }
 
 fn infer_calendar_summary(user_text: &str) -> String {
@@ -468,8 +946,9 @@ fn infer_calendar_summary(user_text: &str) -> String {
 fn infer_calendar_create_arguments(user_text: &str) -> Option<serde_json::Value> {
     let (start, end) = infer_calendar_window(user_text)?;
     let lower = user_text.to_lowercase();
+    let attendees = infer_calendar_attendees(user_text);
 
-    Some(serde_json::json!({
+    let mut args = serde_json::json!({
         "summary": infer_calendar_summary(user_text),
         "start": start,
         "end": end,
@@ -479,7 +958,18 @@ fn infer_calendar_create_arguments(user_text: &str) -> Option<serde_json::Value>
             ""
         },
         "location": "",
-    }))
+    });
+
+    if !attendees.is_empty() {
+        args["attendees"] = serde_json::Value::Array(
+            attendees
+                .into_iter()
+                .map(|email| serde_json::json!({ "email": email }))
+                .collect(),
+        );
+    }
+
+    Some(args)
 }
 
 fn infer_file_search_target(user_text: &str) -> Option<String> {
@@ -516,24 +1006,35 @@ fn infer_file_search_target(user_text: &str) -> Option<String> {
     None
 }
 
-fn build_intent_fallback_tool_call(
-    user_text: &str,
+fn extract_forced_tool_directive(user_text: &str) -> Option<(String, String)> {
+    let caps = FORCED_TOOL_DIRECTIVE_RE.captures(user_text.trim())?;
+    let tool = caps.get(1)?.as_str().trim().to_string();
+    if tool.is_empty() {
+        return None;
+    }
+    let query = caps
+        .get(2)
+        .map(|m| m.as_str().trim().to_string())
+        .unwrap_or_default();
+    Some((tool, query))
+}
+
+fn build_fallback_call_for_hint(
+    hint: &str,
+    user_query: &str,
     allowed_tool_names: &HashSet<String>,
 ) -> Option<ParsedToolCall> {
-    let intent = IntentRouter::classify(user_text);
-    let hint = intent.tool_hint?;
-    let user_query = user_text.trim();
     if user_query.is_empty() {
         return None;
     }
 
     let lower = user_query.to_lowercase();
 
-    match hint.as_str() {
+    match hint {
         "gw_gmail_inbox" if allowed_tool_names.contains("gw_gmail_inbox") => {
             let args = serde_json::json!({
                 "query": infer_gmail_list_query(user_query),
-                "max_results": infer_requested_limit(user_query, 10, 50),
+                "max_results": infer_requested_limit(user_query, 10, 200),
             });
 
             Some(ParsedToolCall {
@@ -548,7 +1049,7 @@ fn build_intent_fallback_tool_call(
                 name: "gw_gmail_search".into(),
                 arguments: serde_json::json!({
                     "query": query,
-                    "max_results": infer_requested_limit(user_query, 10, 50),
+                    "max_results": infer_requested_limit(user_query, 10, 200),
                 }),
             })
         }
@@ -584,11 +1085,24 @@ fn build_intent_fallback_tool_call(
             }
         }
         "gw_drive_search" if allowed_tool_names.contains("gw_drive_search") => {
+            if looks_like_drive_list_request(&lower) && allowed_tool_names.contains("gw_drive_list") {
+                Some(ParsedToolCall {
+                    name: "gw_drive_list".into(),
+                    arguments: serde_json::json!({}),
+                })
+            } else {
+                Some(ParsedToolCall {
+                    name: "gw_drive_search".into(),
+                    arguments: serde_json::json!({
+                        "query": user_query,
+                    }),
+                })
+            }
+        }
+        "gw_drive_list" if allowed_tool_names.contains("gw_drive_list") => {
             Some(ParsedToolCall {
-                name: "gw_drive_search".into(),
-                arguments: serde_json::json!({
-                    "query": user_query,
-                }),
+                name: "gw_drive_list".into(),
+                arguments: serde_json::json!({}),
             })
         }
         "gw_docs_create" if allowed_tool_names.contains("gw_docs_create") => Some(ParsedToolCall {
@@ -613,15 +1127,13 @@ fn build_intent_fallback_tool_call(
                 }),
             })
         }
-        "mcp_gworkspace_listForms" if allowed_tool_names.contains("mcp_gworkspace_listForms") => {
+        "gw_forms_list" if allowed_tool_names.contains("gw_forms_list") => Some(ParsedToolCall {
+            name: "gw_forms_list".into(),
+            arguments: serde_json::json!({}),
+        }),
+        "gw_forms_create" if allowed_tool_names.contains("gw_forms_create") => {
             Some(ParsedToolCall {
-                name: "mcp_gworkspace_listForms".into(),
-                arguments: serde_json::json!({}),
-            })
-        }
-        "mcp_gworkspace_createForm" if allowed_tool_names.contains("mcp_gworkspace_createForm") => {
-            Some(ParsedToolCall {
-                name: "mcp_gworkspace_createForm".into(),
+                name: "gw_forms_create".into(),
                 arguments: serde_json::json!({
                     "title": infer_title(user_query, "Untitled Form"),
                 }),
@@ -716,6 +1228,406 @@ fn build_intent_fallback_tool_call(
         }),
         _ => None,
     }
+}
+
+fn build_intent_fallback_tool_call(
+    user_text: &str,
+    allowed_tool_names: &HashSet<String>,
+) -> Option<ParsedToolCall> {
+    if let Some((forced_tool, forced_query)) = extract_forced_tool_directive(user_text) {
+        let query = if forced_query.trim().is_empty() {
+            user_text.trim()
+        } else {
+            forced_query.trim()
+        };
+        return build_fallback_call_for_hint(&forced_tool, query, allowed_tool_names);
+    }
+
+    let intent = IntentRouter::classify(user_text);
+    let hint = intent.tool_hint?;
+    let user_query = user_text.trim();
+    build_fallback_call_for_hint(hint.as_str(), user_query, allowed_tool_names)
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolChoiceCandidate {
+    pub name: String,
+    pub label: String,
+    pub reason: String,
+    pub confidence: f32,
+}
+
+fn tool_choice_label(name: &str) -> String {
+    match name {
+        "search_news" => "News Search".into(),
+        "web_search" | "searxng_search" => "Web Search".into(),
+        "search_files" | "find_files_by_pattern" | "mcp_fs_search_files" => "File Search".into(),
+        "gw_gmail_inbox" | "gw_gmail_search" => "Gmail".into(),
+        "gw_calendar_today" | "gw_calendar_search" | "gw_calendar_create" => "Google Calendar".into(),
+        "gw_drive_search" | "gw_drive_list" | "gw_drive_read" => "Google Drive".into(),
+        "gw_docs_create" | "gw_docs_read" | "gw_docs_edit" => "Google Docs".into(),
+        "gw_sheets_create" | "gw_sheets_read" | "gw_sheets_edit" => "Google Sheets".into(),
+        "gw_slides_create" | "gw_slides_read" => "Google Slides".into(),
+        "gw_forms_list" | "gw_forms_create" => "Google Forms".into(),
+        other => other.to_string(),
+    }
+}
+
+fn push_tool_choice_candidate(
+    candidates: &mut Vec<ToolChoiceCandidate>,
+    allowed_tool_names: &HashSet<String>,
+    name: &str,
+    reason: &str,
+    confidence: f32,
+) {
+    if !allowed_tool_names.contains(name) {
+        return;
+    }
+
+    if candidates.iter().any(|c| c.name == name) {
+        return;
+    }
+
+    candidates.push(ToolChoiceCandidate {
+        name: name.to_string(),
+        label: tool_choice_label(name),
+        reason: reason.to_string(),
+        confidence,
+    });
+}
+
+fn build_tool_choice_candidates(
+    user_text: &str,
+    allowed_tool_names: &HashSet<String>,
+    primary_hint: Option<&str>,
+    confidence: f32,
+) -> Vec<ToolChoiceCandidate> {
+    let mut candidates: Vec<ToolChoiceCandidate> = Vec::new();
+    let lower = user_text.to_lowercase();
+
+    if let Some(primary) = primary_hint {
+        push_tool_choice_candidate(
+            &mut candidates,
+            allowed_tool_names,
+            primary,
+            "Primary match from intent classifier",
+            confidence,
+        );
+    }
+
+    if lower.contains("news") || lower.contains("headline") {
+        push_tool_choice_candidate(
+            &mut candidates,
+            allowed_tool_names,
+            "search_news",
+            "Best for current events and corroborated headlines",
+            0.62,
+        );
+    }
+
+    if lower.contains("search") || lower.contains("online") || lower.contains("web") {
+        push_tool_choice_candidate(
+            &mut candidates,
+            allowed_tool_names,
+            "web_search",
+            "Best for broad web lookups",
+            0.60,
+        );
+        push_tool_choice_candidate(
+            &mut candidates,
+            allowed_tool_names,
+            "searxng_search",
+            "Best for self-hosted/privacy web lookups",
+            0.58,
+        );
+    }
+
+    if lower.contains("file") || lower.contains("folder") || lower.contains("directory") {
+        push_tool_choice_candidate(
+            &mut candidates,
+            allowed_tool_names,
+            "mcp_fs_search_files",
+            "Best for workspace/filesystem search",
+            0.61,
+        );
+        push_tool_choice_candidate(
+            &mut candidates,
+            allowed_tool_names,
+            "find_files_by_pattern",
+            "Best for local file pattern lookup",
+            0.57,
+        );
+    }
+
+    if looks_like_google_workspace_request(&lower) {
+        for tool in [
+            "gw_gmail_inbox",
+            "gw_calendar_search",
+            "gw_drive_list",
+            "gw_drive_search",
+            "gw_docs_create",
+            "gw_sheets_create",
+            "gw_slides_create",
+            "gw_forms_list",
+        ] {
+            push_tool_choice_candidate(
+                &mut candidates,
+                allowed_tool_names,
+                tool,
+                "Google Workspace request detected",
+                0.56,
+            );
+        }
+    }
+
+    candidates.truncate(6);
+    candidates
+}
+
+fn build_grounding_count_note(tool_name: &str, tool_result: &serde_json::Value) -> Option<String> {
+    if !tool_name.starts_with("gw_") {
+        return None;
+    }
+
+    let payload = tool_result.get("data").unwrap_or(tool_result);
+    let requested = payload
+        .get("requested_count")
+        .and_then(|v| v.as_u64())?;
+    let returned = payload
+        .get("returned_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(requested);
+
+    if let Some(visible) = payload
+        .get("llm_visible_message_count")
+        .and_then(|v| v.as_u64())
+    {
+        if visible < returned {
+            return Some(format!(
+                "GROUNDING_NOTE: requested {requested} item(s), returned {returned} grounded item(s), but only {visible} row(s) are visible in this context. Do NOT invent or duplicate hidden rows; enumerate at most {visible} visible row(s) and mention that additional rows were omitted."
+            ));
+        }
+    }
+
+    Some(format!(
+        "GROUNDING_NOTE: requested {requested} item(s), returned {returned} grounded item(s). Never claim or enumerate more than {returned}."
+    ))
+}
+
+const LLM_GMAIL_MESSAGES_CHAR_BUDGET: usize = 3500;
+const LLM_GMAIL_PREVIEW_MAX_CHARS: usize = 220;
+const LLM_GMAIL_FIELD_MAX_CHARS: usize = 160;
+const LLM_GMAIL_WARNING_MAX_CHARS: usize = 180;
+const LLM_GMAIL_WARNING_LIMIT: usize = 3;
+
+fn compact_text_for_llm(raw: &str, max_chars: usize) -> String {
+    let filtered: String = raw
+        .chars()
+        .filter(|ch| {
+            !matches!(
+                *ch,
+                '\u{034F}' | '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}' | '\u{FEFF}'
+            )
+        })
+        .collect();
+    let collapsed = filtered.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    let trimmed = collapsed.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+
+    let mut truncated: String = trimmed.chars().take(max_chars).collect();
+    truncated.push_str("...");
+    truncated
+}
+
+fn first_non_empty_string_field(message: &serde_json::Value, keys: &[&str], max_chars: usize) -> Option<String> {
+    keys.iter().find_map(|key| {
+        message
+            .get(*key)
+            .and_then(|v| v.as_str())
+            .map(|v| compact_text_for_llm(v, max_chars))
+            .filter(|v| !v.is_empty())
+    })
+}
+
+fn compact_gmail_message_for_llm(message: &serde_json::Value) -> serde_json::Value {
+    if !message.is_object() {
+        return message.clone();
+    }
+
+    let mut compacted = serde_json::Map::new();
+
+    if let Some(subject) = first_non_empty_string_field(
+        message,
+        &["subject", "title", "summary"],
+        LLM_GMAIL_FIELD_MAX_CHARS,
+    ) {
+        compacted.insert("subject".into(), serde_json::Value::String(subject));
+    }
+
+    if let Some(from) = first_non_empty_string_field(
+        message,
+        &["from", "sender", "organizer"],
+        LLM_GMAIL_FIELD_MAX_CHARS,
+    ) {
+        compacted.insert("from".into(), serde_json::Value::String(from));
+    }
+
+    if let Some(date) = first_non_empty_string_field(
+        message,
+        &["date", "updated", "created"],
+        LLM_GMAIL_FIELD_MAX_CHARS,
+    ) {
+        compacted.insert("date".into(), serde_json::Value::String(date));
+    }
+
+    if let Some(id) = first_non_empty_string_field(
+        message,
+        &["id", "messageId", "message_id", "threadId", "thread_id"],
+        LLM_GMAIL_FIELD_MAX_CHARS,
+    ) {
+        compacted.insert("id".into(), serde_json::Value::String(id));
+    }
+
+    if let Some(preview) = first_non_empty_string_field(
+        message,
+        &["preview", "snippet", "description", "text", "content", "body"],
+        LLM_GMAIL_PREVIEW_MAX_CHARS,
+    ) {
+        compacted.insert("preview".into(), serde_json::Value::String(preview));
+    }
+
+    if let Some(url) = first_non_empty_string_field(
+        message,
+        &["url", "htmlLink", "webViewLink", "alternateLink"],
+        LLM_GMAIL_FIELD_MAX_CHARS,
+    ) {
+        compacted.insert("url".into(), serde_json::Value::String(url));
+    }
+
+    serde_json::Value::Object(compacted)
+}
+
+fn compact_gmail_messages_for_llm(messages: &[serde_json::Value]) -> (Vec<serde_json::Value>, usize) {
+    let mut visible = Vec::new();
+    let mut used_chars = 0usize;
+    let mut omitted = 0usize;
+
+    for (index, message) in messages.iter().enumerate() {
+        let compacted = compact_gmail_message_for_llm(message);
+        let chunk_len = compacted.to_string().len();
+
+        if index == 0 || used_chars + chunk_len <= LLM_GMAIL_MESSAGES_CHAR_BUDGET {
+            used_chars += chunk_len;
+            visible.push(compacted);
+        } else {
+            omitted += 1;
+        }
+    }
+
+    (visible, omitted)
+}
+
+fn compact_gmail_payload_for_llm(payload: &serde_json::Value) -> serde_json::Value {
+    let Some(payload_obj) = payload.as_object() else {
+        return payload.clone();
+    };
+
+    let mut compacted = payload_obj.clone();
+
+    if let Some(query) = compacted.get("query").and_then(|v| v.as_str()) {
+        compacted.insert(
+            "query".into(),
+            serde_json::Value::String(compact_text_for_llm(query, LLM_GMAIL_FIELD_MAX_CHARS)),
+        );
+    }
+
+    if let Some(warnings) = compacted.get("warnings").and_then(|v| v.as_array()) {
+        let compacted_warnings: Vec<serde_json::Value> = warnings
+            .iter()
+            .take(LLM_GMAIL_WARNING_LIMIT)
+            .filter_map(|warning| warning.as_str())
+            .map(|warning| {
+                serde_json::Value::String(compact_text_for_llm(
+                    warning,
+                    LLM_GMAIL_WARNING_MAX_CHARS,
+                ))
+            })
+            .collect();
+        compacted.insert("warnings".into(), serde_json::Value::Array(compacted_warnings));
+    }
+
+    let messages = compacted
+        .get("messages")
+        .or_else(|| compacted.get("results"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    if !messages.is_empty() {
+        let total = messages.len();
+        let (visible_messages, omitted_messages) = compact_gmail_messages_for_llm(&messages);
+        compacted.insert("messages".into(), serde_json::Value::Array(visible_messages.clone()));
+        compacted.insert(
+            "llm_visible_message_count".into(),
+            serde_json::json!(visible_messages.len()),
+        );
+        if omitted_messages > 0 {
+            compacted.insert(
+                "llm_omitted_message_count".into(),
+                serde_json::json!(omitted_messages),
+            );
+            compacted.insert(
+                "warnings".into(),
+                match compacted.get("warnings").and_then(|v| v.as_array()) {
+                    Some(existing) => {
+                        let mut merged = existing.clone();
+                        merged.push(serde_json::Value::String(format!(
+                            "{} Gmail message(s) omitted from LLM context to stay within context budget.",
+                            omitted_messages
+                        )));
+                        serde_json::Value::Array(merged)
+                    }
+                    None => serde_json::Value::Array(vec![serde_json::Value::String(format!(
+                        "{} Gmail message(s) omitted from LLM context to stay within context budget.",
+                        omitted_messages
+                    ))]),
+                },
+            );
+        } else {
+            compacted.remove("llm_omitted_message_count");
+        }
+        compacted.insert("count".into(), serde_json::json!(total));
+    }
+
+    serde_json::Value::Object(compacted)
+}
+
+fn compact_tool_result_for_llm(tool_name: &str, tool_result: &serde_json::Value) -> serde_json::Value {
+    let is_gmail_tool = matches!(tool_name, "gw_gmail_inbox" | "gw_gmail_search");
+    if !is_gmail_tool {
+        return tool_result.clone();
+    }
+
+    if tool_result
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .map(|provider| provider.eq_ignore_ascii_case("google_workspace"))
+        .unwrap_or(false)
+    {
+        let mut envelope = tool_result.clone();
+        if let Some(env_obj) = envelope.as_object_mut() {
+            env_obj.remove("raw_text");
+            if let Some(payload) = env_obj.get_mut("data") {
+                *payload = compact_gmail_payload_for_llm(payload);
+            }
+        }
+        return envelope;
+    }
+
+    compact_gmail_payload_for_llm(tool_result)
 }
 
 #[derive(Debug, Clone)]
@@ -1016,6 +1928,13 @@ pub enum StreamEvent {
     },
     /// Approval result.
     ApprovalResult { action: String, approved: bool },
+    /// Tool choice confirmation required for low-confidence routing.
+    ToolChoiceRequired {
+        query: String,
+        confidence: f32,
+        min_confidence: f32,
+        candidates: Vec<ToolChoiceCandidate>,
+    },
     /// Planning step.
     Plan(String),
     /// Error.
@@ -1036,6 +1955,8 @@ pub struct AgentLoop {
     rollback_mgr: Arc<RollbackManager>,
     max_tool_rounds: usize,
     hardware_tier: String,
+    min_confidence_to_act: f32,
+    clarify_threshold: f32,
 }
 
 impl AgentLoop {
@@ -1058,6 +1979,8 @@ impl AgentLoop {
             rollback_mgr,
             max_tool_rounds: 10,
             hardware_tier: "standard".into(),
+            min_confidence_to_act: 0.55,
+            clarify_threshold: 0.40,
         }
     }
 
@@ -1078,6 +2001,21 @@ impl AgentLoop {
         self
     }
 
+    /// Configure confidence thresholds for autonomous intent fallback.
+    pub fn with_confidence_thresholds(
+        mut self,
+        min_confidence_to_act: f32,
+        clarify_threshold: f32,
+    ) -> Self {
+        if (0.0..=1.0).contains(&min_confidence_to_act) {
+            self.min_confidence_to_act = min_confidence_to_act;
+        }
+        if (0.0..=1.0).contains(&clarify_threshold) {
+            self.clarify_threshold = clarify_threshold;
+        }
+        self
+    }
+
     /// Run the agent loop for a single user turn.
     /// Returns a channel of StreamEvents.
     pub async fn run(
@@ -1087,7 +2025,7 @@ impl AgentLoop {
         event_tx: mpsc::UnboundedSender<StreamEvent>,
     ) {
         // Check if the user message contains images and route accordingly
-        let has_images = messages.last().map_or(false, |m| m.has_images());
+        let has_images = messages.last().is_some_and(|m| m.has_images());
 
         let backend = if has_images {
             match self.model_router.route_vision().await {
@@ -1175,6 +2113,11 @@ impl AgentLoop {
         let mut approved_this_turn: HashSet<String> = HashSet::new();
         let mut package_flow = PackageFlowState::from_user_text(&last_user_text);
         let mut intent_fallback_used = false;
+        let mut had_successful_gmail_tool = false;
+        let mut had_failed_gmail_tool = false;
+        let mut last_successful_gmail_result: Option<serde_json::Value> = None;
+        let intent_result = IntentRouter::classify(&last_user_text);
+        let forced_tool_requested = extract_forced_tool_directive(&last_user_text).is_some();
 
         for _round in 0..self.max_tool_rounds {
             // Call LLM
@@ -1222,7 +2165,8 @@ impl AgentLoop {
                     .collect();
                 parse_tool_calls_with_known(&response.content, &known)
             };
-            let text_response = extract_text_response(&response.content);
+            let text_response_raw = extract_text_response(&response.content);
+            let text_response = sanitize_assistant_text_response(&text_response_raw);
 
             let mut synthetic_package_calls = false;
             let mut synthetic_intent_calls = false;
@@ -1243,13 +2187,36 @@ impl AgentLoop {
                 if let Some(fallback_call) =
                     build_intent_fallback_tool_call(&last_user_text, &allowed_tool_names)
                 {
-                    intent_fallback_used = true;
-                    synthetic_intent_calls = true;
-                    let _ = event_tx.send(StreamEvent::Plan(format!(
-                        "No tool call returned; applying intent fallback via {}",
-                        fallback_call.name
-                    )));
-                    tool_calls = vec![fallback_call];
+                    if forced_tool_requested || intent_result.confidence >= self.min_confidence_to_act
+                    {
+                        intent_fallback_used = true;
+                        synthetic_intent_calls = true;
+                        let _ = event_tx.send(StreamEvent::Plan(format!(
+                            "No tool call returned; applying intent fallback via {}",
+                            fallback_call.name
+                        )));
+                        tool_calls = vec![fallback_call];
+                    } else if intent_result.confidence >= self.clarify_threshold {
+                        let candidates = build_tool_choice_candidates(
+                            &last_user_text,
+                            &allowed_tool_names,
+                            intent_result.tool_hint.as_deref(),
+                            intent_result.confidence,
+                        );
+
+                        if !candidates.is_empty() {
+                            let _ = event_tx.send(StreamEvent::ToolChoiceRequired {
+                                query: last_user_text.clone(),
+                                confidence: intent_result.confidence,
+                                min_confidence: self.min_confidence_to_act,
+                                candidates,
+                            });
+                            let _ = event_tx.send(StreamEvent::Done(
+                                "Please choose a tool so I can continue this request.".into(),
+                            ));
+                            return;
+                        }
+                    }
                 }
             }
 
@@ -1262,9 +2229,64 @@ impl AgentLoop {
                         return;
                     }
                 }
-                if !text_response.is_empty() {
-                    let _ = event_tx.send(StreamEvent::Token(text_response.clone()));
-                    let _ = event_tx.send(StreamEvent::Done(text_response));
+                let mut final_text = if had_successful_gmail_tool && !had_failed_gmail_tool {
+                    strip_spurious_gmail_error_lines(&text_response)
+                } else {
+                    text_response.clone()
+                };
+
+                if had_successful_gmail_tool && !had_failed_gmail_tool && !final_text.is_empty() {
+                    let has_placeholder_scaffold = contains_gmail_placeholder_scaffold(&final_text);
+                    let has_raw_payload = looks_like_raw_gmail_payload_json(final_text.trim());
+                    let has_duplicate_rows = contains_duplicate_gmail_rows(&final_text);
+                    let should_force_grounded =
+                        has_placeholder_scaffold || has_raw_payload || has_duplicate_rows;
+
+                    if should_force_grounded {
+                        if let Some(grounded_summary) = last_successful_gmail_result
+                            .as_ref()
+                            .and_then(build_grounded_gmail_message_list_summary)
+                        {
+                            tracing::warn!(
+                                has_images,
+                                round = _round,
+                                has_placeholder_scaffold,
+                                has_raw_payload,
+                                has_duplicate_rows,
+                                "LLM returned non-grounded Gmail response; replacing with grounded summary"
+                            );
+                            final_text = grounded_summary;
+                        }
+                    }
+                }
+
+                if !final_text.is_empty() {
+                    let _ = event_tx.send(StreamEvent::Token(final_text.clone()));
+                    let _ = event_tx.send(StreamEvent::Done(final_text));
+                } else if had_successful_gmail_tool && !had_failed_gmail_tool {
+                    if let Some(summary) = last_successful_gmail_result
+                        .as_ref()
+                        .and_then(build_grounded_gmail_count_summary)
+                    {
+                        tracing::info!(
+                            has_images,
+                            round = _round,
+                            "LLM returned empty response with no tool calls; using grounded Gmail count summary"
+                        );
+                        let _ = event_tx.send(StreamEvent::Token(summary.clone()));
+                        let _ = event_tx.send(StreamEvent::Done(summary));
+                    } else {
+                        let fallback =
+                            "I could not generate a response for this request. Please try again."
+                                .to_string();
+                        tracing::warn!(
+                            has_images,
+                            round = _round,
+                            "LLM returned empty response with no tool calls and no grounded Gmail summary"
+                        );
+                        let _ = event_tx.send(StreamEvent::Token(fallback.clone()));
+                        let _ = event_tx.send(StreamEvent::Done(fallback));
+                    }
                 } else {
                     let fallback =
                         "I could not generate a response for this request. Please try again."
@@ -1280,15 +2302,11 @@ impl AgentLoop {
                 return;
             }
 
-            if !synthetic_package_calls && !synthetic_intent_calls && !text_response.is_empty() {
-                let _ = event_tx.send(StreamEvent::Token(text_response.clone()));
-            }
-
             // Add assistant message to history
             if !synthetic_package_calls && !synthetic_intent_calls {
                 messages.push(ChatMessage {
                     role: "assistant".into(),
-                    content: response.content.clone(),
+                    content: build_tool_call_history_content(&tool_calls),
                     name: None,
                     images: None,
                 });
@@ -1488,6 +2506,15 @@ impl AgentLoop {
                     flow.observe_tool_result(call, tool_result.success, &tool_result.data);
                 }
 
+                if is_gmail_tool_name(&call.name) {
+                    if tool_result.success {
+                        had_successful_gmail_tool = true;
+                        last_successful_gmail_result = Some(tool_result.data.clone());
+                    } else {
+                        had_failed_gmail_tool = true;
+                    }
+                }
+
                 // Log GREEN/YELLOW auto-executed
                 if !decision.requires_approval {
                     self.audit_logger.log(
@@ -1503,6 +2530,7 @@ impl AgentLoop {
                 // Build the string the LLM will see.
                 // IMPORTANT: if the tool failed, send the error — not "null" —
                 // so the LLM knows to report the failure instead of hallucinating.
+                let llm_tool_result = compact_tool_result_for_llm(&call.name, &tool_result.data);
                 let result_str = if !tool_result.success {
                     let err_msg = tool_result
                         .error
@@ -1510,7 +2538,7 @@ impl AgentLoop {
                         .unwrap_or("tool execution failed with no details");
                     format!("TOOL_ERROR: {err_msg}")
                 } else {
-                    tool_result.data.to_string()
+                    llm_tool_result.to_string()
                 };
                 let truncated = if result_str.len() > TOOL_RESULT_MAX_CHARS {
                     format!("{}...<truncated>", &result_str[..TOOL_RESULT_MAX_CHARS])
@@ -1537,6 +2565,12 @@ impl AgentLoop {
                     )
                 } else {
                     truncated
+                };
+
+                let tool_msg = if let Some(note) = build_grounding_count_note(&call.name, &llm_tool_result) {
+                    format!("{tool_msg}\n\n{note}")
+                } else {
+                    tool_msg
                 };
 
                 messages.push(ChatMessage {
@@ -1599,11 +2633,11 @@ impl AgentLoop {
             {
                 Ok(result) if result.success => {
                     // Return summary only to save tokens
-                    if let Some(summary) = result.data.get("summary").and_then(|s| s.as_str()) {
-                        Some(format!("[{}] {}", target_tool, summary))
-                    } else {
-                        None
-                    }
+                    result
+                        .data
+                        .get("summary")
+                        .and_then(|s| s.as_str())
+                        .map(|summary| format!("[{}] {}", target_tool, summary))
                 }
                 _ => None,
             }
@@ -1777,6 +2811,457 @@ mod tests {
     }
 
     #[test]
+    fn grounding_count_note_uses_google_requested_and_returned_counts() {
+        let tool_result = serde_json::json!({
+            "provider": "google_workspace",
+            "data": {
+                "requested_count": 5,
+                "returned_count": 3,
+            }
+        });
+
+        let note = build_grounding_count_note("gw_gmail_inbox", &tool_result)
+            .expect("expected grounding note");
+
+        assert!(note.contains("requested 5"));
+        assert!(note.contains("returned 3"));
+        assert!(note.contains("Never claim or enumerate more than 3"));
+    }
+
+        #[test]
+        fn sanitize_assistant_text_response_filters_sensitive_json_blocks() {
+                let raw = r#"The latest unread emails are listed above.
+
+```json
+{
+    "data": {"messages": []},
+    "toolbench_rapidapi_key": "088440d910mshef857391f2fc461p17ae9ejsnaebc918926ff"
+}
+```
+
+Please open Gmail for full details."#;
+
+                let sanitized = sanitize_assistant_text_response(raw);
+                assert!(sanitized.contains("The latest unread emails are listed above."));
+                assert!(sanitized.contains("[Filtered unsafe raw payload omitted.]"));
+                assert!(!sanitized.contains("toolbench_rapidapi_key"));
+                assert!(!sanitized.contains("088440d910mshef857391f2fc461p17ae9ejsnaebc918926ff"));
+        }
+
+        #[test]
+        fn sanitize_assistant_text_response_filters_raw_gmail_payload_blocks() {
+                let raw = r#"```json
+{
+    "query": "in:inbox is:unread",
+    "requested_count": 3,
+    "returned_count": 3,
+    "messages": [
+        {"id": "m1", "from": "sender@example.com"}
+    ]
+}
+```"#;
+
+                let sanitized = sanitize_assistant_text_response(raw);
+                assert_eq!(sanitized.trim(), "[Filtered unsafe raw payload omitted.]");
+        }
+
+        #[test]
+        fn sanitize_assistant_text_response_filters_gmail_payload_without_query_field() {
+                let raw = r#"```json
+{
+    "data": {
+        "count": 3,
+        "fully_satisfied": true,
+        "messages": [
+            {
+                "from": "owner@example.com",
+                "date": "Sat, 18 Apr 2026 05:49:26 +0000",
+                "id": "m1",
+                "preview": "You have been invited"
+            }
+        ]
+    }
+}
+```"#;
+
+                let sanitized = sanitize_assistant_text_response(raw);
+                assert_eq!(sanitized.trim(), "[Filtered unsafe raw payload omitted.]");
+        }
+
+        #[test]
+        fn sanitize_assistant_text_response_preserves_normal_code_blocks() {
+                let raw = r#"Use this helper:
+
+```python
+print("hello")
+```
+"#;
+
+                let sanitized = sanitize_assistant_text_response(raw);
+                assert!(sanitized.contains("print(\"hello\")"));
+                assert!(sanitized.contains("```python"));
+        }
+
+            #[test]
+            fn build_tool_call_history_content_outputs_canonical_calls_only() {
+                let calls = vec![
+                    ParsedToolCall {
+                        name: "gw_gmail_inbox".into(),
+                        arguments: serde_json::json!({
+                            "query": "in:inbox is:unread",
+                            "max_results": 3
+                        }),
+                    },
+                    ParsedToolCall {
+                        name: "gw_gmail_read".into(),
+                        arguments: serde_json::json!({ "message_id": "abc123" }),
+                    },
+                ];
+
+                let serialized = build_tool_call_history_content(&calls);
+
+                assert!(serialized.contains("<tool_call>"));
+                assert!(serialized.contains("\"name\":\"gw_gmail_inbox\""));
+                assert!(serialized.contains("\"name\":\"gw_gmail_read\""));
+                assert!(!serialized.contains("TOOL_ERROR"));
+            }
+
+            #[test]
+            fn strip_spurious_gmail_error_lines_removes_tool_error_and_capability_claims() {
+                let raw = "Fetched 3 unread emails.\nTOOL_ERROR: The operation to fetch emails is not directly supported by the current interface. Please use a web browser or a third-party application for checking your Gmail inbox.\nDone.";
+                let cleaned = strip_spurious_gmail_error_lines(raw);
+
+                assert!(cleaned.contains("Fetched 3 unread emails."));
+                assert!(cleaned.contains("Done."));
+                assert!(!cleaned.contains("TOOL_ERROR:"));
+                assert!(!cleaned.contains("not directly supported"));
+                assert!(!cleaned.contains("third-party application"));
+            }
+
+    #[test]
+    fn grounded_gmail_count_summary_uses_requested_and_returned_counts() {
+        let tool_result = serde_json::json!({
+            "provider": "google_workspace",
+            "kind": "gmail",
+            "data": {
+                "requested_count": 5,
+                "returned_count": 3,
+            }
+        });
+
+        let summary = build_grounded_gmail_count_summary(&tool_result)
+            .expect("expected grounded Gmail count summary");
+
+        assert_eq!(
+            summary,
+            "I retrieved 3 grounded Gmail message(s) out of 5 requested."
+        );
+    }
+
+    #[test]
+    fn grounded_gmail_count_summary_uses_message_count_fallback() {
+        let tool_result = serde_json::json!({
+            "provider": "google_workspace",
+            "kind": "gmail",
+            "data": {
+                "messages": [
+                    {"id": "m1"},
+                    {"id": "m2"}
+                ]
+            }
+        });
+
+        let summary = build_grounded_gmail_count_summary(&tool_result)
+            .expect("expected grounded Gmail count summary");
+
+        assert_eq!(summary, "I retrieved 2 grounded Gmail message(s).");
+    }
+
+    #[test]
+    fn grounded_gmail_count_summary_returns_none_without_counts() {
+        let tool_result = serde_json::json!({
+            "provider": "google_workspace",
+            "kind": "gmail",
+            "data": {
+                "query": "in:inbox is:unread",
+            }
+        });
+
+        assert!(build_grounded_gmail_count_summary(&tool_result).is_none());
+    }
+
+    #[test]
+    fn detects_placeholder_scaffold_in_gmail_response() {
+        let response = "1. From: [Sender's Name]\n   Subject: [Subject of the Email]\n   Preview: [Preview of the email]";
+        assert!(contains_gmail_placeholder_scaffold(response));
+
+        let grounded = "1. From: alerts@example.com\n   Subject: Security alert\n   Preview: A new sign-in was detected";
+        assert!(!contains_gmail_placeholder_scaffold(grounded));
+    }
+
+    #[test]
+    fn detects_duplicate_gmail_rows_in_response_text() {
+        let duplicated = "Here are the latest 3 unread Gmails:\nDate: Sat, 18 Apr 2026 05:49:26 +0000\nFrom: obaidullah zeeshan <obaidzeeshan.official@gmail.com>\nID: 19d9f230a2e500b1\nPreview: Invitation details\nSubject: Invitation: Kria Presenta...\nDate: Sat, 18 Apr 2026 05:49:26 +0000\nFrom: obaidullah zeeshan <obaidzeeshan.official@gmail.com>\nID: 19d9f230a2e500b1\nPreview: Invitation details\nSubject: Invitation: Kria Presenta...";
+        assert!(contains_duplicate_gmail_rows(duplicated));
+    }
+
+    #[test]
+    fn does_not_flag_unique_gmail_rows_in_response_text() {
+        let unique_rows = "Here are unread emails:\n1. From: Make <info@make.com>\n   Subject: Meet the new Make Grid\n   Preview: Product updates\n2. From: Google <no-reply@accounts.google.com>\n   Subject: Security alert\n   Preview: A new sign-in was detected\nID: m1\nID: m2";
+        assert!(!contains_duplicate_gmail_rows(unique_rows));
+    }
+
+    #[test]
+    fn grounding_note_limits_gmail_enumeration_to_visible_rows() {
+        let note = build_grounding_count_note(
+            "gw_gmail_inbox",
+            &serde_json::json!({
+                "provider": "google_workspace",
+                "kind": "gmail",
+                "data": {
+                    "requested_count": 3,
+                    "returned_count": 3,
+                    "llm_visible_message_count": 1,
+                }
+            }),
+        )
+        .expect("expected grounding note");
+
+        assert!(note.contains("only 1 row(s) are visible"));
+        assert!(note.contains("enumerate at most 1"));
+    }
+
+    #[test]
+    fn grounded_gmail_message_list_summary_uses_real_message_fields() {
+        let tool_result = serde_json::json!({
+            "provider": "google_workspace",
+            "kind": "gmail",
+            "data": {
+                "requested_count": 3,
+                "returned_count": 3,
+                "messages": [
+                    {
+                        "from": "Make <info@make.com>",
+                        "subject": "Meet the new Make Grid",
+                        "preview": "See what's new in your workflow grid."
+                    },
+                    {
+                        "from": "Google <no-reply@accounts.google.com>",
+                        "subject": "Security alert",
+                        "preview": "A new sign-in was detected."
+                    },
+                    {
+                        "from": "alerts@example.com",
+                        "subject": "Deployment complete",
+                        "preview": "Your production deployment is now live."
+                    }
+                ]
+            }
+        });
+
+        let summary = build_grounded_gmail_message_list_summary(&tool_result)
+            .expect("expected grounded gmail list summary");
+
+        assert!(summary.contains("I retrieved 3 grounded Gmail message(s):"));
+        assert!(summary.contains("1. From: Make <info@make.com>"));
+        assert!(summary.contains("Subject: Meet the new Make Grid"));
+        assert!(!summary.contains("[Sender"));
+        assert!(!summary.contains("[Subject"));
+    }
+
+    #[test]
+    fn grounded_gmail_message_list_summary_deduplicates_duplicate_ids() {
+        let tool_result = serde_json::json!({
+            "provider": "google_workspace",
+            "kind": "gmail",
+            "data": {
+                "requested_count": 3,
+                "returned_count": 3,
+                "messages": [
+                    {
+                        "id": "m1",
+                        "from": "owner@example.com",
+                        "subject": "Invitation",
+                        "preview": "Join us"
+                    },
+                    {
+                        "id": "m1",
+                        "from": "owner@example.com",
+                        "subject": "Invitation",
+                        "preview": "Join us"
+                    },
+                    {
+                        "id": "m2",
+                        "from": "alerts@example.com",
+                        "subject": "Security alert",
+                        "preview": "A new sign-in was detected"
+                    }
+                ]
+            }
+        });
+
+        let summary = build_grounded_gmail_message_list_summary(&tool_result)
+            .expect("expected grounded gmail list summary");
+
+        assert!(summary.contains("I retrieved 2 grounded Gmail message(s) out of 3 requested:"));
+        assert_eq!(summary.matches("Subject: Invitation").count(), 1);
+        assert_eq!(summary.matches("Subject: Security alert").count(), 1);
+    }
+
+    #[test]
+    fn compact_tool_result_for_llm_preserves_gmail_rows_and_removes_raw_text() {
+        let long_preview = "x".repeat(380);
+        let tool_result = serde_json::json!({
+            "provider": "google_workspace",
+            "kind": "gmail",
+            "tool": "searchGmail",
+            "data": {
+                "query": "in:inbox is:unread",
+                "requested_count": 3,
+                "returned_count": 3,
+                "messages": [
+                    {
+                        "subject": "Invitation",
+                        "from": "owner@example.com",
+                        "date": "Sat, 18 Apr 2026 05:49:26 +0000",
+                        "id": "m1",
+                        "labels": ["UNREAD", "CATEGORY_PERSONAL"],
+                        "preview": "You are invited"
+                    },
+                    {
+                        "subject": "Meet the new Make Grid",
+                        "from": "Make <info@make.com>",
+                        "date": "Fri, 10 Apr 2026 10:47:32 +0000",
+                        "id": "m2",
+                        "labels": ["CATEGORY_PROMOTIONS", "UNREAD"],
+                        "preview": long_preview
+                    },
+                    {
+                        "subject": "Security alert",
+                        "from": "Google <no-reply@accounts.google.com>",
+                        "date": "Thu, 09 Apr 2026 07:36:37 GMT",
+                        "id": "m3",
+                        "labels": ["CATEGORY_UPDATES", "UNREAD"],
+                        "preview": "A new sign-in was detected"
+                    }
+                ]
+            },
+            "raw_text": "raw page output should not be passed into llm context"
+        });
+
+        let compact = compact_tool_result_for_llm("gw_gmail_inbox", &tool_result);
+
+        assert!(compact.get("raw_text").is_none());
+        let messages = compact["data"]["messages"]
+            .as_array()
+            .expect("expected compacted gmail messages array");
+        assert_eq!(messages.len(), 3);
+        assert!(messages[0].get("category").is_none());
+        assert!(messages[1].get("category").is_none());
+        assert!(messages[2].get("category").is_none());
+        assert!(messages[0].get("labels").is_none());
+        assert!(messages[1].get("labels").is_none());
+        assert!(messages[2].get("labels").is_none());
+
+        let preview_len = messages[1]["preview"]
+            .as_str()
+            .unwrap_or_default()
+            .chars()
+            .count();
+        assert!(preview_len <= LLM_GMAIL_PREVIEW_MAX_CHARS + 3);
+    }
+
+    #[test]
+    fn compact_gmail_payload_for_llm_tracks_omitted_messages_when_budget_exceeded() {
+        let messages: Vec<serde_json::Value> = (0..24)
+            .map(|index| {
+                serde_json::json!({
+                    "subject": format!("Message {index}"),
+                    "from": "sender@example.com",
+                    "date": "Sat, 18 Apr 2026 05:49:26 +0000",
+                    "id": format!("m{index}"),
+                    "labels": ["UNREAD", "CATEGORY_PERSONAL"],
+                    "preview": "p".repeat(320),
+                })
+            })
+            .collect();
+
+        let payload = serde_json::json!({
+            "query": "in:inbox is:unread",
+            "requested_count": 24,
+            "returned_count": 24,
+            "messages": messages,
+        });
+
+        let compact = compact_gmail_payload_for_llm(&payload);
+        let visible = compact["messages"]
+            .as_array()
+            .expect("expected compacted messages")
+            .len();
+
+        assert!(visible < 24);
+        assert_eq!(compact["llm_visible_message_count"], serde_json::json!(visible));
+        assert_eq!(
+            compact["llm_omitted_message_count"],
+            serde_json::json!(24 - visible)
+        );
+    }
+
+    #[test]
+    fn grounding_note_uses_compacted_visible_count_after_compact_tool_result() {
+        // Simulate the exact pipeline: envelope → compact_tool_result_for_llm → build_grounding_count_note
+        let messages: Vec<serde_json::Value> = (0..10)
+            .map(|i| {
+                serde_json::json!({
+                    "subject": format!("Message {i} with a long subject to consume budget"),
+                    "from": format!("sender{i}@example.com"),
+                    "date": "Sat, 18 Apr 2026 05:49:26 +0000",
+                    "id": format!("m{i}"),
+                    "preview": "p".repeat(300),
+                })
+            })
+            .collect();
+
+        let raw_envelope = serde_json::json!({
+            "provider": "google_workspace",
+            "kind": "gmail",
+            "tool": "searchGmail",
+            "data": {
+                "query": "in:inbox is:unread",
+                "requested_count": 10,
+                "returned_count": 10,
+                "messages": messages,
+            },
+            "raw_text": "irrelevant"
+        });
+
+        let compacted = compact_tool_result_for_llm("gw_gmail_inbox", &raw_envelope);
+        let note = build_grounding_count_note("gw_gmail_inbox", &compacted)
+            .expect("expected grounding note from compacted result");
+
+        let visible = compacted
+            .pointer("/data/llm_visible_message_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10);
+
+        if visible < 10 {
+            assert!(
+                note.contains(&format!("only {visible} row(s) are visible")),
+                "grounding note should reflect compacted visible count, got: {note}"
+            );
+            assert!(
+                note.contains(&format!("enumerate at most {visible}")),
+                "grounding note should cap enumeration at visible count, got: {note}"
+            );
+        } else {
+            assert!(
+                note.contains("returned 10 grounded item(s)"),
+                "grounding note should reflect all items visible, got: {note}"
+            );
+        }
+    }
+
+    #[test]
     fn intent_fallback_uses_web_search_when_available() {
         let mut allowed = HashSet::new();
         allowed.insert("web_search".to_string());
@@ -1820,6 +3305,22 @@ mod tests {
     }
 
     #[test]
+    fn intent_fallback_allows_large_gmail_result_limit_up_to_cap() {
+        let mut allowed = HashSet::new();
+        allowed.insert("gw_gmail_inbox".to_string());
+
+        let call = build_intent_fallback_tool_call(
+            "fetch latest 120 unread gmails",
+            &allowed,
+        )
+        .expect("expected gmail inbox fallback call");
+
+        assert_eq!(call.name, "gw_gmail_inbox");
+        assert_eq!(call.arguments["query"], "in:inbox is:unread");
+        assert_eq!(call.arguments["max_results"], 120);
+    }
+
+    #[test]
     fn intent_fallback_handles_fetch_latest_unread_gmails_variant() {
         let mut allowed = HashSet::new();
         allowed.insert("gw_gmail_inbox".to_string());
@@ -1850,13 +3351,68 @@ mod tests {
             .get("start")
             .and_then(|v| v.as_str())
             .unwrap_or("")
+            .ends_with('Z'));
+        assert!(call
+            .arguments
+            .get("start")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
             .contains('T'));
         assert!(call
             .arguments
             .get("end")
             .and_then(|v| v.as_str())
             .unwrap_or("")
+            .ends_with('Z'));
+        assert!(call
+            .arguments
+            .get("end")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
             .contains('T'));
+    }
+
+    #[test]
+    fn intent_fallback_extracts_calendar_attendees() {
+        let mut allowed = HashSet::new();
+        allowed.insert("gw_calendar_create".to_string());
+
+        let call = build_intent_fallback_tool_call(
+            "Schedule a Google Meet tomorrow at 3pm for 30 minutes and add zeeshanobaid335@gmail.com as an attendee",
+            &allowed,
+        )
+        .expect("expected calendar create fallback call");
+
+        assert_eq!(call.name, "gw_calendar_create");
+        assert_eq!(call.arguments["attendees"][0]["email"], "zeeshanobaid335@gmail.com");
+    }
+
+    #[test]
+    fn intent_fallback_uses_for_clause_for_sheet_title() {
+        let mut allowed = HashSet::new();
+        allowed.insert("gw_sheets_create".to_string());
+
+        let call = build_intent_fallback_tool_call(
+            "Create a Google Sheet for monthly budget",
+            &allowed,
+        )
+        .expect("expected sheets create fallback call");
+
+        assert_eq!(call.name, "gw_sheets_create");
+        assert_eq!(call.arguments["title"], "monthly budget");
+    }
+
+    #[test]
+    fn intent_fallback_routes_drive_listing_prompt_to_drive_list() {
+        let allowed: HashSet<String> = ["gw_drive_search", "gw_drive_list"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let call = build_intent_fallback_tool_call("List files in my Google drive", &allowed)
+            .expect("expected drive fallback call");
+
+        assert_eq!(call.name, "gw_drive_list");
     }
 
     #[test]
@@ -1875,14 +3431,62 @@ mod tests {
     }
 
     #[test]
-    fn intent_fallback_maps_forms_listing_to_raw_tool() {
+    fn intent_fallback_maps_forms_listing_to_curated_tool() {
         let mut allowed = HashSet::new();
-        allowed.insert("mcp_gworkspace_listForms".to_string());
+        allowed.insert("gw_forms_list".to_string());
 
         let call = build_intent_fallback_tool_call("List my Google Forms", &allowed)
             .expect("expected forms list fallback call");
 
-        assert_eq!(call.name, "mcp_gworkspace_listForms");
+        assert_eq!(call.name, "gw_forms_list");
+    }
+
+    #[test]
+    fn forced_tool_directive_overrides_intent_classification() {
+        let mut allowed = HashSet::new();
+        allowed.insert("gw_gmail_inbox".to_string());
+
+        let call = build_intent_fallback_tool_call(
+            "#tool:gw_gmail_inbox please check unread messages",
+            &allowed,
+        )
+        .expect("expected forced tool fallback call");
+
+        assert_eq!(call.name, "gw_gmail_inbox");
+        assert_eq!(call.arguments["query"], "in:inbox is:unread");
+    }
+
+    #[test]
+    fn tool_choice_candidates_include_primary_and_web_alternatives() {
+        let allowed: HashSet<String> = ["search_news", "web_search", "searxng_search"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let candidates = build_tool_choice_candidates(
+            "search the web for latest headlines about robotics",
+            &allowed,
+            Some("search_news"),
+            0.49,
+        );
+
+        assert!(!candidates.is_empty());
+        assert_eq!(candidates[0].name, "search_news");
+        assert!(candidates.iter().any(|c| c.name == "web_search"));
+    }
+
+    #[test]
+    fn tool_choice_candidates_include_google_workspace_options() {
+        let allowed: HashSet<String> = ["gw_gmail_inbox", "gw_calendar_search", "gw_drive_search"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let candidates =
+            build_tool_choice_candidates("check my gmail for unread messages", &allowed, None, 0.45);
+
+        assert!(candidates.iter().any(|c| c.name == "gw_gmail_inbox"));
+        assert!(candidates.iter().any(|c| c.name == "gw_calendar_search"));
     }
 
     #[test]

@@ -61,7 +61,7 @@ impl RagEngine {
     ) -> anyhow::Result<(String, usize)> {
         let doc_id = format!(
             "doc_{}",
-            uuid::Uuid::new_v4().to_string().replace('-', "")[..12].to_string()
+            &uuid::Uuid::new_v4().to_string().replace('-', "")[..12]
         );
 
         // Delete existing chunks for same doc name (re-ingest)

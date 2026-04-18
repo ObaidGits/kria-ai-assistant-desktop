@@ -41,6 +41,11 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 dirs = { workspace = true }
 open = { workspace = true }
+tokio-util = { workspace = true }
+nvml-wrapper = { workspace = true, optional = true }
+
+[features]
+nvidia = ["nvml-wrapper"]
 
 [dev-dependencies]
 tempfile = "3"

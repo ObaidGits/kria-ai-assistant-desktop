@@ -1,11 +1,11 @@
 /// ────────────────────────────────────────────────────────────────
 ///  Feature tests for the 7 reported issues
 ///  1. LLM health – no longer hardcoded
-///  2-3. Model detection – router stores api_url, detect_server_model available
+///     2-3. Model detection – router stores api_url, detect_server_model available
 ///  4. Voice live transcription – PartialTranscript event exists
-///  5-6. HITL request_id – UUID instead of "pending"
+///     5-6. HITL request_id – UUID instead of "pending"
 ///  7. Vision / image routing – multimodal content format + fallback
-/// ────────────────────────────────────────────────────────────────
+///     ────────────────────────────────────────────────────────────────
 use kria_core::config::KriaConfig;
 use kria_core::llm::{ChatMessage, ImageAttachment, ModelRouter};
 use kria_core::safety::hitl::{ApprovalResponse, HitlGateway};
@@ -379,11 +379,12 @@ fn no_vision_when_no_local_url() {
 
 #[tokio::test]
 async fn detect_server_model_returns_none_when_server_down() {
-    // Default config points to localhost:8080 which is likely not running in tests
-    let config = KriaConfig::default();
+    // Use an explicitly unreachable local endpoint so this assertion remains deterministic.
+    let mut config = KriaConfig::default();
+    config.llm.local_api_url = "http://127.0.0.1:1/v1".into();
     let router = ModelRouter::from_config(&config);
     let model = router.detect_server_model().await;
-    // The server is not running, so it should return None (not panic)
+    // Endpoint is unreachable, so detection should gracefully return None.
     assert!(
         model.is_none(),
         "should gracefully return None when server is unreachable"
@@ -405,11 +406,12 @@ async fn detect_server_model_none_when_no_url() {
 
 #[tokio::test]
 async fn model_router_status_reports_unhealthy_when_server_down() {
-    let config = KriaConfig::default();
+    let mut config = KriaConfig::default();
+    config.llm.local_api_url = "http://127.0.0.1:1/v1".into();
     let router = ModelRouter::from_config(&config);
     let status = router.status().await;
 
-    // Server not running in test → should report unhealthy
+    // Endpoint is unreachable in test, so health should report false.
     let healthy = status["local_healthy"].as_bool().unwrap_or(true);
     assert!(
         !healthy,

@@ -2,6 +2,8 @@ pub mod cloud;
 pub mod local;
 pub mod model_manager;
 pub mod model_router;
+pub mod orchestrator;
+pub mod server_binary;
 
 use async_trait::async_trait;
 use futures::Stream;
@@ -35,7 +37,7 @@ pub struct ImageAttachment {
 impl ChatMessage {
     /// Check if this message contains images.
     pub fn has_images(&self) -> bool {
-        self.images.as_ref().map_or(false, |imgs| !imgs.is_empty())
+        self.images.as_ref().is_some_and(|imgs| !imgs.is_empty())
     }
 
     /// Convert to OpenAI multimodal content format for vision APIs.
@@ -251,7 +253,7 @@ pub fn trim_messages_for_context(messages: &[ChatMessage], attempt: usize) -> Ve
                 msg.content = truncate_with_suffix(&msg.content, max_chars, suffix);
             }
 
-            systems.into_iter().chain(non_system.into_iter()).collect()
+            systems.into_iter().chain(non_system).collect()
         }
         _ => {
             // Stage 3: emergency context fit — keep minimal instruction and only

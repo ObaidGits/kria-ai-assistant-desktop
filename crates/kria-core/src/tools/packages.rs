@@ -296,7 +296,7 @@ async fn search_with_pm(pm: PackageManager, query: &str) -> Vec<serde_json::Valu
                 while let Some(pkg_line) = lines.next() {
                     let desc = lines.next().map(|l| l.trim()).unwrap_or("");
                     if let Some(name_part) = pkg_line.split_whitespace().next() {
-                        let name = name_part.split('/').last().unwrap_or(name_part);
+                        let name = name_part.split('/').next_back().unwrap_or(name_part);
                         results.push(serde_json::json!({
                             "name": name,
                             "description": desc,
@@ -921,7 +921,13 @@ async fn get_info_with_pm(pm: PackageManager, name: &str) -> serde_json::Value {
             let field = |key: &str| -> Option<String> {
                 out.lines()
                     .find(|l| l.starts_with(key))
-                    .map(|l| l.splitn(2, ": ").nth(1).unwrap_or("").trim().to_string())
+                    .map(|l| {
+                        l.split_once(": ")
+                            .map(|x| x.1)
+                            .unwrap_or("")
+                            .trim()
+                            .to_string()
+                    })
             };
             serde_json::json!({
                 "name": name,
@@ -943,7 +949,13 @@ async fn get_info_with_pm(pm: PackageManager, name: &str) -> serde_json::Value {
             let field = |key: &str| -> Option<String> {
                 out.lines()
                     .find(|l| l.starts_with(key))
-                    .map(|l| l.splitn(2, ": ").nth(1).unwrap_or("").trim().to_string())
+                    .map(|l| {
+                        l.split_once(": ")
+                            .map(|x| x.1)
+                            .unwrap_or("")
+                            .trim()
+                            .to_string()
+                    })
             };
             serde_json::json!({
                 "name": name,
@@ -970,7 +982,13 @@ async fn get_info_with_pm(pm: PackageManager, name: &str) -> serde_json::Value {
             let field = |key: &str| -> Option<String> {
                 out.lines()
                     .find(|l| l.starts_with(key))
-                    .map(|l| l.splitn(2, ": ").nth(1).unwrap_or("").trim().to_string())
+                    .map(|l| {
+                        l.split_once(": ")
+                            .map(|x| x.1)
+                            .unwrap_or("")
+                            .trim()
+                            .to_string()
+                    })
             };
             serde_json::json!({
                 "name": name,
@@ -986,7 +1004,13 @@ async fn get_info_with_pm(pm: PackageManager, name: &str) -> serde_json::Value {
             let field = |key: &str| -> Option<String> {
                 out.lines()
                     .find(|l| l.contains(key))
-                    .map(|l| l.splitn(2, ": ").nth(1).unwrap_or("").trim().to_string())
+                    .map(|l| {
+                        l.split_once(": ")
+                            .map(|x| x.1)
+                            .unwrap_or("")
+                            .trim()
+                            .to_string()
+                    })
             };
             serde_json::json!({
                 "name": name,
@@ -1043,7 +1067,13 @@ async fn get_info_with_pm(pm: PackageManager, name: &str) -> serde_json::Value {
             let field = |key: &str| -> Option<String> {
                 out.lines()
                     .find(|l| l.starts_with(key))
-                    .map(|l| l.splitn(2, ": ").nth(1).unwrap_or("").trim().to_string())
+                    .map(|l| {
+                        l.split_once(": ")
+                            .map(|x| x.1)
+                            .unwrap_or("")
+                            .trim()
+                            .to_string()
+                    })
             };
             serde_json::json!({
                 "name": name,

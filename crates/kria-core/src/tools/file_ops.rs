@@ -62,7 +62,7 @@ impl ToolHandler for SearchFiles {
             if results.len() >= max {
                 break;
             }
-            if let Some(ref m) = glob.as_ref().ok() {
+            if let Ok(m) = glob.as_ref() {
                 if m.is_match(entry.file_name().to_string_lossy().as_ref()) {
                     results.push(entry.path().to_string_lossy().to_string());
                 }

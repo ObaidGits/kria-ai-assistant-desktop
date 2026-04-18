@@ -90,11 +90,11 @@ fn sidecar_bridge_debug_format() {
 
 #[test]
 fn precognitive_tools_register_into_registry() {
-    let mut registry = registry::build_default_registry();
+    let registry = registry::build_default_registry();
     let base_count = registry.len();
 
     let bridge = Arc::new(SidecarBridge::new("python3", None));
-    precognitive::register(&mut registry, bridge);
+    precognitive::register(&registry, bridge);
 
     assert_eq!(
         registry.len(),
@@ -113,9 +113,9 @@ fn precognitive_tools_register_into_registry() {
 
 #[test]
 fn precognitive_tools_in_correct_category() {
-    let mut registry = registry::build_default_registry();
+    let registry = registry::build_default_registry();
     let bridge = Arc::new(SidecarBridge::new("python3", None));
-    precognitive::register(&mut registry, bridge);
+    precognitive::register(&registry, bridge);
 
     let precog_tools = registry.list_by_category("precognitive");
     assert_eq!(precog_tools.len(), 6);
@@ -123,9 +123,9 @@ fn precognitive_tools_in_correct_category() {
 
 #[test]
 fn precognitive_tools_have_handlers() {
-    let mut registry = registry::build_default_registry();
+    let registry = registry::build_default_registry();
     let bridge = Arc::new(SidecarBridge::new("python3", None));
-    precognitive::register(&mut registry, bridge);
+    precognitive::register(&registry, bridge);
 
     assert!(registry.get_handler("image_analyze").is_some());
     assert!(registry.get_handler("document_extract").is_some());
@@ -137,9 +137,9 @@ fn precognitive_tools_have_handlers() {
 
 #[test]
 fn precognitive_tools_generate_function_schemas() {
-    let mut registry = registry::build_default_registry();
+    let registry = registry::build_default_registry();
     let bridge = Arc::new(SidecarBridge::new("python3", None));
-    precognitive::register(&mut registry, bridge);
+    precognitive::register(&registry, bridge);
 
     let schemas = registry.function_schemas("standard");
     let precog_names: Vec<&str> = vec![
@@ -161,9 +161,9 @@ fn precognitive_tools_generate_function_schemas() {
 
 #[test]
 fn precognitive_tools_tier_filtering() {
-    let mut registry = registry::build_default_registry();
+    let registry = registry::build_default_registry();
     let bridge = Arc::new(SidecarBridge::new("python3", None));
-    precognitive::register(&mut registry, bridge);
+    precognitive::register(&registry, bridge);
 
     // "lite" tier should see document_extract and code_analyze_ast (min_tier: "lite")
     let lite_tools = registry.list_for_tier("lite");

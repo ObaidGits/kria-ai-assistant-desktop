@@ -636,7 +636,7 @@ impl ToolHandler for GetCurrentTime {
                 )
             }
             "CET" | "EUROPE/BERLIN" | "EUROPE/PARIS" => {
-                let offset = chrono::FixedOffset::east_opt(1 * 3600).unwrap();
+                let offset = chrono::FixedOffset::east_opt(3600).unwrap();
                 (
                     now.with_timezone(&offset)
                         .format("%Y-%m-%d %H:%M:%S")

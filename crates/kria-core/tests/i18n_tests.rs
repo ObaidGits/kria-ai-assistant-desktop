@@ -31,11 +31,13 @@ fn ui_config_defaults_font_scale_1() {
 
 #[test]
 fn ui_config_serialization_roundtrip() {
-    let mut ui = UiConfig::default();
-    ui.language = "fr".into();
-    ui.high_contrast = true;
-    ui.reduce_motion = true;
-    ui.font_scale = 1.5;
+    let ui = UiConfig {
+        language: "fr".into(),
+        high_contrast: true,
+        reduce_motion: true,
+        font_scale: 1.5,
+        ..UiConfig::default()
+    };
 
     let toml_str = toml::to_string_pretty(&ui).unwrap();
     let parsed: UiConfig = toml::from_str(&toml_str).unwrap();

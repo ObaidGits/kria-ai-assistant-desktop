@@ -10,12 +10,24 @@ local_host = "127.0.0.1"
 local_port = 8080
 max_context_tokens = 4096
 
-[[llm.local_models]]
+[[llm.models]]
+name = "qwen2.5-vl-7b"
+file = "Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf"
+display_name = "Qwen 2.5 VL 7B (Q4_K_M)"
+context_window = 8192
+max_tokens = 4096
+vram_estimate_gb = 5.0
+capabilities = ["chat", "vision"]
+mmproj_file = "mmproj-F16.gguf"
+
+[[llm.models]]
 name = "phi-4-mini"
-filename = "microsoft_Phi-4-mini-instruct-Q4_K_M.gguf"
-context_size = 4096
-gpu_layers = 99
-tier = "low"
+file = "microsoft_Phi-4-mini-instruct-Q4_K_M.gguf"
+display_name = "Phi-4 Mini Instruct (Q4_K_M)"
+context_window = 4096
+max_tokens = 2048
+vram_estimate_gb = 2.5
+capabilities = ["chat"]
 
 [voice]
 enabled = false
@@ -82,3 +94,33 @@ clarify_threshold = 0.40
 require_plan_for_complex_tasks = true
 require_evidence_for_completion = true
 max_tool_rounds = 10
+
+# ── Hardware Orchestrator ───────────────────────────────────────────
+# Manages llama-server lifecycle and dynamic GPU layer offloading.
+[orchestrator]
+enabled = true
+poll_interval_secs = 2
+yield_threshold_mb = 512                     # Free VRAM (MB) below → yield swap
+emergency_threshold_mb = 128                 # Free VRAM (MB) below → emergency SIGKILL
+recover_threshold_mb = 2048                  # Free VRAM (MB) above → recover layers
+cooldown_secs = 60
+max_transitions_per_hour = 6
+min_ngl_delta = 3
+safety_margin_mb = 256
+llama_server_binary = "/home/obaid/Downloads/llama.cpp/build/bin/llama-server"
+flash_attention = true
+mlock = true
+batch_size = 256
+macos_yield_ram_mb = 2048
+macos_emergency_ram_mb = 1024
+macos_recover_ram_mb = 4096
+
+[orchestrator.model_profile]
+total_layers = 28                            # Qwen2.5-VL-7B (qwen2vl.block_count = 28)
+per_layer_vram_mb = 165                      # ~4609 MiB / 28 layers
+base_vram_overhead_mb = 200
+kv_per_1k_ctx_mb = 100
+min_context = 2048                           # Hard floor — never go below
+max_context = 8192
+has_vision_projector = true
+mmproj_vram_mb = 1300                        # mmproj-F16.gguf ~1291 MiB

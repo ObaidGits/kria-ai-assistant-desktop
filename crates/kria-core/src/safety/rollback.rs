@@ -164,7 +164,7 @@ impl RollbackManager {
 
         if let Ok(entries) = std::fs::read_dir(&self.rollback_dir) {
             let mut snapshots: Vec<_> = entries.flatten().collect();
-            snapshots.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+            snapshots.sort_by_key(|a| a.file_name());
 
             for entry in &snapshots {
                 let manifest_path = entry.path().join("manifest.json");
@@ -189,7 +189,7 @@ impl RollbackManager {
             // Remove oldest until under limit
             if let Ok(entries) = std::fs::read_dir(&self.rollback_dir) {
                 let mut snapshots: Vec<_> = entries.flatten().collect();
-                snapshots.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+                snapshots.sort_by_key(|a| a.file_name());
                 for entry in snapshots {
                     if self.total_size() <= self.max_storage_bytes {
                         break;

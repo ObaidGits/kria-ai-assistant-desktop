@@ -87,8 +87,17 @@ fn main() {
             commands::save_export_file,
             commands::open_html_for_print,
             commands::get_google_workspace_status,
+            commands::set_google_workspace_account,
             commands::connect_google_workspace,
             commands::disconnect_google_workspace,
+            commands::get_orchestrator_status,
+            // Provisioning (first-boot setup wizard)
+            commands::get_provisioning_state,
+            commands::start_provisioning,
+            commands::set_provisioning_backend,
+            commands::run_provisioning_step,
+            commands::get_provisioning_diagnostics,
+            commands::get_hardware_profile,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

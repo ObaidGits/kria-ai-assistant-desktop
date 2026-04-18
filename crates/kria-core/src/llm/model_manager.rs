@@ -1,6 +1,6 @@
-use sha2::{Digest, Sha256};
+use crate::infra::download::{self, DownloadClient, DownloadClientConfig, DownloadProgress};
 use std::path::{Path, PathBuf};
-use tokio::io::AsyncWriteExt;
+use tokio_util::sync::CancellationToken;
 
 /// Model file metadata.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -69,57 +69,42 @@ impl ModelManager {
         models
     }
 
-    /// Download a model from a URL (resumable).
-    pub async fn download(
+    /// Download a model from a URL using the robust download client.
+    ///
+    /// Features: resumable, retries with backoff, stream SHA256, disk space check.
+    pub async fn download<F>(
         &self,
         url: &str,
         subdir: &str,
         filename: &str,
         expected_sha256: Option<&str>,
-    ) -> anyhow::Result<PathBuf> {
+        cancel: &CancellationToken,
+        on_progress: F,
+    ) -> anyhow::Result<PathBuf>
+    where
+        F: Fn(DownloadProgress) + Send + Sync,
+    {
         let target_dir = self.models_dir.join(subdir);
-        let _ = std::fs::create_dir_all(&target_dir);
-        let target_path = target_dir.join(filename);
+        let client = DownloadClient::new(DownloadClientConfig::default())?;
 
-        // Resume support
-        let existing_size = if target_path.exists() {
-            std::fs::metadata(&target_path)?.len()
-        } else {
-            0
-        };
-
-        let client = reqwest::Client::new();
-        let mut request = client.get(url);
-        if existing_size > 0 {
-            request = request.header("Range", format!("bytes={}-", existing_size));
-        }
-
-        let resp = request.send().await?.error_for_status()?;
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&target_path)
+        let result = client
+            .download(
+                url,
+                &target_dir,
+                filename,
+                expected_sha256,
+                cancel,
+                on_progress,
+            )
             .await?;
 
-        let mut stream = resp.bytes_stream();
-        use futures::StreamExt;
-        while let Some(chunk) = stream.next().await {
-            let bytes = chunk?;
-            file.write_all(&bytes).await?;
-        }
-        file.flush().await?;
+        Ok(result.path)
+    }
 
-        // SHA256 verification
-        if let Some(expected) = expected_sha256 {
-            let actual = sha256_file(&target_path)?;
-            if actual != expected {
-                std::fs::remove_file(&target_path)?;
-                anyhow::bail!("SHA256 mismatch for {filename}: expected {expected}, got {actual}");
-            }
-        }
-
-        tracing::info!(file = %target_path.display(), "model downloaded");
-        Ok(target_path)
+    /// Verify SHA256 of an existing model file (stream-based, no OOM).
+    pub async fn verify_sha256(&self, subdir: &str, filename: &str) -> anyhow::Result<String> {
+        let path = self.models_dir.join(subdir).join(filename);
+        download::stream_sha256(&path).await
     }
 
     /// Delete a model file.
@@ -131,11 +116,4 @@ impl ModelManager {
         }
         Ok(())
     }
-}
-
-fn sha256_file(path: &Path) -> anyhow::Result<String> {
-    let data = std::fs::read(path)?;
-    let mut hasher = Sha256::new();
-    hasher.update(&data);
-    Ok(format!("{:x}", hasher.finalize()))
 }

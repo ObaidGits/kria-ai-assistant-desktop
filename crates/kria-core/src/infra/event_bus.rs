@@ -31,6 +31,24 @@ pub enum KriaEvent {
     SkillInstalled { name: String },
     /// Sidecar process is ready.
     SidecarReady,
+    /// VRAM pressure detected; includes current free VRAM.
+    VramPressure { free_vram_mb: u64 },
+    /// LLM server swap initiated (old → new params).
+    LlmSwapStarted {
+        from_ngl: u32,
+        to_ngl: u32,
+        emergency: bool,
+    },
+    /// LLM server swap completed; new server is healthy.
+    LlmSwapCompleted {
+        new_ngl: u32,
+        new_context: u32,
+        duration_ms: u64,
+    },
+    /// Degradation level changed (e.g. "full" → "reduced_context").
+    LlmDegradationChanged { level: String },
+    /// An in-flight LLM stream was interrupted by a swap.
+    LlmStreamInterrupted,
 }
 
 /// Central event bus using tokio broadcast channels.

@@ -60,7 +60,7 @@ async fn ws_chat_returns_ack_then_done() {
     let _ = next_text(&mut stream).await;
 
     let msg = serde_json::json!({ "type": "chat", "message": "Hello!" });
-    sink.send(Message::Text(msg.to_string().into()))
+    sink.send(Message::Text(msg.to_string()))
         .await
         .unwrap();
 
@@ -84,7 +84,7 @@ async fn ws_approve_returns_hitl_ack() {
     let _ = next_text(&mut stream).await; // welcome
 
     let msg = serde_json::json!({ "type": "approve", "request_id": "abc-123" });
-    sink.send(Message::Text(msg.to_string().into()))
+    sink.send(Message::Text(msg.to_string()))
         .await
         .unwrap();
 
@@ -102,7 +102,7 @@ async fn ws_deny_returns_hitl_ack() {
     let _ = next_text(&mut stream).await; // welcome
 
     let msg = serde_json::json!({ "type": "deny", "request_id": "abc-123", "reason": "too risky" });
-    sink.send(Message::Text(msg.to_string().into()))
+    sink.send(Message::Text(msg.to_string()))
         .await
         .unwrap();
 
@@ -122,7 +122,7 @@ async fn ws_ping_returns_pong() {
     let _ = next_text(&mut stream).await; // welcome
 
     let ping = serde_json::json!({ "type": "ping" });
-    sink.send(Message::Text(ping.to_string().into()))
+    sink.send(Message::Text(ping.to_string()))
         .await
         .unwrap();
 
@@ -141,7 +141,7 @@ async fn ws_unknown_type_returns_error() {
     let _ = next_text(&mut stream).await; // welcome
 
     let bad = serde_json::json!({ "type": "foobar" });
-    sink.send(Message::Text(bad.to_string().into()))
+    sink.send(Message::Text(bad.to_string()))
         .await
         .unwrap();
 

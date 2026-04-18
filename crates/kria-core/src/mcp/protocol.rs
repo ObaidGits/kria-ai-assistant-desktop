@@ -58,16 +58,10 @@ pub struct JsonRpcError {
 // ── MCP-specific types ──────────────────────────────────────────────
 
 /// Client capabilities sent during `initialize`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct ClientCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub roots: Option<serde_json::Value>,
-}
-
-impl Default for ClientCapabilities {
-    fn default() -> Self {
-        Self { roots: None }
-    }
 }
 
 /// `initialize` request params.

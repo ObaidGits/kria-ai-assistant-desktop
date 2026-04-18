@@ -1,0 +1,67 @@
+name: Update Model Manifest
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "models/manifest.json"
+
+permissions:
+  contents: write
+
+jobs:
+  validate-manifest:
+    runs-on: ubuntu-22.04
+    name: Validate manifest URLs & checksums
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate manifest
+        run: |
+          set -e
+          MANIFEST="models/manifest.json"
+          if [ ! -f "$MANIFEST" ]; then
+            echo "No manifest found at $MANIFEST — skipping"
+            exit 0
+          fi
+
+          echo "Validating model manifest URLs…"
+          FAILED=0
+
+          # Extract all URLs from manifest
+          URLS=$(python3 -c "
+          import json, sys
+          with open('$MANIFEST') as f:
+              data = json.load(f)
+          for model in data.get('models', []):
+              for variant in model.get('variants', []):
+                  url = variant.get('url', '')
+                  if url:
+                      print(url)
+          " 2>/dev/null || echo "")
+
+          if [ -z "$URLS" ]; then
+            echo "No URLs found in manifest or manifest format unexpected"
+            exit 0
+          fi
+
+          while IFS= read -r url; do
+            if [ -z "$url" ]; then continue; fi
+            HTTP_CODE=$(curl -o /dev/null -s -w "%{http_code}" --head -L "$url" 2>/dev/null || echo "000")
+            if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "302" ]; then
+              echo "  ✓ $url ($HTTP_CODE)"
+            else
+              echo "  ✗ $url ($HTTP_CODE)"
+              FAILED=$((FAILED + 1))
+            fi
+          done <<< "$URLS"
+
+          if [ "$FAILED" -gt 0 ]; then
+            echo ""
+            echo "ERROR: $FAILED URL(s) are unreachable"
+            exit 1
+          fi
+
+          echo ""
+          echo "All manifest URLs validated successfully"

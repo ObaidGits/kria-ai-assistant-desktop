@@ -1,0 +1,16 @@
+# K.R.I.A. — Docker Compose CPU override
+# Usage: docker compose -f docker-compose.yml -f docker-compose.cpu.yml up -d
+
+services:
+  kria:
+    build:
+      context: .
+      dockerfile: Dockerfile.cpu
+    environment:
+      - KRIA_TIER=auto
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
+    deploy:
+      resources:
+        reservations:
+          devices: []

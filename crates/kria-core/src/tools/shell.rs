@@ -21,10 +21,29 @@ impl ToolHandler for ExecuteBash {
         let command = params["command"].as_str().unwrap_or("");
         let timeout_secs = params["timeout"].as_u64().unwrap_or(30);
 
+        // On Windows, fall back to cmd.exe if bash is not available
+        let (shell, args): (&str, Vec<&str>) = if cfg!(target_os = "windows") {
+            // Check if bash exists (e.g. Git Bash / WSL)
+            let has_bash = std::process::Command::new("where")
+                .arg("bash")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if has_bash {
+                ("bash", vec!["-c", command])
+            } else {
+                ("cmd", vec!["/C", command])
+            }
+        } else {
+            ("bash", vec!["-c", command])
+        };
+
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
-            tokio::process::Command::new("bash")
-                .args(["-c", command])
+            tokio::process::Command::new(shell)
+                .args(&args)
                 .output(),
         )
         .await;

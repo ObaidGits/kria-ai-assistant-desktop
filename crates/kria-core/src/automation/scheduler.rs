@@ -86,3 +86,9 @@ impl AutomationScheduler {
         self.tasks.remove(task_id);
     }
 }
+
+impl Default for AutomationScheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}

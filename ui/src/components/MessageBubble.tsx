@@ -79,6 +79,33 @@ function formatFreshnessAge(hours?: number | null): string | null {
   return `${Math.round(hours / 24)}d old`;
 }
 
+function normalizeRows(payload: unknown): Record<string, any>[] {
+  if (!payload) return [];
+  if (Array.isArray(payload)) {
+    return payload.filter((row) => row && typeof row === "object") as Record<string, any>[];
+  }
+  if (typeof payload !== "object") return [];
+
+  const data = payload as Record<string, any>;
+  for (const key of ["results", "items", "messages", "events", "files", "forms", "rows"]) {
+    if (Array.isArray(data[key])) {
+      return data[key].filter((row: unknown) => row && typeof row === "object") as Record<string, any>[];
+    }
+  }
+
+  return [data];
+}
+
+function pickFirstString(row: Record<string, any>, keys: string[]): string {
+  for (const key of keys) {
+    const value = row[key];
+    if (typeof value === "string" && value.trim().length > 0) {
+      return value.trim();
+    }
+  }
+  return "";
+}
+
 const ToolCallBlock: Component<{ tc: ToolCall }> = (props) => {
   const [expanded, setExpanded] = createSignal(false);
   const resultObj = createMemo(() => parseResultObject(props.tc.result));
@@ -109,8 +136,68 @@ const ToolCallBlock: Component<{ tc: ToolCall }> = (props) => {
     return resultObj();
   });
 
+  const googleResult = createMemo(() => {
+    if (!props.tc.name.startsWith("gw_")) return null;
+    const obj = resultObj();
+    if (!obj) return null;
+
+    if (obj.provider === "google_workspace") {
+      return {
+        kind: String(obj.kind || "google_workspace"),
+        data: obj.data ?? obj,
+        rawText: typeof obj.raw_text === "string" ? obj.raw_text : "",
+      };
+    }
+
+    return {
+      kind: "google_workspace",
+      data: obj,
+      rawText: resultText(),
+    };
+  });
+
+  const googleRows = createMemo(() => normalizeRows(googleResult()?.data));
+
+  const googleCreateTrust = createMemo(() => {
+    const payload = googleResult()?.data;
+    if (!payload || typeof payload !== "object") return null;
+
+    const row = payload as Record<string, any>;
+    const status = typeof row.status === "string" ? row.status : "";
+    const explicitVerified = typeof row.verified === "boolean" ? row.verified : null;
+    const hasTrustSignal =
+      explicitVerified !== null || status === "created_verified" || status === "created_unverified";
+
+    if (!hasTrustSignal) return null;
+
+    const verified = explicitVerified === true || status === "created_verified";
+    const unverified = explicitVerified === false || status === "created_unverified";
+    const verificationError =
+      typeof row.verification_error === "string" ? row.verification_error : "";
+
+    return {
+      verified,
+      unverified,
+      verificationError,
+    };
+  });
+
+  const canOpenGoogleLinks = createMemo(() => {
+    const trust = googleCreateTrust();
+    return !trust || trust.verified;
+  });
+
+  const hasGoogleMeetLink = createMemo(() => {
+    if (!props.tc.name.includes("calendar")) return false;
+    return googleRows().some((row) =>
+      ["hangoutLink", "meetLink", "conferenceLink", "htmlLink", "url"]
+        .map((key) => row[key])
+        .some((value) => typeof value === "string" && /meet\.google\.com/i.test(value))
+    );
+  });
+
   const hasStructuredCards = createMemo(() =>
-    newsResults().length > 0 || webResults().length > 0 || !!articleResult()
+    newsResults().length > 0 || webResults().length > 0 || !!articleResult() || !!googleResult()
   );
 
   const statusIcon = () => {
@@ -151,6 +238,30 @@ const ToolCallBlock: Component<{ tc: ToolCall }> = (props) => {
   const askToRefresh = (topic?: string) => {
     if (!topic) return;
     void appStore.sendMessage(`Get the latest live updates and key developments about: ${topic}`);
+  };
+
+  const googlePrimaryLink = (row: Record<string, any>): string => {
+    return pickFirstString(row, ["url", "htmlLink", "webViewLink", "alternateLink", "hangoutLink", "meetLink"]);
+  };
+
+  const googleTitle = (row: Record<string, any>): string => {
+    return (
+      pickFirstString(row, ["subject", "title", "summary", "name", "displayName"]) ||
+      `Google ${googleResult()?.kind || "item"}`
+    );
+  };
+
+  const googleSnippet = (row: Record<string, any>): string => {
+    return pickFirstString(row, ["preview", "snippet", "description", "text", "content", "body"]);
+  };
+
+  const googleMeta = (row: Record<string, any>): string[] => {
+    const parts = [
+      pickFirstString(row, ["sender", "from", "organizer"]),
+      pickFirstString(row, ["date", "updated", "created", "start", "startTime"]),
+      pickFirstString(row, ["id", "messageId", "fileId", "eventId"]),
+    ].filter(Boolean);
+    return parts.slice(0, 3);
   };
 
   const confidenceLabel = createMemo(() => formatConfidence(props.tc.metadata?.confidence));
@@ -269,6 +380,78 @@ const ToolCallBlock: Component<{ tc: ToolCall }> = (props) => {
                   </Show>
                 </div>
               </article>
+            </div>
+          </Show>
+
+          <Show when={googleResult()}>
+            <div class="tool-structured-list">
+              <strong>
+                Google {String(googleResult()?.kind || "workspace").replace(/_/g, " ")}:
+              </strong>
+              <Show when={googleCreateTrust()?.verified}>
+                <div class="tool-metric-badge tool-trust-verified" style={{ width: "fit-content", "margin-bottom": "0.45rem" }}>
+                  Verified create
+                </div>
+              </Show>
+              <Show when={googleCreateTrust()?.unverified}>
+                <div class="tool-metric-badge tool-trust-unverified" style={{ width: "fit-content", "margin-bottom": "0.45rem" }}>
+                  Create unverified
+                </div>
+                <div class="tool-trust-guidance">
+                  <strong>Recovery guidance:</strong>
+                  <p>
+                    This resource may have been created, but KRIA could not verify it yet.
+                    Re-run a read check for this item, then use links only after status is verified.
+                  </p>
+                  <Show when={googleCreateTrust()?.verificationError}>
+                    <pre>{String(googleCreateTrust()?.verificationError || "")}</pre>
+                  </Show>
+                </div>
+              </Show>
+              <Show when={hasGoogleMeetLink()}>
+                <div class="tool-metric-badge" style={{ width: "fit-content", "margin-bottom": "0.45rem" }}>
+                  Meet link available
+                </div>
+              </Show>
+              <For each={googleRows().slice(0, 8)}>
+                {(row) => {
+                  const url = googlePrimaryLink(row);
+                  const title = googleTitle(row);
+                  const snippet = googleSnippet(row);
+                  const meta = googleMeta(row);
+                  return (
+                    <article class="tool-result-card">
+                      <div class="tool-result-card-title">{title}</div>
+                      <Show when={meta.length > 0}>
+                        <div class="tool-result-card-meta">
+                          <For each={meta}>{(part) => <span>{part}</span>}</For>
+                        </div>
+                      </Show>
+                      <Show when={snippet}>
+                        <p class="tool-result-card-snippet">{snippet}</p>
+                      </Show>
+                      <div class="tool-result-card-actions">
+                        <Show when={url && canOpenGoogleLinks()}>
+                          <button class="tool-quick-action" onClick={() => openUrl(url)}>Open</button>
+                        </Show>
+                        <Show when={url && !canOpenGoogleLinks()}>
+                          <span class="tool-link-locked">Open hidden until verification</span>
+                        </Show>
+                        <Show when={props.tc.name === "gw_calendar_create" && /meet\.google\.com/i.test(url || "") && canOpenGoogleLinks()}>
+                          <button class="tool-quick-action" onClick={() => openUrl(url)}>Join Meet</button>
+                        </Show>
+                        <button class="tool-quick-action" onClick={() => askToRefresh(title)}>Follow up</button>
+                      </div>
+                    </article>
+                  );
+                }}
+              </For>
+              <Show when={googleRows().length === 0 && googleResult()?.rawText}>
+                <div class={`tool-call-result tool-result-${props.tc.status}`}>
+                  <strong>Result:</strong>
+                  <pre>{String(googleResult()?.rawText || "")}</pre>
+                </div>
+              </Show>
             </div>
           </Show>
 

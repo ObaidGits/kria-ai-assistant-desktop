@@ -72,7 +72,7 @@ impl TelegramBridge {
 
     /// Check if the background task is still running.
     pub fn is_running(&self) -> bool {
-        self.task.as_ref().map_or(false, |t| !t.is_finished())
+        self.task.as_ref().is_some_and(|t| !t.is_finished())
     }
 }
 
@@ -210,6 +210,7 @@ fn conflict_backoff_duration(retry_count: u32) -> Duration {
 }
 
 /// The main polling loop.
+#[allow(clippy::too_many_arguments)]
 async fn telegram_poll_loop(
     config: TelegramConfig,
     agent_loop: Arc<AgentLoop>,
@@ -423,6 +424,7 @@ async fn telegram_poll_loop(
 ///
 /// This is reused by the desktop's local HTTP bridge so external Telegram MCP
 /// servers can forward incoming messages into the in-process agent loop.
+#[allow(clippy::too_many_arguments)]
 pub async fn process_message(
     text: &str,
     chat_id: i64,

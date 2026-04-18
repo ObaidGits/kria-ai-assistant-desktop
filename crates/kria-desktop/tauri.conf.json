@@ -6,7 +6,7 @@
   "build": {
     "frontendDist": "../../ui/dist",
     "devUrl": "http://localhost:1420",
-    "beforeDevCommand": "if [ -f ui/package.json ]; then npm run dev --prefix ui; elif [ -f ../ui/package.json ]; then npm run dev --prefix ../ui; else npm run dev --prefix ../../ui; fi",
+    "beforeDevCommand": "fuser -k 1420/tcp 2>/dev/null; if [ -f ui/package.json ]; then npm run dev --prefix ui; elif [ -f ../ui/package.json ]; then npm run dev --prefix ../ui; else npm run dev --prefix ../../ui; fi",
     "beforeBuildCommand": "if [ -f ui/package.json ]; then npm run build --prefix ui; elif [ -f ../ui/package.json ]; then npm run build --prefix ../ui; else npm run build --prefix ../../ui; fi"
   },
   "app": {
@@ -35,6 +35,12 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "resources": [
+      "../../config/default.toml",
+      "../../config/mcp_servers.json",
+      "../../models/piper/en_US-ryan-high.onnx",
+      "../../models/piper/en_US-ryan-high.onnx.json"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -43,10 +49,21 @@
     ],
     "linux": {
       "deb": {
-        "depends": []
+        "depends": [],
+        "desktopTemplate": null,
+        "section": "utils"
       },
       "appimage": {
         "bundleMediaFramework": true
+      }
+    },
+    "macOS": {
+      "minimumSystemVersion": "11.0",
+      "signingIdentity": null
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "both"
       }
     }
   }

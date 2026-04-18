@@ -28,10 +28,7 @@ impl DocSidecar {
             "file": path,
             "operations": operations,
         });
-        match bridge.request("document.extract", params).await {
-            Ok(result) => Some(result),
-            Err(_) => None,
-        }
+        bridge.request("document.extract", params).await.ok()
     }
 }
 

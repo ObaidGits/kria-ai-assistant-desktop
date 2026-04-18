@@ -32,7 +32,6 @@ static CONVERSATION_RE: Lazy<Vec<Regex>> = Lazy::new(|| {
         r"^(tell\s+me\s+a\s+joke|joke\b)",
         r"^(how\s+are\s+you|what'?s\s+up)\b",
         r"^(explain|describe|what\s+is|what\s+are|define)\b",
-        r"\?$",
     ];
     patterns
         .iter()
@@ -80,6 +79,19 @@ static DIRECT_TOOL_RE: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
             "list_running_apps",
         ),
         (r"(?i)\b(kill|terminate)\s*(process|pid)\b", "kill_process"),
+        // Google Workspace (Drive)
+        (
+            r"(?i)\b(list|show|browse|what'?s\s+in|what\s+is\s+in|contents?)\b.*\b(google\s+drive|drive\s+files?|drive)\b",
+            "gw_drive_list",
+        ),
+        (
+            r"(?i)\b(search|find|look\s*for|locate)\b.*\b(google\s+drive|drive\s+files?|drive)\b",
+            "gw_drive_search",
+        ),
+        (
+            r"(?i)\b(latest|recent|today|current|updates?)\b.*\b(google\s+calendar|calendar|schedule|events?)\b",
+            "gw_calendar_search",
+        ),
         // File ops
         (
             r"(?i)\b(read|show|cat|display)\s+(the\s+)?file\b",
@@ -130,7 +142,7 @@ static DIRECT_TOOL_RE: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
         ),
         // Internet
         (
-            r"(?i)\b(latest|breaking|today|current|recent)\b.*\b(news|headlines|updates?)\b",
+            r"(?i)^(?!.*\b(?:google\s+calendar|calendar|gmail|drive|docs?|sheets?|slides?|forms?)\b).*(?:\b(latest|breaking|today|current|recent)\b.*\b(news|headlines|updates?)\b)",
             "search_news",
         ),
         (
@@ -172,13 +184,12 @@ static DIRECT_TOOL_RE: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
             "gw_calendar_search",
         ),
         (
+            r"(?i)\b(today)\b.*\b(meetings?|events?)\b|\b(meetings?|events?)\b.*\b(today)\b",
+            "gw_calendar_today",
+        ),
+        (
             r"(?i)\b(schedule|create|book|add|plan)\b.*\b(calendar\s+event|event|meeting|appointment|meet|call|invite)\b",
             "gw_calendar_create",
-        ),
-        // Google Workspace (Drive)
-        (
-            r"(?i)\b(search|find|look\s*for|list|show|browse)\b.*\b(google\s+drive|drive\s+files?|drive)\b",
-            "gw_drive_search",
         ),
         // Google Workspace (Docs)
         (
@@ -215,14 +226,14 @@ static DIRECT_TOOL_RE: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
             r"(?i)\b(read|open|show|view)\b.*\b(google\s+slides?|gslides?|presentation|deck)\b",
             "gw_slides_read",
         ),
-        // Google Workspace (Forms via raw MCP tools)
+        // Google Workspace (Forms)
         (
             r"(?i)\b(list|show|read|open|find|search)\b.*\b(google\s+forms?|forms?)\b",
-            "mcp_gworkspace_listForms",
+            "gw_forms_list",
         ),
         (
             r"(?i)\b(create|new|make|build)\b.*\b(google\s+forms?|forms?)\b",
-            "mcp_gworkspace_createForm",
+            "gw_forms_create",
         ),
         (r"(?i)\b(ping)\s+\w+", "ping_host"),
         (r"(?i)\b(download)\s+", "download_file"),
@@ -421,13 +432,31 @@ mod tests {
     }
 
     #[test]
-    fn routes_forms_listing_to_raw_forms_tool() {
+    fn routes_forms_listing_to_curated_forms_tool() {
         let result = IntentRouter::classify("List my google forms");
         assert!(matches!(result.intent, Intent::DirectTool(_)));
-        assert_eq!(
-            result.tool_hint.as_deref(),
-            Some("mcp_gworkspace_listForms")
-        );
+        assert_eq!(result.tool_hint.as_deref(), Some("gw_forms_list"));
+    }
+
+    #[test]
+    fn routes_actionable_question_to_calendar_today_tool() {
+        let result = IntentRouter::classify("Do I have meetings today?");
+        assert!(matches!(result.intent, Intent::DirectTool(_)));
+        assert_eq!(result.tool_hint.as_deref(), Some("gw_calendar_today"));
+    }
+
+    #[test]
+    fn routes_drive_listing_prompts_to_drive_list_tool() {
+        let result = IntentRouter::classify("List files in my Google drive");
+        assert!(matches!(result.intent, Intent::DirectTool(_)));
+        assert_eq!(result.tool_hint.as_deref(), Some("gw_drive_list"));
+    }
+
+    #[test]
+    fn routes_calendar_update_prompts_to_calendar_search_tool() {
+        let result = IntentRouter::classify("Get latest updates about Google calendar");
+        assert!(matches!(result.intent, Intent::DirectTool(_)));
+        assert_eq!(result.tool_hint.as_deref(), Some("gw_calendar_search"));
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use crate::config::KriaConfig;
+use crate::llm::orchestrator::server_manager::LlamaServerManager;
 use crate::llm::{cloud::CloudBackend, local::LocalBackend, LlmBackend};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,15 +13,20 @@ pub enum RoutingMode {
     External,
 }
 
-impl RoutingMode {
-    pub fn from_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
+impl std::str::FromStr for RoutingMode {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mode = match s.to_lowercase().as_str() {
             "gemini" => Self::Gemini,
             "external" => Self::External,
             _ => Self::Local,
-        }
+        };
+        Ok(mode)
     }
+}
 
+impl RoutingMode {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Local => "local",
@@ -34,6 +40,9 @@ impl RoutingMode {
 pub struct ModelRouter {
     mode: RwLock<RoutingMode>,
     local: Option<Arc<dyn LlmBackend>>,
+    /// Concrete typed reference to the local backend (same Arc) for
+    /// orchestrator attachment after construction.
+    local_concrete: Option<Arc<LocalBackend>>,
     vision_local: Option<Arc<dyn LlmBackend>>,
     cloud_clients: RwLock<HashMap<String, Arc<dyn LlmBackend>>>,
     /// Local API URL (stored for server probing).
@@ -43,15 +52,16 @@ pub struct ModelRouter {
 impl ModelRouter {
     /// Create a model router from configuration.
     pub fn from_config(config: &KriaConfig) -> Self {
-        let local = if !config.llm.local_api_url.is_empty() {
-            Some(Arc::new(LocalBackend::new(
+        let (local, local_concrete) = if !config.llm.local_api_url.is_empty() {
+            let backend = Arc::new(LocalBackend::new(
                 config.llm.local_api_url.clone(),
                 config.llm.active_model.clone(),
                 vec!["text".into()],
                 config.llm.context_window,
-            )) as Arc<dyn LlmBackend>)
+            ));
+            (Some(backend.clone() as Arc<dyn LlmBackend>), Some(backend))
         } else {
-            None
+            (None, None)
         };
 
         // Create a vision-capable backend if a vision model is explicitly defined
@@ -105,11 +115,16 @@ impl ModelRouter {
             );
         }
 
-        let mode = RoutingMode::from_str(&config.llm.routing_mode);
+        let mode = config
+            .llm
+            .routing_mode
+            .parse::<RoutingMode>()
+            .unwrap_or(RoutingMode::Local);
 
         Self {
             mode: RwLock::new(mode),
             local,
+            local_concrete,
             vision_local,
             cloud_clients: RwLock::new(cloud_clients),
             local_api_url: config.llm.local_api_url.clone(),
@@ -216,6 +231,14 @@ impl ModelRouter {
             rpm,
         ));
         self.cloud_clients.write().await.insert(name, client);
+    }
+
+    /// Attach an orchestrator server manager to the local backend.
+    /// This wires up dynamic URL resolution and stream cancellation.
+    pub fn attach_server_manager(&self, mgr: Arc<LlamaServerManager>) {
+        if let Some(ref backend) = self.local_concrete {
+            backend.attach_server_manager(mgr);
+        }
     }
 
     /// Get status dict for dashboard.

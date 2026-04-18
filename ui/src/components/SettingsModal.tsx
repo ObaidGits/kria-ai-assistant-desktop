@@ -31,7 +31,7 @@ interface McpCatalogItem {
 }
 
 const SettingsModal: Component = () => {
-  const { setShowSettings, settings, loadSettings, saveSettings, models, loadModels, audioDevices, loadAudioDevices, theme, applyTheme, mcpServers, loadMcpServers, addMcpServer, removeMcpServer, toggleMcpServer, healthInfo, loadHealth, scheduledTasks, loadScheduledTasks, addScheduledTask, removeScheduledTask, macros, loadMacros, deleteMacro, workflows, loadWorkflows, deleteWorkflow, hardwareInfo, loadHardwareInfo, knowledgeBase, loadKnowledgeBase, telegramConfig, telegramBotInfo, loadTelegramConfig, saveTelegramConfig, testTelegramConnection, startTelegramMcp, stopTelegramMcp, googleStatus, loadGoogleStatus, connectGoogle, disconnectGoogle } = appStore;
+  const { setShowSettings, settings, loadSettings, saveSettings, models, loadModels, audioDevices, loadAudioDevices, theme, applyTheme, mcpServers, loadMcpServers, addMcpServer, removeMcpServer, toggleMcpServer, healthInfo, loadHealth, scheduledTasks, loadScheduledTasks, addScheduledTask, removeScheduledTask, macros, loadMacros, deleteMacro, workflows, loadWorkflows, deleteWorkflow, hardwareInfo, loadHardwareInfo, knowledgeBase, loadKnowledgeBase, telegramConfig, telegramBotInfo, loadTelegramConfig, saveTelegramConfig, testTelegramConnection, startTelegramMcp, stopTelegramMcp, googleStatus, loadGoogleStatus, setGoogleAccount, connectGoogle, disconnectGoogle, reconcileMcpRuntime, restartMcpServerRuntime } = appStore;
 
   const [activeTab, setActiveTab] = createSignal<Tab>("llm");
   const [draft, setDraft] = createSignal<Record<string, any>>({});
@@ -111,58 +111,96 @@ const SettingsModal: Component = () => {
     },
   ]);
 
-  onMount(async () => {
-    await loadSettings();
-    await loadModels();
-    await loadAudioDevices();
-    await loadMcpServers();
-    await loadHealth();
-    await loadScheduledTasks();
-    await loadMacros();
-    await loadWorkflows();
-    await loadHardwareInfo();
-    await loadKnowledgeBase();
-    await loadTelegramConfig();
-    await loadGoogleStatus();
+  onMount(() => {
+    let disposed = false;
+    let unlistenConnected: (() => void) | null = null;
+    let unlistenError: (() => void) | null = null;
 
-    // Restore frontend-only preferences from local storage.
-    try {
-      const assistantRaw = localStorage.getItem("kria_assistant_frontend_prefs");
-      if (assistantRaw) {
-        setAssistantPrefs({ ...assistantPrefs(), ...JSON.parse(assistantRaw) });
+    const initialize = async () => {
+      await loadSettings();
+      await loadModels();
+      await loadAudioDevices();
+      await loadMcpServers();
+      await loadHealth();
+      await loadScheduledTasks();
+      await loadMacros();
+      await loadWorkflows();
+      await loadHardwareInfo();
+      await loadKnowledgeBase();
+      await loadTelegramConfig();
+      const initialGoogleStatus = await loadGoogleStatus();
+      if (disposed) return;
+      if (initialGoogleStatus?.account) {
+        setGwAccount(initialGoogleStatus.account);
       }
-      const labsRaw = localStorage.getItem("kria_labs_frontend_prefs");
-      if (labsRaw) {
-        setLabsPrefs({ ...labsPrefs(), ...JSON.parse(labsRaw) });
-      }
-      const catalogRaw = localStorage.getItem("kria_mcp_catalog");
-      if (catalogRaw) {
-        const parsed = JSON.parse(catalogRaw);
-        if (Array.isArray(parsed)) {
-          setMcpCatalog(parsed as McpCatalogItem[]);
+
+      // Restore frontend-only preferences from local storage.
+      try {
+        const assistantRaw = localStorage.getItem("kria_assistant_frontend_prefs");
+        if (assistantRaw) {
+          setAssistantPrefs({ ...assistantPrefs(), ...JSON.parse(assistantRaw) });
         }
+        const labsRaw = localStorage.getItem("kria_labs_frontend_prefs");
+        if (labsRaw) {
+          setLabsPrefs({ ...labsPrefs(), ...JSON.parse(labsRaw) });
+        }
+        const catalogRaw = localStorage.getItem("kria_mcp_catalog");
+        if (catalogRaw) {
+          const parsed = JSON.parse(catalogRaw);
+          if (Array.isArray(parsed)) {
+            setMcpCatalog(parsed as McpCatalogItem[]);
+          }
+        }
+      } catch (e) {
+        console.warn("Failed to restore frontend preferences:", e);
       }
-    } catch (e) {
-      console.warn("Failed to restore frontend preferences:", e);
-    }
 
-    // Listen for OAuth completion events from Tauri backend
-    const unlistenConnected = await listen("gw:connected", (event: any) => {
-      setGwConnecting(false);
-      setGwMessage("");
-      const pol = gwPollTimer();
-      if (pol) { clearInterval(pol); setGwPollTimer(null); }
-      loadGoogleStatus(gwAccount());
-    });
-    const unlistenError = await listen("gw:error", (event: any) => {
-      setGwConnecting(false);
-      const pol = gwPollTimer();
-      if (pol) { clearInterval(pol); setGwPollTimer(null); }
-      setGwMessage(`Authorization failed: ${event.payload?.message ?? "unknown error"}`);
-    });
+      if (disposed) return;
+
+      // Listen for OAuth completion events from Tauri backend.
+      unlistenConnected = await listen("gw:connected", async (_event: any) => {
+        setGwConnecting(false);
+        setGwMessage("");
+        const pol = gwPollTimer();
+        if (pol) {
+          clearInterval(pol);
+          setGwPollTimer(null);
+        }
+        try {
+          await reconcileMcpRuntime();
+        } catch (e) {
+          console.warn("Failed to reconcile MCP runtime after Google connect:", e);
+        }
+        await loadMcpServers();
+        await loadGoogleStatus(gwAccount());
+      });
+
+      if (disposed) {
+        unlistenConnected?.();
+        return;
+      }
+
+      unlistenError = await listen("gw:error", (event: any) => {
+        setGwConnecting(false);
+        const pol = gwPollTimer();
+        if (pol) {
+          clearInterval(pol);
+          setGwPollTimer(null);
+        }
+        setGwMessage(`Authorization failed: ${event.payload?.message ?? "unknown error"}`);
+      });
+
+      if (disposed) {
+        unlistenError?.();
+      }
+    };
+
+    void initialize();
+
     onCleanup(() => {
-      unlistenConnected();
-      unlistenError();
+      disposed = true;
+      unlistenConnected?.();
+      unlistenError?.();
       const pol = gwPollTimer();
       if (pol) clearInterval(pol);
     });
@@ -181,6 +219,13 @@ const SettingsModal: Component = () => {
       setTgBotToken(tg.bot_token);
       setTgChatIds(tg.allowed_chat_ids);
       setTgAutoStart(tg.auto_start);
+    }
+  });
+
+  createEffect(() => {
+    const status = googleStatus();
+    if (status?.account && !gwConnecting()) {
+      setGwAccount(status.account);
     }
   });
 
@@ -283,6 +328,7 @@ const SettingsModal: Component = () => {
       ["Docs", capabilities.docs],
       ["Sheets", capabilities.sheets],
       ["Slides", capabilities.slides],
+      ["Forms", capabilities.forms],
       ["Meet (direct)", capabilities.meet],
       ["Meet via Calendar", capabilities.meet_via_calendar],
     ] as const;
@@ -1649,13 +1695,23 @@ const SettingsModal: Component = () => {
                   type="text"
                   value={gwAccount()}
                   onInput={(e) => setGwAccount(e.currentTarget.value)}
+                  onBlur={async () => {
+                    const normalized = gwAccount().trim();
+                    if (!normalized) return;
+                    try {
+                      await setGoogleAccount(normalized);
+                      await loadGoogleStatus(normalized);
+                    } catch (e) {
+                      setGwMessage(`Failed to persist account: ${e}`);
+                    }
+                  }}
                   placeholder="personal"
                   disabled={gwConnecting()}
                   style="max-width:220px"
                 />
                 <span class="field-hint">
                   Name you'll use to identify this Google account (e.g. "personal", "work").
-                  Must match what KRIA was started with (<code>KRIA_GW_ACCOUNT</code>).
+                  This is now persisted as KRIA's single active Google account.
                 </span>
               </div>
 
@@ -1685,6 +1741,7 @@ const SettingsModal: Component = () => {
                     class="btn-primary"
                     disabled={gwConnecting() || !googleStatus()?.credentials_configured}
                     onClick={async () => {
+                      const normalized = gwAccount().trim() || "personal";
                       const existing = gwPollTimer();
                       if (existing) {
                         clearInterval(existing);
@@ -1694,14 +1751,15 @@ const SettingsModal: Component = () => {
                       setGwConnecting(true);
                       setGwMessage("");
                       try {
-                        await connectGoogle(gwAccount());
+                        await setGoogleAccount(normalized);
+                        await connectGoogle(normalized);
                         let attempts = 0;
                         const maxAttempts = 20;
 
                         // Poll every 3s while OAuth browser flow is in progress.
                         const timer = setInterval(async () => {
                           attempts += 1;
-                          const status = await loadGoogleStatus(gwAccount());
+                          const status = await loadGoogleStatus(normalized);
 
                           if (status?.connected) {
                             clearInterval(timer);
@@ -1749,7 +1807,9 @@ const SettingsModal: Component = () => {
                   <button
                     class="btn-secondary"
                     onClick={async () => {
-                      const status = await loadGoogleStatus(gwAccount());
+                      const normalized = gwAccount().trim() || "personal";
+                      await setGoogleAccount(normalized);
+                      const status = await loadGoogleStatus(normalized);
                       await loadMcpServers();
 
                       if (!status) {
@@ -1771,12 +1831,47 @@ const SettingsModal: Component = () => {
                   </button>
                 </Show>
 
+                <Show when={googleStatus()}>
+                  <button
+                    class="btn-secondary"
+                    onClick={async () => {
+                      try {
+                        await reconcileMcpRuntime();
+                        await loadMcpServers();
+                        await loadGoogleStatus(gwAccount());
+                        setGwMessage("MCP runtime reconciled.");
+                      } catch (e) {
+                        setGwMessage(`Failed to reconcile runtime: ${e}`);
+                      }
+                    }}
+                  >
+                    Reconcile runtime
+                  </button>
+                  <button
+                    class="btn-secondary"
+                    onClick={async () => {
+                      try {
+                        await restartMcpServerRuntime("gworkspace");
+                        await loadMcpServers();
+                        await loadGoogleStatus(gwAccount());
+                        setGwMessage("gworkspace runtime restarted.");
+                      } catch (e) {
+                        setGwMessage(`Failed to restart runtime: ${e}`);
+                      }
+                    }}
+                  >
+                    Restart runtime
+                  </button>
+                </Show>
+
                 <Show when={googleStatus()?.token_present}>
                   <button
                     class="btn-danger"
                     onClick={async () => {
                       try {
-                        await disconnectGoogle(gwAccount());
+                        const normalized = gwAccount().trim() || "personal";
+                        await setGoogleAccount(normalized);
+                        await disconnectGoogle(normalized);
                         await loadMcpServers();
                         setGwMessage("Disconnected. OAuth token removed.");
                       } catch (e) {
@@ -1796,7 +1891,7 @@ const SettingsModal: Component = () => {
                   <li>Go to <a href="https://console.cloud.google.com/" target="_blank" rel="noopener">Google Cloud Console</a> → APIs &amp; Services → Credentials</li>
                   <li>Create an <strong>OAuth 2.0 Client ID</strong> (Application type: <em>Desktop app</em>)</li>
                   <li>Download the JSON and save it as <code>~/.google-mcp/credentials.json</code></li>
-                  <li>Enable these APIs: Gmail, Calendar, Drive, Docs, Sheets, Slides</li>
+                  <li>Enable these APIs: Gmail, Calendar, Drive, Docs, Sheets, Slides, Forms</li>
                   <li>Come back here and click <strong>Connect with Google</strong></li>
                   <li>Sign in and click <strong>Allow</strong> - KRIA can now access your Workspace</li>
                   <li>Meet requests use calendar conference-link mode (<code>calendar_conference_link</code>)</li>

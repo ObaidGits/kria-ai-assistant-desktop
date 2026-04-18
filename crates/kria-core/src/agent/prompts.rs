@@ -2,7 +2,6 @@
 ///
 /// Phase 6: package_manager injected into System Context header; Rules updated for
 /// anti-narration, anti-pseudo-code, and no-redundant-questions behaviour.
-
 /// Build the system prompt for the LLM, including available tools and user context.
 pub fn build_system_prompt(
     tool_descriptions: &str,
@@ -52,6 +51,8 @@ Current Date/Time: {datetime}
 27. When uncertain, prefer a targeted clarification question over a guess. Never present uncertain assumptions as facts.
 28. For news requests, always call `search_news` first and tune parameters to intent: use `freshness_mode=live` for breaking updates, and use `country`/`region` plus `source_profile=authentic` or `india_authentic` when the user asks for region-specific trustworthy coverage.
 29. For Google Workspace requests (Gmail, Calendar, Drive, Docs, Sheets, Slides, Forms), call the corresponding Google tools directly. Do NOT respond with manual shell/IMAP/API setup instructions unless the user explicitly asks for setup help.
+30. NEVER dump raw tool payload JSON to the user unless the user explicitly asks for raw JSON. Summarize grounded fields instead.
+31. For Gmail list/search results, NEVER invent email rows, IDs, senders, dates, labels, or previews. Use only grounded tool rows; if a field is missing, say it was not provided.
 
 ## Application Management Rules
 - ALWAYS call `search_package` before installing. Never install blind with a name the user typed.

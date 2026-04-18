@@ -1,4 +1,5 @@
 use crate::infra::circuit_breaker::{CircuitBreaker, CircuitBreakerError, CircuitState};
+use crate::llm::orchestrator::server_manager::LlamaServerManager;
 use crate::llm::{
     extract_openai_content_text, extract_openai_message_text, extract_openai_tool_calls,
     trim_messages_for_context, ChatMessage, ContextTooLargeError, LlmBackend, LlmResponse,
@@ -7,21 +8,29 @@ use crate::llm::{
 use async_trait::async_trait;
 use futures::Stream;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 /// Local LLM backend using llama.cpp via HTTP API.
 ///
-/// In production, replace HTTP calls with llama-cpp-rs embedded bindings.
-/// Keeping HTTP API for now allows using existing llama-server binary.
+/// When an orchestrator `LlamaServerManager` is attached, the API URL and
+/// context window are resolved dynamically from the server manager, and
+/// in-flight streams can be cancelled via `CancellationToken` during swaps.
 pub struct LocalBackend {
+    /// Fallback API URL (used when no server manager is attached).
     api_url: String,
     model_label: String,
     capabilities: Vec<String>,
-    #[allow(dead_code)]
-    context_window: usize,
+    /// Dynamic context window (updated by orchestrator swaps).
+    context_window: Arc<AtomicUsize>,
     client: reqwest::Client,
     circuit: Arc<CircuitBreaker>,
+    /// Optional server manager for orchestrator-managed mode.
+    /// Uses `OnceLock` so it can be attached after construction via `&self`
+    /// (required because `ModelRouter` stores backends behind `Arc<dyn LlmBackend>`).
+    server_manager: OnceLock<Arc<LlamaServerManager>>,
 }
 
 impl LocalBackend {
@@ -40,16 +49,53 @@ impl LocalBackend {
             api_url,
             model_label,
             capabilities,
-            context_window,
+            context_window: Arc::new(AtomicUsize::new(context_window)),
             client,
             circuit: Arc::new(CircuitBreaker::with_defaults("local-llm")),
+            server_manager: OnceLock::new(),
         }
+    }
+
+    /// Attach a server manager from the orchestrator.
+    /// Enables dynamic URL resolution and stream cancellation.
+    /// Safe to call on `&self` (uses `OnceLock`) — idempotent, first call wins.
+    pub fn attach_server_manager(&self, mgr: Arc<LlamaServerManager>) {
+        let _ = self.server_manager.set(mgr);
+    }
+
+    /// Resolve the current API URL — from server manager if attached, else fallback.
+    fn resolve_api_url(&self) -> String {
+        if let Some(mgr) = self.server_manager.get() {
+            let url = mgr.api_url();
+            if !url.is_empty() {
+                return url;
+            }
+        }
+        self.api_url.clone()
+    }
+
+    /// Update the context window (called by orchestrator after swap).
+    pub fn update_context_window(&self, ctx: usize) {
+        self.context_window.store(ctx, Ordering::Release);
+    }
+
+    /// Get a cancellation token if orchestrator is attached.
+    fn cancel_token(&self) -> Option<CancellationToken> {
+        self.server_manager.get().map(|mgr| mgr.cancel_token())
+    }
+
+    /// Check if the server is in a swapping state.
+    fn is_swapping(&self) -> bool {
+        self.server_manager
+            .get()
+            .map(|mgr| mgr.is_swapping())
+            .unwrap_or(false)
     }
 
     /// Query the llama.cpp `/v1/models` endpoint to detect the actually loaded model.
     /// Returns the model ID string if the server responds, or None.
     pub async fn detect_server_model(&self) -> Option<String> {
-        let url = format!("{}/models", self.api_url);
+        let url = format!("{}/models", self.resolve_api_url());
         let resp = self.client.get(&url).send().await.ok()?;
         if !resp.status().is_success() {
             return None;
@@ -125,7 +171,7 @@ impl LocalBackend {
             }
         }
 
-        let url = format!("{}/chat/completions", self.api_url);
+        let url = format!("{}/chat/completions", self.resolve_api_url());
         let resp = self.client.post(&url).json(&payload).send().await?;
         let status = resp.status();
 
@@ -176,6 +222,18 @@ impl LlmBackend for LocalBackend {
         temperature: f32,
         max_tokens: u32,
     ) -> anyhow::Result<LlmResponse> {
+        // V10: Wait for swap to complete before sending a request
+        if self.is_swapping() {
+            tracing::info!("local LLM: waiting for swap to complete before chat");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+            while self.is_swapping() {
+                if tokio::time::Instant::now() > deadline {
+                    anyhow::bail!("local LLM: swap timeout exceeded (120s)");
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+
         let mut current_messages = messages.to_vec();
 
         for attempt in 0..3 {
@@ -224,6 +282,18 @@ impl LlmBackend for LocalBackend {
         temperature: f32,
         max_tokens: u32,
     ) -> anyhow::Result<Pin<Box<dyn Stream<Item = String> + Send>>> {
+        // V10: Wait for swap to complete
+        if self.is_swapping() {
+            tracing::info!("local LLM: waiting for swap to complete before stream");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+            while self.is_swapping() {
+                if tokio::time::Instant::now() > deadline {
+                    anyhow::bail!("local LLM: swap timeout exceeded (120s)");
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+
         if matches!(self.circuit.state().await, CircuitState::Open) {
             anyhow::bail!("local LLM stream unavailable (circuit open)");
         }
@@ -255,7 +325,7 @@ impl LlmBackend for LocalBackend {
             }
         }
 
-        let url = format!("{}/chat/completions", self.api_url);
+        let url = format!("{}/chat/completions", self.resolve_api_url());
         let resp = match tokio::time::timeout(
             Duration::from_secs(45),
             self.client.post(&url).json(&payload).send(),
@@ -287,37 +357,57 @@ impl LlmBackend for LocalBackend {
 
         self.circuit.on_success().await;
 
-        let stream = futures::stream::unfold(resp, |mut resp| async move {
-            match resp.chunk().await {
-                Ok(Some(chunk)) => {
-                    let text = String::from_utf8_lossy(&chunk).to_string();
-                    // Parse SSE: lines starting with "data: "
-                    let mut tokens = String::new();
-                    for line in text.lines() {
-                        if let Some(data) = line.strip_prefix("data: ") {
-                            if data == "[DONE]" {
-                                continue;
-                            }
-                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
-                                let delta_content = &v["choices"][0]["delta"]["content"];
-                                let tok = extract_openai_content_text(delta_content);
-                                if !tok.is_empty() {
-                                    tokens.push_str(&tok);
+        // V13: Build cancellable stream using select! on CancellationToken
+        let cancel = self.cancel_token();
+
+        let stream = futures::stream::unfold(
+            (resp, cancel),
+            |(mut resp, cancel)| async move {
+                // If we have a cancel token, use select! to abort on cancellation
+                let chunk_result = if let Some(ref token) = cancel {
+                    tokio::select! {
+                        biased;
+                        _ = token.cancelled() => {
+                            tracing::info!("local LLM stream: cancelled by orchestrator swap");
+                            return None;
+                        }
+                        result = resp.chunk() => result,
+                    }
+                } else {
+                    resp.chunk().await
+                };
+
+                match chunk_result {
+                    Ok(Some(chunk)) => {
+                        let text = String::from_utf8_lossy(&chunk).to_string();
+                        // Parse SSE: lines starting with "data: "
+                        let mut tokens = String::new();
+                        for line in text.lines() {
+                            if let Some(data) = line.strip_prefix("data: ") {
+                                if data == "[DONE]" {
+                                    continue;
+                                }
+                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                                    let delta_content = &v["choices"][0]["delta"]["content"];
+                                    let tok = extract_openai_content_text(delta_content);
+                                    if !tok.is_empty() {
+                                        tokens.push_str(&tok);
+                                    }
                                 }
                             }
                         }
+                        Some((tokens, (resp, cancel)))
                     }
-                    Some((tokens, resp))
+                    _ => None,
                 }
-                _ => None,
-            }
-        });
+            },
+        );
 
         Ok(Box::pin(stream))
     }
 
     async fn health_check(&self) -> bool {
-        let health_url = self.api_url.replace("/v1", "/health");
+        let health_url = self.resolve_api_url().replace("/v1", "/health");
         self.client
             .get(&health_url)
             .send()

@@ -66,8 +66,8 @@ impl VoiceActivityDetector {
                     let state = SileroState {
                         session,
                         // Silero VAD v4/v5: state shape [2, 1, 64]
-                        h: vec![0.0f32; 2 * 1 * 64],
-                        c: vec![0.0f32; 2 * 1 * 64],
+                        h: vec![0.0f32; 2 * 64],
+                        c: vec![0.0f32; 2 * 64],
                     };
                     vad.silero = Some(Arc::new(StdMutex::new(state)));
                     tracing::info!(path = %model_path.display(), "Silero VAD model loaded");
