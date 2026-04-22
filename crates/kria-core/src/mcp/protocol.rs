@@ -113,8 +113,11 @@ pub struct McpToolDef {
 
 /// `tools/list` response.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolsListResult {
     pub tools: Vec<McpToolDef>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
 }
 
 /// `tools/call` request params.

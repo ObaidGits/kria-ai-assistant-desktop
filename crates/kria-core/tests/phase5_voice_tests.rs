@@ -394,7 +394,7 @@ fn phase5_voice_config_defaults() {
     assert_eq!(config.language, "auto");
     assert_eq!(config.partial_update_ms, 2000);
     assert!((config.confidence_threshold - 0.30).abs() < f32::EPSILON);
-    assert_eq!(config.noise_suppression_mode, "light");
+    assert_eq!(config.noise_suppression_mode, "off");
     assert!(config.follow_system_default_mic);
     assert!(config.follow_system_default_speaker);
     assert!(config.persist_transcripts);

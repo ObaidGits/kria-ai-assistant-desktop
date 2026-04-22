@@ -157,6 +157,9 @@ pub struct OrchestratorSnapshot {
 | `start(config, model_path, mmproj_path, event_bus, health)` | Async constructor — detects GPU, spawns server, starts watchdog |
 | `snapshot()` | Returns current `OrchestratorSnapshot` |
 | `api_url()` | Current `llama-server` API URL (ephemeral port) |
+| `ensure_ready(reason)` | Preflight runtime warm-up — starts/restarts server on demand before a turn |
+| `restart(reason)` | Bounded restart with cooldown + fallback spawn path |
+| `release_if_idle(reason)` | Gracefully releases local runtime (and GPU VRAM) during safe idle windows |
 | `shutdown()` | Graceful shutdown — aborts watchdog, kills server |
 
 ---
@@ -613,6 +616,15 @@ All orchestrator settings live under `[orchestrator]` in `config/default.toml`.
 | `flash_attention` | bool | `true` | Pass `--flash-attn` to llama-server |
 | `mlock` | bool | `true` | Pass `--mlock` to llama-server (lock model weights in RAM) |
 | `batch_size` | u32 | `256` | Pass `--batch-size` to llama-server |
+| `graceful_stop_timeout_secs` | u64 | `5` | Max wait for graceful stop before kill escalation |
+| `health_check_timeout_secs` | u64 | `120` | Spawn readiness timeout for llama-server health probe |
+| `port_discovery_timeout_secs` | u64 | `60` | Max wait for ephemeral port discovery from server logs |
+| `vram_release_timeout_secs` | u64 | `5` | Max wait to confirm VRAM release after stop/swap |
+| `restart_cooldown_secs` | u64 | `10` | Minimum cooldown between restart attempts |
+| `restart_backoff_ms` | u64 | `350` | Backoff before fallback spawn after restart failure |
+| `idle_release_enabled` | bool | `true` | Enable idle-time runtime release to free GPU memory |
+| `idle_release_after_secs` | u64 | `300` | Idle window before releasing local runtime |
+| `idle_release_check_interval_secs` | u64 | `10` | Poll interval for idle-release checks |
 
 ### macOS-specific Thresholds
 

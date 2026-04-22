@@ -2,6 +2,7 @@ import { Component, Show, For, createSignal, createMemo, onMount, onCleanup } fr
 import { appStore } from "./stores/app";
 import { provisioningStore } from "./stores/provisioning";
 import ChatView from "./components/ChatView";
+import PromptLabView from "./components/PromptLabView";
 import SessionSidebar from "./components/SessionSidebar";
 import SettingsModal from "./components/SettingsModal";
 import HitlModal from "./components/HitlModal";
@@ -27,12 +28,33 @@ export function addToast(message: string, type: Toast["type"] = "info") {
 const [toasts, setToasts] = createSignal<Toast[]>([]);
 
 const App: Component = () => {
-  const { showSettings, showHitl, voiceActive, setShowSettings } = appStore;
+  const {
+    showSettings,
+    showHitl,
+    voiceActive,
+    setShowSettings,
+    currentEnvironment,
+    colabDispatchWarning,
+  } = appStore;
   const [showShortcuts, setShowShortcuts] = createSignal(false);
   const [showWizard, setShowWizard] = createSignal(false);
   const [wizardLoading, setWizardLoading] = createSignal(true);
 
   const assistantStatus = createMemo(() => appStore.assistantStatus());
+  const routingMode = createMemo(() => {
+    const raw = String(appStore.settings()?.llm?.routing_mode ?? "local").toLowerCase();
+    if (raw === "cloud") return "gemini";
+    if (raw === "hybrid") return "local";
+    if (["local", "colab", "gemini", "external"].includes(raw)) return raw;
+    return "local";
+  });
+  const routingSummary = createMemo(() => {
+    const requested = routingMode();
+    if (colabDispatchWarning()) {
+      return `${requested} -> local fallback`;
+    }
+    return requested;
+  });
   const connectedMcpServers = createMemo(
     () => appStore
       .mcpServers()
@@ -112,8 +134,21 @@ const App: Component = () => {
 
     // Check provisioning state before loading main app
     void (async () => {
+      const wizardAlreadyCompleted =
+        typeof window !== "undefined" &&
+        window.localStorage.getItem("kria_wizard_complete") === "true";
+
+      if (wizardAlreadyCompleted) {
+        setShowWizard(false);
+        setWizardLoading(false);
+        return;
+      }
+
       const state = await provisioningStore.loadState();
-      if (state && state.current_step !== "complete") {
+      if (state && state.current_step === "complete") {
+        window.localStorage.setItem("kria_wizard_complete", "true");
+        setShowWizard(false);
+      } else if (state && state.current_step !== "complete") {
         setShowWizard(true);
       }
       setWizardLoading(false);
@@ -160,16 +195,27 @@ const App: Component = () => {
                 <span class={statusDotClass()} />
                 <span>{assistantStatus().label}</span>
               </div>
+              <div class="status-pill subtle">Routing {routingSummary()}</div>
               <div class="status-pill subtle">{connectedMcpServers()} MCP online</div>
               <div class="status-pill subtle">{appStore.alerts().length} active alerts</div>
             </div>
           </div>
+          <Show when={colabDispatchWarning()}>
+            <div class="startup-warning-banner">
+              <strong>Colab Routing:</strong> {colabDispatchWarning()}
+            </div>
+          </Show>
           <Show when={ocrStartupWarning()}>
             <div class="startup-warning-banner">
               <strong>OCR Warning:</strong> {ocrStartupWarning()}
             </div>
           </Show>
-          <ChatView />
+          <Show when={currentEnvironment() === "assistant"}>
+            <ChatView />
+          </Show>
+          <Show when={currentEnvironment() === "prompt_lab"}>
+            <PromptLabView />
+          </Show>
           <div class="status-bar">
             <div class="status-item">
               <span class={statusDotClass()} />
@@ -180,6 +226,9 @@ const App: Component = () => {
             </div>
             <div class="status-item">
               <span>MCP: {connectedMcpServers()} online</span>
+            </div>
+            <div class="status-item">
+              <span>Routing: {routingSummary()}</span>
             </div>
             <div class="status-item">
               <span>{appStore.theme() === "dark" ? "🌙" : "☀️"}</span>

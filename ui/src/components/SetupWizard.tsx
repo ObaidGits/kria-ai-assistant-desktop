@@ -502,7 +502,8 @@ const SetupWizard: Component<{ onComplete: () => void }> = (props) => {
     }
   }
 
-  function finishWizard() {
+  async function finishWizard() {
+    await provisioningStore.completeProvisioning();
     localStorage.setItem("kria_wizard_complete", "true");
     props.onComplete();
   }

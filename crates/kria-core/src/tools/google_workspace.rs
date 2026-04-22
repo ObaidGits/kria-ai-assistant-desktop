@@ -22,6 +22,7 @@ use crate::infra::ToolResult;
 use crate::mcp::McpClient;
 use crate::safety::RiskLevel;
 use crate::sidecar::SidecarBridge;
+use crate::tools::google_workspace_contract as gw_contract;
 use crate::tools::registry::{ParamDef, ToolDef, ToolHandler, ToolRegistry};
 use async_trait::async_trait;
 use std::collections::HashSet;
@@ -68,17 +69,8 @@ const GMAIL_MAX_RESULTS_CAP: u64 = 200;
 const GMAIL_PAGE_SIZE_CAP: u64 = 50;
 const GMAIL_MAX_PAGE_FETCHES: usize = 6;
 
-fn gw_kind_for_tool(tool: &str) -> &'static str {
-    match tool {
-        t if t.contains("Gmail") => "gmail",
-        t if t.contains("Calendar") => "calendar",
-        t if t.contains("Spreadsheet") => "sheets",
-        t if t.contains("Presentation") || t.contains("Slides") => "slides",
-        t if t.contains("Form") => "forms",
-        t if t.contains("Document") || t.contains("GoogleDoc") => "docs",
-        t if t.contains("Folder") || t.contains("Drive") || t.contains("File") => "drive",
-        _ => "google_workspace",
-    }
+fn new_correlation_id() -> String {
+    gw_contract::new_correlation_id()
 }
 
 fn parse_json_or_text(text: &str) -> serde_json::Value {
@@ -91,21 +83,36 @@ fn parse_json_or_text(text: &str) -> serde_json::Value {
         .unwrap_or_else(|_| serde_json::json!({ "text": trimmed }))
 }
 
-fn envelope_result(tool: &str, data: serde_json::Value, raw_text: Option<&str>) -> serde_json::Value {
-    serde_json::json!({
-        "provider": "google_workspace",
-        "kind": gw_kind_for_tool(tool),
-        "tool": tool,
-        "data": data,
-        "raw_text": raw_text.unwrap_or(""),
-    })
+fn envelope_result_with_meta(
+    tool: &str,
+    data: serde_json::Value,
+    raw_text: Option<&str>,
+    correlation_id: Option<&str>,
+    account: Option<&str>,
+) -> serde_json::Value {
+    gw_contract::envelope_for_tool(tool, data, raw_text, correlation_id, account)
+}
+
+fn envelope_result(
+    tool: &str,
+    data: serde_json::Value,
+    raw_text: Option<&str>,
+) -> serde_json::Value {
+    envelope_result_with_meta(tool, data, raw_text, None, None)
 }
 
 fn looks_like_drive_listing_phrase(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    let has_list_intent = ["list", "show", "browse", "contents", "what is in", "what's in"]
-        .iter()
-        .any(|needle| lower.contains(needle));
+    let has_list_intent = [
+        "list",
+        "show",
+        "browse",
+        "contents",
+        "what is in",
+        "what's in",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
     let has_search_intent = ["search", "find", "look for", "locate"]
         .iter()
         .any(|needle| lower.contains(needle));
@@ -210,10 +217,7 @@ fn parse_gmail_messages_from_text(raw: &str) -> Vec<serde_json::Value> {
             msg.insert(
                 "labels".into(),
                 serde_json::Value::Array(
-                    labels
-                        .into_iter()
-                        .map(serde_json::Value::String)
-                        .collect(),
+                    labels.into_iter().map(serde_json::Value::String).collect(),
                 ),
             );
             continue;
@@ -350,6 +354,16 @@ fn extract_first_string_recursive(value: &serde_json::Value, keys: &[&str]) -> O
         .find_map(|key| find_string_field_recursive(value, key))
 }
 
+fn extract_gmail_draft_id(payload: &serde_json::Value) -> Option<String> {
+    if let Some(draft_id) = extract_first_string_recursive(payload, &["draftId", "draft_id"]) {
+        return Some(draft_id);
+    }
+
+    let raw_text = find_string_field_recursive(payload, "raw_text")?;
+    let parsed = parse_json_or_text(&raw_text);
+    extract_first_string_recursive(&parsed, &["draftId", "draft_id"])
+}
+
 fn extract_id_from_google_url(url: &str, marker: &str) -> Option<String> {
     let (_, rest) = url.split_once(marker)?;
     let id = rest
@@ -482,13 +496,19 @@ impl GwBridge {
             args = serde_json::json!({});
         }
         let account = active_google_account();
+        let correlation_id = new_correlation_id();
         // Inject account — never overwrite if the caller already set it
         if let Some(obj) = args.as_object_mut() {
             obj.entry("account")
                 .or_insert_with(|| serde_json::json!(account));
         }
 
-        tracing::info!("[GW] mcp_call: tool='{}' account='{}'", tool, account);
+        tracing::info!(
+            "[GW] mcp_call: tool='{}' account='{}' correlation_id='{}'",
+            tool,
+            account,
+            correlation_id
+        );
         tracing::debug!("[GW] mcp_call args: {}", args);
 
         let guard = self.mcp.read().await;
@@ -500,10 +520,23 @@ impl GwBridge {
                      Run: npx google-workspace-mcp accounts add personal  \
                      Then restart KRIA. (tool={tool})"
                 );
+                let gw_error = GwErrorDescriptor {
+                    code: "account_not_connected",
+                    category: "configuration",
+                    recovery_action: "refresh_auth",
+                    retryable: false,
+                    user_facing: msg.clone(),
+                };
                 tracing::warn!("[GW] {}", msg);
                 return ToolResult {
                     success: false,
-                    data: serde_json::Value::Null,
+                    data: envelope_result_with_meta(
+                        tool,
+                        serde_json::json!({ "error": gw_error_payload(&gw_error, Some(&msg)) }),
+                        None,
+                        Some(&correlation_id),
+                        Some(&account),
+                    ),
                     error: Some(msg),
                 };
             }
@@ -524,14 +557,16 @@ impl GwBridge {
                         tool,
                         &text[..text.len().min(300)]
                     );
-                    // Parse well-known Google API errors into concise, actionable messages.
-                    let user_error = parse_gw_error(&text);
+                    let gw_error = parse_gw_error(&text);
+                    let user_error = gw_error.user_facing.clone();
                     ToolResult {
                         success: false,
-                        data: envelope_result(
+                        data: envelope_result_with_meta(
                             tool,
-                            serde_json::json!({ "error": user_error.clone() }),
+                            serde_json::json!({ "error": gw_error_payload(&gw_error, Some(&text)) }),
                             Some(&text),
+                            Some(&correlation_id),
+                            Some(&account),
                         ),
                         error: Some(user_error),
                     }
@@ -546,16 +581,26 @@ impl GwBridge {
             }
             Err(e) => {
                 tracing::error!("[GW] tool '{}' call error: {}", tool, e);
+                let user_error = format!("MCP call failed: {e}");
+                let gw_error = mcp_transport_error(&user_error);
                 ToolResult {
                     success: false,
-                    data: serde_json::Value::Null,
-                    error: Some(format!("MCP call failed: {e}")),
+                    data: envelope_result_with_meta(
+                        tool,
+                        serde_json::json!({ "error": gw_error_payload(&gw_error, Some(&user_error)) }),
+                        None,
+                        Some(&correlation_id),
+                        Some(&account),
+                    ),
+                    error: Some(user_error),
                 }
             }
         }
     }
 
     async fn mcp_call(&self, tool: &str, args: serde_json::Value) -> ToolResult {
+        let correlation_id = new_correlation_id();
+        let account = active_google_account();
         let raw = self.mcp_call_raw(tool, args).await;
         if !raw.success {
             return raw;
@@ -564,7 +609,13 @@ impl GwBridge {
         let raw_text = raw.data.as_str().unwrap_or("");
         ToolResult {
             success: true,
-            data: envelope_result(tool, parse_json_or_text(raw_text), Some(raw_text)),
+            data: envelope_result_with_meta(
+                tool,
+                parse_json_or_text(raw_text),
+                Some(raw_text),
+                Some(&correlation_id),
+                Some(&account),
+            ),
             error: None,
         }
     }
@@ -576,6 +627,8 @@ impl GwBridge {
         mcp_args: serde_json::Value,
         sidecar_method: &str,
     ) -> ToolResult {
+        let correlation_id = new_correlation_id();
+        let account = active_google_account();
         tracing::debug!(
             "[GW] fetch_and_buffer: mcp_tool={} sidecar={}",
             mcp_tool,
@@ -593,7 +646,13 @@ impl GwBridge {
                 tracing::info!("[GW] sidecar '{}' digest produced", sidecar_method);
                 ToolResult {
                     success: true,
-                    data: envelope_result(mcp_tool, digest, Some(&raw_text)),
+                    data: envelope_result_with_meta(
+                        mcp_tool,
+                        digest,
+                        Some(&raw_text),
+                        Some(&correlation_id),
+                        Some(&account),
+                    ),
                     error: None,
                 }
             }
@@ -605,7 +664,13 @@ impl GwBridge {
                 );
                 ToolResult {
                     success: true,
-                    data: envelope_result(mcp_tool, parse_json_or_text(&raw_text), Some(&raw_text)),
+                    data: envelope_result_with_meta(
+                        mcp_tool,
+                        parse_json_or_text(&raw_text),
+                        Some(&raw_text),
+                        Some(&correlation_id),
+                        Some(&account),
+                    ),
                     error: None,
                 }
             }
@@ -613,6 +678,8 @@ impl GwBridge {
     }
 
     async fn grounded_gmail_search(&self, query: String, requested_max: u64) -> ToolResult {
+        let correlation_id = new_correlation_id();
+        let account = active_google_account();
         let requested_count = requested_max.clamp(1, GMAIL_MAX_RESULTS_CAP);
         let page_size = requested_count.clamp(1, GMAIL_PAGE_SIZE_CAP);
 
@@ -732,7 +799,13 @@ impl GwBridge {
         let raw_text = raw_pages.join("\n");
         ToolResult {
             success: true,
-            data: envelope_result("searchGmail", data, Some(&raw_text)),
+            data: envelope_result_with_meta(
+                "searchGmail",
+                data,
+                Some(&raw_text),
+                Some(&correlation_id),
+                Some(&account),
+            ),
             error: None,
         }
     }
@@ -743,7 +816,7 @@ fn gmail_max_results(params: &serde_json::Value, default: u64) -> u64 {
         .get("max_results")
         .and_then(|v| v.as_u64())
         .filter(|count| *count > 0)
-    .map(|count| count.min(GMAIL_MAX_RESULTS_CAP))
+        .map(|count| count.min(GMAIL_MAX_RESULTS_CAP))
         .unwrap_or(default)
 }
 
@@ -763,90 +836,24 @@ fn normalize_gmail_inbox_query(query: Option<&str>) -> String {
 
 // ── Error helpers ──────────────────────────────────────────────────────────────
 
-/// Convert verbose Google API error messages into short, actionable strings.
+type GwErrorDescriptor = gw_contract::GwErrorDescriptor;
+
+fn gw_error_payload(error: &GwErrorDescriptor, raw: Option<&str>) -> serde_json::Value {
+    gw_contract::error_payload(error, raw)
+}
+
+/// Convert verbose Google API error messages into structured, actionable metadata.
 ///
 /// Google errors for "API not enabled" are typically hundreds of characters long
-/// and contain a URL to fix the issue.  This function extracts the key info so
-/// KRIA's UI shows something readable.
-fn parse_gw_error(raw: &str) -> String {
-    // "accessNotConfigured" / "API has not been used" — API disabled in Cloud Console
-    if raw.contains("accessNotConfigured")
-        || raw.contains("has not been used")
-        || raw.contains("is disabled")
-    {
-        // Try to extract the enable URL
-        let url = raw
-            .split_once("https://console")
-            .map(|(_, rest)| {
-                format!(
-                    "https://console{}",
-                    rest.split_whitespace().next().unwrap_or("")
-                )
-            })
-            .unwrap_or_default();
-        // Determine which API from the URL or the error text
-        let api_name = if raw.contains("gmail") {
-            "Gmail API"
-        } else if raw.contains("calendar") {
-            "Calendar API"
-        } else if raw.contains("drive") {
-            "Drive API"
-        } else if raw.contains("docs") {
-            "Docs API"
-        } else if raw.contains("sheets") {
-            "Sheets API"
-        } else if raw.contains("slides") {
-            "Slides API"
-        } else {
-            "Google API"
-        };
-        if url.is_empty() {
-            return format!(
-                "{api_name} is disabled in your Google Cloud project. \
-                 Enable it at https://console.cloud.google.com/apis/library then restart KRIA."
-            );
-        }
-        return format!(
-            "{api_name} is disabled. Enable it at {url} \
-             (wait ~1 min after enabling, then retry or restart KRIA)."
-        );
-    }
+/// and contain a URL to fix the issue. This function extracts the key info so
+/// KRIA can preserve compatibility (`error` string) while also emitting a typed
+/// error envelope for downstream clients.
+fn parse_gw_error(raw: &str) -> GwErrorDescriptor {
+    gw_contract::parse_error(raw)
+}
 
-    // "invalid_grant" / token expired / revoked
-    if raw.contains("invalid_grant")
-        || raw.contains("Token has been expired")
-        || raw.contains("Token has been revoked")
-    {
-        return "Google authentication token expired or revoked. \
-                Re-run: bash scripts/setup_google_workspace.sh  then restart KRIA."
-            .into();
-    }
-
-    // "insufficientPermissions" — scope missing
-    if raw.contains("insufficientPermissions")
-        || raw.contains("Request had insufficient authentication scopes")
-    {
-        return "Insufficient OAuth scopes. \
-                Re-run: bash scripts/setup_google_workspace.sh  to refresh permissions, then restart KRIA.".into();
-    }
-
-    // "rateLimitExceeded" / quota
-    if raw.contains("rateLimitExceeded") || raw.contains("quotaExceeded") {
-        return "Google API rate limit or quota exceeded. Wait a minute and try again.".into();
-    }
-
-    // transient upstream proxy/gateway failure
-    if raw.contains("Bad Gateway") || raw.contains("status code 502") {
-        return "Google API temporarily unavailable (502 Bad Gateway). Retry in a few seconds."
-            .into();
-    }
-
-    // Fallback: trim to 300 chars
-    if raw.len() > 300 {
-        format!("{}…", &raw[..300])
-    } else {
-        raw.to_string()
-    }
+fn mcp_transport_error(raw: &str) -> GwErrorDescriptor {
+    gw_contract::mcp_transport_error(raw)
 }
 
 // ── Gmail tools ────────────────────────────────────────────────────────────────
@@ -910,28 +917,25 @@ impl ToolHandler for GwGmailSend {
         if !draft_result.success {
             return draft_result;
         }
-        // Extract draft_id from result (JSON string containing draftId field)
-        let draft_text = draft_result.data.as_str().unwrap_or("");
-        tracing::info!(
-            "[GW] draft created: {}",
-            &draft_text[..draft_text.len().min(200)]
-        );
-        // Step 2: sendGmailDraft using the draft_id
-        // The result text from createGmailDraft typically contains the draft ID
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(draft_text) {
-            if let Some(draft_id) = parsed.get("draftId").and_then(|v| v.as_str()) {
-                return self
-                    .0
-                    .mcp_call("sendGmailDraft", serde_json::json!({ "draftId": draft_id }))
-                    .await;
-            }
+
+        if let Some(draft_id) = extract_gmail_draft_id(&draft_result.data) {
+            return self
+                .0
+                .mcp_call("sendGmailDraft", serde_json::json!({ "draftId": draft_id }))
+                .await;
         }
+
         // Fallback: return the draft result and let user know to send manually
-        tracing::warn!("[GW] could not extract draftId from createGmailDraft response — draft created but not sent");
+        tracing::warn!(
+            "[GW] could not extract draftId from createGmailDraft response — draft created but not sent"
+        );
         ToolResult {
             success: false,
             data: draft_result.data,
-            error: Some("Draft created but could not auto-send: draftId not found in response. Check Gmail drafts.".into()),
+            error: Some(
+                "Draft created but could not auto-send: draftId not found in response. Check Gmail drafts."
+                    .into(),
+            ),
         }
     }
 }
@@ -952,9 +956,6 @@ impl ToolHandler for GwGmailDelete {
             .await
     }
 }
-
-// ── Calendar tools ─────────────────────────────────────────────────────────────
-// Real tool names: listCalendarEvents, createCalendarEvent, deleteCalendarEvent
 
 struct GwCalendarToday(GwBridge);
 #[async_trait]
@@ -1003,7 +1004,9 @@ impl ToolHandler for GwCalendarCreate {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
         let primary_args = calendar_create_args(&params, false);
         let primary_result = self.0.mcp_call("createCalendarEvent", primary_args).await;
-        if primary_result.success || !should_retry_calendar_with_alternate_shape(primary_result.error.as_deref()) {
+        if primary_result.success
+            || !should_retry_calendar_with_alternate_shape(primary_result.error.as_deref())
+        {
             return primary_result;
         }
 
@@ -1018,7 +1021,10 @@ impl ToolHandler for GwCalendarCreate {
             return alternate_result;
         }
 
-        let merged_error = match (primary_result.error.as_deref(), alternate_result.error.as_deref()) {
+        let merged_error = match (
+            primary_result.error.as_deref(),
+            alternate_result.error.as_deref(),
+        ) {
             (Some(primary), Some(alternate)) => {
                 format!("{primary} (alternate argument retry failed: {alternate})")
             }
@@ -1185,13 +1191,12 @@ impl ToolHandler for GwDocsCreate {
             if verify_result.success {
                 result_data["status"] = serde_json::json!("created_verified");
                 result_data["verified"] = serde_json::json!(true);
-                result_data["verify"] = parse_json_or_text(verify_result.data.as_str().unwrap_or(""));
+                result_data["verify"] =
+                    parse_json_or_text(verify_result.data.as_str().unwrap_or(""));
             } else {
-                result_data["verification_error"] = serde_json::json!(
-                    verify_result
-                        .error
-                        .unwrap_or_else(|| "Document verification failed after create".into())
-                );
+                result_data["verification_error"] = serde_json::json!(verify_result
+                    .error
+                    .unwrap_or_else(|| "Document verification failed after create".into()));
             }
         } else {
             result_data["verification_error"] = serde_json::json!(
@@ -1270,7 +1275,13 @@ impl ToolHandler for GwSheetsCreate {
         let spreadsheet_id = extract_google_resource_id(
             &create_data,
             &["spreadsheetId", "spreadsheet_id", "id"],
-            &["url", "spreadsheetUrl", "spreadsheet_link", "link", "webViewLink"],
+            &[
+                "url",
+                "spreadsheetUrl",
+                "spreadsheet_link",
+                "link",
+                "webViewLink",
+            ],
             "/spreadsheets/d/",
         );
 
@@ -1298,13 +1309,12 @@ impl ToolHandler for GwSheetsCreate {
             if verify_result.success {
                 result_data["status"] = serde_json::json!("created_verified");
                 result_data["verified"] = serde_json::json!(true);
-                result_data["verify"] = parse_json_or_text(verify_result.data.as_str().unwrap_or(""));
+                result_data["verify"] =
+                    parse_json_or_text(verify_result.data.as_str().unwrap_or(""));
             } else {
-                result_data["verification_error"] = serde_json::json!(
-                    verify_result
-                        .error
-                        .unwrap_or_else(|| "Spreadsheet verification failed after create".into())
-                );
+                result_data["verification_error"] = serde_json::json!(verify_result
+                    .error
+                    .unwrap_or_else(|| "Spreadsheet verification failed after create".into()));
             }
         } else {
             result_data["verification_error"] = serde_json::json!(
@@ -1390,7 +1400,13 @@ impl ToolHandler for GwSlidesCreate {
         let presentation_id = extract_google_resource_id(
             &create_data,
             &["presentationId", "presentation_id", "id"],
-            &["url", "presentationUrl", "presentation_link", "link", "webViewLink"],
+            &[
+                "url",
+                "presentationUrl",
+                "presentation_link",
+                "link",
+                "webViewLink",
+            ],
             "/presentation/d/",
         );
 
@@ -1418,13 +1434,12 @@ impl ToolHandler for GwSlidesCreate {
             if verify_result.success {
                 result_data["status"] = serde_json::json!("created_verified");
                 result_data["verified"] = serde_json::json!(true);
-                result_data["verify"] = parse_json_or_text(verify_result.data.as_str().unwrap_or(""));
+                result_data["verify"] =
+                    parse_json_or_text(verify_result.data.as_str().unwrap_or(""));
             } else {
-                result_data["verification_error"] = serde_json::json!(
-                    verify_result
-                        .error
-                        .unwrap_or_else(|| "Presentation verification failed after create".into())
-                );
+                result_data["verification_error"] = serde_json::json!(verify_result
+                    .error
+                    .unwrap_or_else(|| "Presentation verification failed after create".into()));
             }
         } else {
             result_data["verification_error"] = serde_json::json!(
@@ -1481,7 +1496,10 @@ pub fn register(reg: &ToolRegistry, mcp_ref: GwClientRef, sidecar: Arc<SidecarBr
         "[GW] registering Google Workspace tools (account source=KRIA_GW_ACCOUNT, lazy MCP ref)"
     );
 
-    let gw = GwBridge { mcp: mcp_ref, sidecar };
+    let gw = GwBridge {
+        mcp: mcp_ref,
+        sidecar,
+    };
 
     let tools: Vec<(ToolDef, Arc<dyn ToolHandler>)> = vec![
         // ── Ambient (always mounted) ─────────────────────
@@ -1818,10 +1836,10 @@ pub fn register(reg: &ToolRegistry, mcp_ref: GwClientRef, sidecar: Arc<SidecarBr
 #[cfg(test)]
 mod tests {
     use super::{
-        build_google_resource_url, calendar_create_args, extract_google_resource_id,
-        gmail_max_results, gmail_messages_from_payload, gmail_next_page_token,
-        looks_like_drive_listing_phrase, normalize_gmail_inbox_query,
-        parse_gmail_messages_from_text,
+        build_google_resource_url, calendar_create_args, envelope_result, extract_gmail_draft_id,
+        extract_google_resource_id, gmail_max_results, gmail_messages_from_payload,
+        gmail_next_page_token, looks_like_drive_listing_phrase, normalize_gmail_inbox_query,
+        parse_gmail_messages_from_text, parse_gw_error,
     };
 
     #[test]
@@ -1844,6 +1862,70 @@ mod tests {
         assert_eq!(
             gmail_max_results(&serde_json::json!({"max_results": 500}), 10),
             200
+        );
+    }
+
+    #[test]
+    fn envelope_result_contains_contract_metadata() {
+        let envelope = envelope_result(
+            "searchGmail",
+            serde_json::json!({ "messages": [] }),
+            Some("{\"messages\":[]}"),
+        );
+
+        assert_eq!(envelope["provider"], "google_workspace");
+        assert_eq!(envelope["kind"], "gmail");
+        assert_eq!(envelope["_meta"]["schema_version"], "1.1");
+        assert!(!envelope["_meta"]["correlation_id"]
+            .as_str()
+            .unwrap_or("")
+            .is_empty());
+        assert!(!envelope["_meta"]["timestamp"]
+            .as_str()
+            .unwrap_or("")
+            .is_empty());
+        assert!(!envelope["_meta"]["account"]
+            .as_str()
+            .unwrap_or("")
+            .is_empty());
+    }
+
+    #[test]
+    fn gw_error_parser_classifies_quota_errors() {
+        let parsed = parse_gw_error("rateLimitExceeded: Too many requests");
+
+        assert_eq!(parsed.code, "quota_exceeded");
+        assert_eq!(parsed.category, "quota");
+        assert_eq!(parsed.recovery_action, "wait_and_retry");
+        assert!(parsed.retryable);
+        assert!(parsed.user_facing.contains("rate limit") || parsed.user_facing.contains("quota"));
+    }
+
+    #[test]
+    fn extract_gmail_draft_id_handles_wrapped_and_raw_shapes() {
+        let wrapped = serde_json::json!({
+            "provider": "google_workspace",
+            "data": {
+                "result": {
+                    "draftId": "draft_wrapped_123"
+                }
+            }
+        });
+        assert_eq!(
+            extract_gmail_draft_id(&wrapped).as_deref(),
+            Some("draft_wrapped_123")
+        );
+
+        let raw_text_shape = serde_json::json!({
+            "provider": "google_workspace",
+            "data": {
+                "status": "created"
+            },
+            "raw_text": "{\"draftId\":\"draft_raw_456\"}"
+        });
+        assert_eq!(
+            extract_gmail_draft_id(&raw_text_shape).as_deref(),
+            Some("draft_raw_456")
         );
     }
 
@@ -1902,9 +1984,13 @@ Total estimate: 201 messages
 
     #[test]
     fn drive_listing_phrase_detector_distinguishes_list_from_search() {
-        assert!(looks_like_drive_listing_phrase("list files in my google drive"));
+        assert!(looks_like_drive_listing_phrase(
+            "list files in my google drive"
+        ));
         assert!(looks_like_drive_listing_phrase("show drive contents"));
-        assert!(!looks_like_drive_listing_phrase("search drive for quarterly report"));
+        assert!(!looks_like_drive_listing_phrase(
+            "search drive for quarterly report"
+        ));
     }
 
     #[test]

@@ -31,6 +31,15 @@
         "createCalendarEvent": "YELLOW",
         "deleteCalendarEvent": "RED"
       }
+    },
+    {
+      "name": "colab-mcp",
+      "transport": "stdio",
+      "command": "uvx",
+      "args": ["git+https://github.com/googlecolab/colab-mcp"],
+      "enabled": true,
+      "trust_level": "YELLOW",
+      "tool_overrides": {}
     }
   ]
 }

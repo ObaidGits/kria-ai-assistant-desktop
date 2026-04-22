@@ -9,6 +9,7 @@ use tokio::sync::RwLock;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoutingMode {
     Local,
+    Colab,
     Gemini,
     External,
 }
@@ -18,6 +19,7 @@ impl std::str::FromStr for RoutingMode {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mode = match s.to_lowercase().as_str() {
+            "colab" => Self::Colab,
             "gemini" => Self::Gemini,
             "external" => Self::External,
             _ => Self::Local,
@@ -30,6 +32,7 @@ impl RoutingMode {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Local => "local",
+            Self::Colab => "colab",
             Self::Gemini => "gemini",
             Self::External => "external",
         }
@@ -44,6 +47,9 @@ pub struct ModelRouter {
     /// orchestrator attachment after construction.
     local_concrete: Option<Arc<LocalBackend>>,
     vision_local: Option<Arc<dyn LlmBackend>>,
+    /// Concrete typed reference to the vision backend for orchestrator
+    /// attachment after construction.
+    vision_local_concrete: Option<Arc<LocalBackend>>,
     cloud_clients: RwLock<HashMap<String, Arc<dyn LlmBackend>>>,
     /// Local API URL (stored for server probing).
     local_api_url: String,
@@ -64,33 +70,42 @@ impl ModelRouter {
             (None, None)
         };
 
-        // Create a vision-capable backend if a vision model is explicitly defined
-        let vision_local = config
+        // Create a vision-capable backend if a vision model is explicitly defined.
+        // Keep a concrete Arc so orchestrator server manager can be attached.
+        let (vision_local, vision_local_concrete) = config
             .llm
             .models
             .iter()
             .find(|m| m.capabilities.contains(&"vision".to_string()) && m.mmproj_file.is_some())
             .map(|vm| {
-                Arc::new(LocalBackend::new(
+                let backend = Arc::new(LocalBackend::new(
                     config.llm.local_api_url.clone(),
                     vm.name.clone(),
                     vec!["text".into(), "vision".into()],
                     vm.context_window,
-                )) as Arc<dyn LlmBackend>
+                ));
+                (
+                    Some(backend.clone() as Arc<dyn LlmBackend>),
+                    Some(backend),
+                )
             })
             // If no explicit vision model but local backend exists, treat local
             // as vision-capable: the user may have loaded a vision model (e.g.
             // Qwen2.5-VL with --mmproj) on their llama.cpp server.
-            .or_else(|| {
+            .unwrap_or_else(|| {
                 if !config.llm.local_api_url.is_empty() {
-                    Some(Arc::new(LocalBackend::new(
+                    let backend = Arc::new(LocalBackend::new(
                         config.llm.local_api_url.clone(),
                         config.llm.active_model.clone(),
                         vec!["text".into(), "vision".into()],
                         config.llm.context_window,
-                    )) as Arc<dyn LlmBackend>)
+                    ));
+                    (
+                        Some(backend.clone() as Arc<dyn LlmBackend>),
+                        Some(backend),
+                    )
                 } else {
-                    None
+                    (None, None)
                 }
             });
 
@@ -126,6 +141,7 @@ impl ModelRouter {
             local,
             local_concrete,
             vision_local,
+            vision_local_concrete,
             cloud_clients: RwLock::new(cloud_clients),
             local_api_url: config.llm.local_api_url.clone(),
         }
@@ -170,6 +186,14 @@ impl ModelRouter {
 
         match mode {
             RoutingMode::Local => self.local.clone(),
+            RoutingMode::Colab => {
+                let clients = self.cloud_clients.read().await;
+                clients
+                    .get("colab")
+                    .cloned()
+                    .or_else(|| clients.get("external").cloned())
+                    .or_else(|| self.local.clone())
+            }
             RoutingMode::Gemini => {
                 let clients = self.cloud_clients.read().await;
                 clients
@@ -237,6 +261,10 @@ impl ModelRouter {
     /// This wires up dynamic URL resolution and stream cancellation.
     pub fn attach_server_manager(&self, mgr: Arc<LlamaServerManager>) {
         if let Some(ref backend) = self.local_concrete {
+            backend.attach_server_manager(mgr.clone());
+        }
+
+        if let Some(ref backend) = self.vision_local_concrete {
             backend.attach_server_manager(mgr);
         }
     }

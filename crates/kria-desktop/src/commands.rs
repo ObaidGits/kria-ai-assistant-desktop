@@ -6,17 +6,20 @@ use axum::{
     Json, Router,
 };
 use chrono::Utc;
-use kria_core::agent::loop_engine::StreamEvent;
+use kria_core::agent::loop_engine::{
+    PromptLabToolSelectionStrategy, StreamEvent, TurnExecutionMode, TurnExecutionProfile,
+};
 use kria_core::agent::AgentLoop;
 use kria_core::automation::{AutomationScheduler, MacroRecorder, WorkflowEngine};
-use kria_core::config::KriaConfig;
+use kria_core::config::{ColabConfig, KriaConfig};
 use kria_core::infra::health::{HealthRegistry, ServiceStatus};
 use kria_core::infra::EventBus;
-use kria_core::llm::{ChatMessage, ImageAttachment, ModelRouter};
+use kria_core::llm::model_router::RoutingMode;
 use kria_core::llm::orchestrator::Orchestrator;
+use kria_core::llm::{ChatMessage, ImageAttachment, ModelRouter};
 use kria_core::mcp::client::McpServerState;
 use kria_core::mcp::server_manager::McpServerStatus;
-use kria_core::mcp::McpServerManager;
+use kria_core::mcp::{build_colab_capability_summary, McpServerManager};
 use kria_core::memory::embeddings::EmbeddingModel;
 use kria_core::memory::store::ConversationTurn;
 use kria_core::memory::vectors::VectorIndex;
@@ -28,6 +31,7 @@ use kria_core::safety::hitl::{ApprovalResponse, HitlGateway};
 use kria_core::safety::{AuditLogger, PolicyEngine, RollbackManager};
 use kria_core::sidecar::SidecarBridge;
 use kria_core::tools::google_workspace as gw;
+use kria_core::tools::google_workspace_contract as gw_contract;
 use kria_core::tools::mount_manager;
 use kria_core::tools::registry::{self, ToolRegistry};
 use kria_core::voice::{
@@ -44,9 +48,224 @@ use kria_core::platform::telegram::TelegramBridge;
 const AGENT_EVENT_IDLE_TIMEOUT_SECS: u64 = 180;
 const AGENT_TIMEOUT_MESSAGE: &str = "⚠️ Timed out waiting for model output. Please verify the model runtime is healthy and try again.";
 const IMAGE_PREANALYSIS_TIMEOUT_SECS: u64 = 35;
+const IMAGE_SAFE_MAX_ATTACHMENTS_PER_TURN: usize = 1;
+const IMAGE_SAFE_MAX_B64_CHARS_2K_CTX: usize = 550_000;
+const IMAGE_SAFE_MAX_B64_CHARS_4K_CTX: usize = 900_000;
 const GOOGLE_MCP_CONFIG_DIR_ENV: &str = "GOOGLE_MCP_CONFIG_DIR";
 const GOOGLE_ACCOUNT_ENV_KEY: &str = "KRIA_GW_ACCOUNT";
 const GOOGLE_DEFAULT_ACCOUNT: &str = "personal";
+const COLAB_DEFAULT_SERVER_NAME: &str = "colab-mcp";
+const COLAB_LEGACY_NPX_COMMAND: &str = "npx";
+const COLAB_LEGACY_NPX_PACKAGE: &str = "@googlecolab/colab-mcp";
+const COLAB_OFFICIAL_COMMAND: &str = "uvx";
+const COLAB_OFFICIAL_SOURCE: &str = "git+https://github.com/googlecolab/colab-mcp";
+const COLAB_BROWSER_BOOTSTRAP_TOOL: &str = "open_colab_browser_connection";
+
+fn is_colab_bootstrap_tool_name(tool_name: &str) -> bool {
+    tool_name
+        .to_ascii_lowercase()
+        .ends_with(COLAB_BROWSER_BOOTSTRAP_TOOL)
+}
+
+fn is_likely_local_llm_transport_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("local llm transport error")
+        || lower.contains("error sending request for url")
+        || lower.contains("connection refused")
+        || lower.contains("tcp connect")
+        || lower.contains("dns error")
+        || lower.contains("timed out")
+        || lower.contains("connection reset")
+        || lower.contains("broken pipe")
+}
+
+async fn touch_orchestrator_activity(
+    last_activity: &Arc<tokio::sync::Mutex<std::time::Instant>>,
+) {
+    let mut lock = last_activity.lock().await;
+    *lock = std::time::Instant::now();
+}
+
+fn decrement_active_turn_counter(active_turns: &Arc<std::sync::atomic::AtomicUsize>) {
+    let previous = active_turns.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    if previous == 0 {
+        active_turns.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+async fn ensure_orchestrator_ready_for_turn(
+    orchestrator: Option<&Arc<Orchestrator>>,
+    reason: &str,
+) -> Result<(), String> {
+    if let Some(orchestrator) = orchestrator {
+        orchestrator
+            .ensure_ready(reason)
+            .await
+            .map_err(|e| format!("Local model runtime is unavailable: {e}"))?;
+    }
+    Ok(())
+}
+
+fn summarize_colab_dispatch_reason(status_payload: &serde_json::Value) -> String {
+    let mut reasons: Vec<String> = status_payload
+        .get("warnings")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let missing: Vec<String> = status_payload
+        .get("capabilities")
+        .and_then(|v| v.get("ready_requirements"))
+        .and_then(|v| v.get("missing"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if !missing.is_empty() {
+        reasons.push(format!("missing capabilities: {}", missing.join(", ")));
+    }
+
+    if reasons.is_empty() {
+        let runtime_state = status_payload
+            .get("runtime_state")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        reasons.push(format!("runtime_state={runtime_state}"));
+    }
+
+    reasons.join("; ")
+}
+
+async fn enforce_colab_dispatch_requirements(
+    state: &AppState,
+    app: &AppHandle,
+) -> Result<(), String> {
+    let requested_mode = {
+        let config = state.config.read().await;
+        config
+            .llm
+            .routing_mode
+            .parse::<RoutingMode>()
+            .unwrap_or(RoutingMode::Local)
+    };
+
+    state.model_router.set_mode(requested_mode).await;
+
+    if requested_mode != RoutingMode::Colab {
+        return Ok(());
+    }
+
+    let status_payload = collect_colab_tier_status(state).await;
+    let ready_for_cloud_task = status_payload
+        .get("ready_for_cloud_task")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if ready_for_cloud_task {
+        emit_agent_stage(
+            app,
+            "colab_dispatch_ready",
+            "Colab tier requirements are satisfied",
+            Some(serde_json::json!({
+                "requested_mode": "colab",
+                "effective_mode": "colab",
+                "ready_for_cloud_task": true,
+            })),
+        );
+        emit_colab_status_event(app, state).await;
+        return Ok(());
+    }
+
+    let reason = summarize_colab_dispatch_reason(&status_payload);
+    let fallback_to_local = status_payload
+        .get("fallback_to_local")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let runtime_state = status_payload
+        .get("runtime_state")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let capability_requirements = status_payload
+        .get("capabilities")
+        .and_then(|v| v.get("ready_requirements"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+
+    if fallback_to_local {
+        state.model_router.set_mode(RoutingMode::Local).await;
+
+        emit_agent_stage(
+            app,
+            "colab_dispatch_fallback_local",
+            "Colab tier requirements were not satisfied; using local fallback",
+            Some(serde_json::json!({
+                "reason": reason,
+                "runtime_state": runtime_state,
+                "capability_requirements": capability_requirements,
+                "requested_mode": "colab",
+                "effective_mode": "local",
+                "ready_for_cloud_task": false,
+                "fallback_to_local": fallback_to_local,
+            })),
+        );
+
+        emit_colab_status_event(app, state).await;
+
+        tracing::warn!(
+            reason = %reason,
+            "colab dispatch requirements not satisfied; using local fallback"
+        );
+        Ok(())
+    } else {
+        emit_agent_stage(
+            app,
+            "colab_dispatch_blocked",
+            "Colab tier requirements were not satisfied and fallback is disabled",
+            Some(serde_json::json!({
+                "reason": reason,
+                "runtime_state": runtime_state,
+                "capability_requirements": capability_requirements,
+                "requested_mode": "colab",
+                "effective_mode": "colab",
+                "ready_for_cloud_task": false,
+                "fallback_to_local": fallback_to_local,
+            })),
+        );
+
+        emit_colab_status_event(app, state).await;
+
+        Err(format!(
+            "Colab tier is not ready for cloud execution and local fallback is disabled: {}",
+            reason
+        ))
+    }
+}
+
+fn build_tool_only_fallback_message(name: &str, success: bool, result: &serde_json::Value) -> String {
+    let metadata = compute_tool_result_metadata(name, result);
+    let summary = summarize_tool_turn_for_history(name, success, result, &metadata);
+
+    if success {
+        format!(
+            "{summary}\n\n⚠️ Local model became unavailable while preparing the final response. Tool output above is complete."
+        )
+    } else {
+        format!(
+            "{summary}\n\n⚠️ Local model became unavailable after a tool failure."
+        )
+    }
+}
 
 // 1x1 white PPM probe image used for sidecar OCR capability checks.
 const OCR_HEALTH_PROBE_IMAGE_BYTES: &[u8] = b"P3\n1 1\n255\n255 255 255\n";
@@ -116,6 +335,10 @@ fn encode_base64_bytes(data: &[u8]) -> String {
 }
 
 fn build_native_preprocessed_attachment(path: &str) -> Option<ImageAttachment> {
+    build_native_preprocessed_attachment_with_max(path, 768)
+}
+
+fn build_native_preprocessed_attachment_with_max(path: &str, max_dim: u32) -> Option<ImageAttachment> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
         return None;
@@ -128,7 +351,7 @@ fn build_native_preprocessed_attachment(path: &str) -> Option<ImageAttachment> {
 
     // Native fallback preprocessing: generate a normalized PNG thumbnail.
     let thumb_bytes =
-        kria_core::preprocessing::image::ImageProcessor::thumbnail(path_obj, 1280).ok()?;
+        kria_core::preprocessing::image::ImageProcessor::thumbnail(path_obj, max_dim).ok()?;
 
     Some(ImageAttachment {
         data: encode_base64_bytes(&thumb_bytes),
@@ -151,6 +374,59 @@ fn local_api_base_url(host: &str, port: u16) -> String {
         other => other,
     };
     format!("http://{probe_host}:{port}")
+}
+
+fn build_tool_descriptions_for_prompt(tool_defs: &[registry::ToolDef]) -> String {
+    const MAX_PROMPT_TOOL_LINES: usize = 80;
+
+    let mut sorted_defs = tool_defs.to_vec();
+    sorted_defs.sort_by(|a, b| a.category.cmp(&b.category).then(a.name.cmp(&b.name)));
+
+    let omitted = sorted_defs.len().saturating_sub(MAX_PROMPT_TOOL_LINES);
+    let visible_defs: Vec<registry::ToolDef> = sorted_defs
+        .into_iter()
+        .take(MAX_PROMPT_TOOL_LINES)
+        .collect();
+
+    let mut lines = Vec::with_capacity(visible_defs.len() + 4);
+    lines.push(format!(
+        "You can call {} tools via function-calling. Use tool schemas for exact arguments.",
+        tool_defs.len()
+    ));
+    lines.push("Tool catalog (name [category]: summary):".to_string());
+    if omitted > 0 {
+        lines.push(format!(
+            "Only {} representative tools are listed below for brevity; {} additional tools are available via function schemas.",
+            MAX_PROMPT_TOOL_LINES, omitted
+        ));
+    }
+
+    for def in visible_defs {
+        let mut line = format!(
+            "- {} [{}]: {}",
+            def.name,
+            def.category,
+            kria_core::infra::pipeline_trace::sanitize_text_for_logs(&def.description, 96)
+        );
+
+        let param_names: Vec<&str> = def
+            .parameters
+            .iter()
+            .take(3)
+            .map(|p| p.name.as_str())
+            .collect();
+        if !param_names.is_empty() {
+            if def.parameters.len() > 3 {
+                line.push_str(&format!(" | params: {}, ...", param_names.join(", ")));
+            } else {
+                line.push_str(&format!(" | params: {}", param_names.join(", ")));
+            }
+        }
+
+        lines.push(line);
+    }
+
+    lines.join("\n")
 }
 
 fn telegram_api_url(config: &KriaConfig) -> String {
@@ -463,11 +739,25 @@ fn emit_agent_stage(app: &AppHandle, step: &str, message: &str, detail: Option<s
     let payload = serde_json::json!({
         "step": step,
         "message": message,
-        "detail": detail_value,
+        "detail": detail_value.clone(),
         "ts": Utc::now().to_rfc3339(),
     });
     let _ = app.emit("agent:stage", payload);
-    tracing::info!(step = step, message = message, "agent stage emitted");
+
+    if kria_core::infra::pipeline_trace::pipeline_debug_enabled() {
+        tracing::debug!(
+            target: "kria_pipeline",
+            step = step,
+            message = message,
+            detail = ?detail_value,
+            "agent stage emitted"
+        );
+    }
+}
+
+async fn emit_colab_status_event(app: &AppHandle, state: &AppState) {
+    let payload = collect_colab_tier_status(state).await;
+    let _ = app.emit("colab:status", payload);
 }
 
 fn parse_relative_age_hours(age: &str) -> Option<f64> {
@@ -680,9 +970,27 @@ fn compute_tool_result_metadata(name: &str, result: &serde_json::Value) -> serde
             let payload = result.get("data").unwrap_or(result);
             let source_count = count_items_in_value(payload);
             let kind = infer_google_kind(name, result);
+            let schema_version = result
+                .get(gw_contract::GW_META_KEY)
+                .and_then(|meta| meta.get(gw_contract::GW_META_SCHEMA_VERSION_KEY))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let correlation_id = result
+                .get(gw_contract::GW_META_KEY)
+                .and_then(|meta| meta.get(gw_contract::GW_META_CORRELATION_ID_KEY))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let account = result
+                .get(gw_contract::GW_META_KEY)
+                .and_then(|meta| meta.get(gw_contract::GW_META_ACCOUNT_KEY))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
 
             let mut confidence = if source_count > 0 { 0.80 } else { 0.58 };
-            if ["create", "edit", "send", "delete"].iter().any(|k| name.contains(k)) {
+            if ["create", "edit", "send", "delete"]
+                .iter()
+                .any(|k| name.contains(k))
+            {
                 confidence = 0.74;
             }
 
@@ -692,6 +1000,9 @@ fn compute_tool_result_metadata(name: &str, result: &serde_json::Value) -> serde
                 "freshness_age_hours": serde_json::Value::Null,
                 "region_match": serde_json::Value::Null,
                 "kind": kind,
+                "schema_version": schema_version,
+                "correlation_id": correlation_id,
+                "account": account,
             })
         }
         _ => serde_json::Value::Null,
@@ -926,6 +1237,47 @@ fn extract_preprocessed_image_attachments(
     }
 
     None
+}
+
+fn image_visual_token_cap_for_context(context_window: usize) -> u64 {
+    if context_window <= 2048 {
+        320
+    } else if context_window <= 3072 {
+        448
+    } else {
+        640
+    }
+}
+
+fn image_base64_cap_for_context(context_window: usize) -> usize {
+    if context_window <= 2048 {
+        IMAGE_SAFE_MAX_B64_CHARS_2K_CTX
+    } else {
+        IMAGE_SAFE_MAX_B64_CHARS_4K_CTX
+    }
+}
+
+fn constrain_runtime_image_attachments(
+    attachments: Vec<ImageAttachment>,
+    context_window: usize,
+) -> Vec<ImageAttachment> {
+    let max_b64_chars = image_base64_cap_for_context(context_window);
+    let mut safe: Vec<ImageAttachment> = Vec::new();
+
+    for attachment in attachments {
+        if attachment.data.trim().is_empty() {
+            continue;
+        }
+        if attachment.data.len() > max_b64_chars {
+            continue;
+        }
+        safe.push(attachment);
+        if safe.len() >= IMAGE_SAFE_MAX_ATTACHMENTS_PER_TURN {
+            break;
+        }
+    }
+
+    safe
 }
 
 async fn refresh_ocr_dependency_health(health: &HealthRegistry, sidecar: &SidecarBridge) {
@@ -1280,9 +1632,59 @@ pub struct AppState {
     pub mcp_manager: Arc<tokio::sync::Mutex<McpServerManager>>,
     /// Lazy Google Workspace MCP client reference used by gw_* tool handlers.
     pub gw_client_ref: gw::GwClientRef,
+    /// Colab cloud-tier runtime status surface.
+    pub colab_runtime: Arc<RwLock<ColabRuntimeSnapshot>>,
     /// Hardware orchestrator — manages llama-server lifecycle and dynamic GPU offloading.
+    /// Wrapped in RwLock so the background startup task can populate it after AppState
+    /// is set, keeping the main init path non-blocking.
     #[allow(dead_code)]
-    pub orchestrator: Option<Arc<Orchestrator>>,
+    pub orchestrator: Arc<tokio::sync::RwLock<Option<Arc<Orchestrator>>>>,
+    /// Number of active turn executions that currently depend on local runtime.
+    pub orchestrator_active_turns: Arc<std::sync::atomic::AtomicUsize>,
+    /// Last observed local-runtime activity timestamp for idle release decisions.
+    pub orchestrator_last_activity_at: Arc<tokio::sync::Mutex<std::time::Instant>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColabRuntimeState {
+    Disconnected,
+    SidecarStarting,
+    AwaitingBrowserConnection,
+    NotebookSelectionRequired,
+    Ready,
+    Degraded,
+}
+
+impl ColabRuntimeState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disconnected => "disconnected",
+            Self::SidecarStarting => "sidecar_starting",
+            Self::AwaitingBrowserConnection => "awaiting_browser_connection",
+            Self::NotebookSelectionRequired => "notebook_selection_required",
+            Self::Ready => "ready",
+            Self::Degraded => "degraded",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ColabRuntimeSnapshot {
+    pub state: ColabRuntimeState,
+    pub sidecar_server_name: String,
+    pub selected_notebook: Option<String>,
+    pub last_error: Option<String>,
+}
+
+impl ColabRuntimeSnapshot {
+    fn new(state: ColabRuntimeState, sidecar_server_name: String) -> Self {
+        Self {
+            state,
+            sidecar_server_name,
+            selected_notebook: None,
+            last_error: None,
+        }
+    }
 }
 
 fn build_voice_pipeline(
@@ -1310,11 +1712,12 @@ fn build_voice_pipeline(
 
 /// Initialize the KRIA runtime (called from setup).
 pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
-    let mut config = KriaConfig::load(None)?;
+    // Initialize logging first so startup diagnostics are filterable.
+    let bootstrap_paths = kria_core::platform::paths::KriaPaths::resolve();
+    kria_core::infra::logging::setup_logging(&bootstrap_paths.logs_dir);
 
-    // Initialize logging
+    let mut config = KriaConfig::load(None)?;
     let paths = config.resolve_paths()?;
-    kria_core::infra::logging::setup_logging(&paths.logs_dir);
 
     // Resolve hardware tier with precedence: env > config > cache > detect.
     let hw_cache_path = paths.data_dir.join("hardware_tier.json");
@@ -1439,74 +1842,150 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
         filename.to_string()
     };
 
-    let orchestrator: Option<Arc<Orchestrator>> = if config.orchestrator.enabled {
-        tracing::info!(
-            model_count = config.llm.models.len(),
-            "orchestrator: config loaded, checking models"
+    // ── Hardware Orchestrator (non-blocking background startup) ───────────────
+    // The orchestrator spawns llama-server and waits for /health (up to 120s).
+    // We set AppState immediately (with orchestrator = None) so the frontend
+    // is never blocked. The background task populates the RwLock when ready.
+    let model_router_bg_ref = model_router.clone();
+    let orch_cell: Arc<tokio::sync::RwLock<Option<Arc<Orchestrator>>>> =
+        Arc::new(tokio::sync::RwLock::new(None));
+
+    // Resolve model paths now (cheap, synchronous) so the background task
+    // captures owned Strings rather than borrowing from `config`.
+    //
+    // The selection is **tier-aware**: on Lite/Standard hardware we pick the
+    // smallest existing model (e.g. Phi-4-mini) instead of trying to load a
+    // 4.7 GB Qwen2.5-VL and OOM-ing the GPU. On Performance/High hardware we
+    // pick the largest fitting model with vision when available.
+    //
+    // The user can override the selection by setting `[llm].active_model` to
+    // a model name from `[[llm.models]]`; that override is honoured iff the
+    // GGUF file actually exists on disk.
+    let (orch_model_path, orch_mmproj_path, orch_config, orch_enabled, selected_model_name) = if config.orchestrator.enabled {
+        use kria_core::llm::orchestrator::tier_strategy::{
+            derive_model_profile, select_model_for_tier, SelectionReason,
+        };
+
+        let model_exists = |file: &str| -> bool {
+            let resolved = resolve_model_file(file);
+            std::path::Path::new(&resolved).exists()
+        };
+
+        let choice = select_model_for_tier(
+            hardware_info.tier,
+            hardware_info.total_ram_mb,
+            hardware_info.vram_mb,
+            &config.llm.active_model,
+            &config.llm.models,
+            model_exists,
         );
-        // Resolve the model .gguf path from config
-        let model_path = config
-            .llm
-            .models
-            .first()
-            .map(|m| {
-                let resolved = resolve_model_file(&m.file);
-                tracing::info!(raw = %m.file, resolved = %resolved, "orchestrator: resolved model path");
-                resolved
-            })
-            .unwrap_or_default();
 
-        let mmproj_path = config
-            .llm
-            .models
-            .iter()
-            .find_map(|m| m.mmproj_file.as_ref())
-            .map(|f| {
-                let resolved = resolve_model_file(f);
-                tracing::info!(raw = %f, resolved = %resolved, "orchestrator: resolved mmproj path");
-                resolved
-            });
+        match choice {
+            None => {
+                tracing::warn!(
+                    "orchestrator: no models defined in `[[llm.models]]` — \
+                     skipping background startup. Add a model entry in \
+                     ~/.kria/config.toml or run `scripts/download_models.py`."
+                );
+                let _ = handle.emit(
+                    "orchestrator:disabled",
+                    serde_json::json!({
+                        "reason": "no_models_configured",
+                        "message": "No LLM models are defined in config.toml.",
+                    }),
+                );
+                (String::new(), None, config.orchestrator.clone(), false, String::new())
+            }
+            Some(c) if matches!(c.reason, SelectionReason::NoModels) => {
+                let searched: Vec<String> = config
+                    .llm
+                    .models
+                    .iter()
+                    .map(|m| resolve_model_file(&m.file))
+                    .collect();
+                tracing::error!(
+                    tier = %hardware_info.tier.as_str(),
+                    searched = ?searched,
+                    "orchestrator: no GGUF model files found on disk — skipping startup. \
+                     Run `scripts/download_models.py` or place the GGUF in ~/.kria/models/llm/"
+                );
+                let _ = handle.emit(
+                    "orchestrator:disabled",
+                    serde_json::json!({
+                        "reason": "model_files_missing",
+                        "tier": hardware_info.tier.as_str(),
+                        "searched_paths": searched,
+                        "message": "No GGUF model files found. Download models or update config.",
+                    }),
+                );
+                (String::new(), None, config.orchestrator.clone(), false, String::new())
+            }
+            Some(c) => {
+                let model_path = resolve_model_file(&c.model.file);
+                let mmproj_path = c
+                    .model
+                    .mmproj_file
+                    .as_ref()
+                    .filter(|_| !c.vision_disabled)
+                    .map(|f| resolve_model_file(f));
 
-        if model_path.is_empty() {
-            tracing::warn!("orchestrator: no model path configured — skipping startup");
-            None
-        } else {
-            match Orchestrator::start(
-                config.orchestrator.clone(),
-                model_path,
-                mmproj_path,
-                event_bus.clone(),
-                health.clone(),
-            )
-            .await
-            {
-                Ok(orch) => {
-                    // Wire the orchestrator's server manager into the model router
-                    // so local LLM requests use the dynamically managed URL.
-                    model_router.attach_server_manager(orch.server_manager.clone());
-                    tracing::info!(
-                        backend = ?orch.backend,
-                        api_url = %orch.api_url(),
-                        "orchestrator: started and attached to model router"
-                    );
-                    Some(orch)
-                }
-                Err(e) => {
-                    tracing::error!("orchestrator: failed to start (non-fatal): {e}");
-                    health.register("orchestrator");
-                    health.update(
-                        "orchestrator",
-                        ServiceStatus::Degraded,
-                        Some(format!("{e}")),
-                    );
-                    None
-                }
+                tracing::info!(
+                    tier = %hardware_info.tier.as_str(),
+                    model = %c.model.name,
+                    file = %c.model.file,
+                    resolved = %model_path,
+                    reason = ?c.reason,
+                    vision_disabled = c.vision_disabled,
+                    mmproj = ?mmproj_path,
+                    "orchestrator: tier-aware model selection complete"
+                );
+
+                // Override active_model so the model_router and other subsystems
+                // agree on which model is actually loaded.
+                config.llm.active_model = c.model.name.clone();
+
+                // Derive a tier-appropriate ModelProfile and substitute it
+                // into the orchestrator config. This way each model gets its
+                // own VRAM-budget calculation (layer count, mmproj size, …).
+                let mut orch_cfg = config.orchestrator.clone();
+                orch_cfg.model_profile =
+                    derive_model_profile(&c.model, &config.orchestrator.model_profile);
+
+                tracing::info!(
+                    total_layers = orch_cfg.model_profile.total_layers,
+                    per_layer_vram_mb = orch_cfg.model_profile.per_layer_vram_mb,
+                    has_vision = orch_cfg.model_profile.has_vision_projector,
+                    mmproj_vram_mb = orch_cfg.model_profile.mmproj_vram_mb,
+                    max_context = orch_cfg.model_profile.max_context,
+                    "orchestrator: derived model profile"
+                );
+
+                let _ = handle.emit(
+                    "orchestrator:selected",
+                    serde_json::json!({
+                        "tier": hardware_info.tier.as_str(),
+                        "model": c.model.name,
+                        "display_name": c.model.display_name,
+                        "vram_estimate_gb": c.model.vram_estimate_gb,
+                        "vision_enabled": !c.vision_disabled
+                            && c.model.capabilities.iter().any(|x| x == "vision"),
+                    }),
+                );
+
+                let model_name = c.model.name.clone();
+                (model_path, mmproj_path, orch_cfg, true, model_name)
             }
         }
     } else {
-        tracing::info!("orchestrator: disabled in config");
-        None
+        tracing::info!("orchestrator: disabled in config (orchestrator.enabled = false)");
+        let _ = handle.emit(
+            "orchestrator:disabled",
+            serde_json::json!({ "reason": "config_disabled" }),
+        );
+        (String::new(), None, config.orchestrator.clone(), false, String::new())
     };
+
+    let _ = selected_model_name; // currently used only for logging above
 
     // Initialize embedding model and vector index for fact extraction
     let embeddings = Arc::new(EmbeddingModel::load(384).unwrap_or_else(|e| {
@@ -1773,6 +2252,42 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
         hw_tier: hardware_info.tier.as_str().to_string(),
     });
 
+    let voice_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let orchestrator_active_turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let orchestrator_last_activity_at = Arc::new(tokio::sync::Mutex::new(std::time::Instant::now()));
+
+    let (colab_enabled, colab_server_name) = {
+        let cfg = config.read().await;
+        (cfg.colab.enabled, cfg.colab.mcp_server_name.clone())
+    };
+    let colab_runtime = Arc::new(RwLock::new(ColabRuntimeSnapshot::new(
+        if colab_enabled {
+            ColabRuntimeState::SidecarStarting
+        } else {
+            ColabRuntimeState::Disconnected
+        },
+        colab_server_name.clone(),
+    )));
+
+    if colab_enabled {
+        let colab_server_configured = {
+            let cfg = config.read().await;
+            cfg.mcp
+                .servers
+                .iter()
+                .any(|s| s.enabled && s.name == colab_server_name)
+        };
+
+        if !colab_server_configured {
+            let mut runtime = colab_runtime.write().await;
+            runtime.state = ColabRuntimeState::Degraded;
+            runtime.last_error = Some(format!(
+                "Configured MCP server '{}' is missing or disabled",
+                runtime.sidecar_server_name
+            ));
+        }
+    }
+
     let state = AppState {
         config,
         model_router,
@@ -1785,7 +2300,7 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
         embeddings,
         vectors,
         current_session_id: Arc::new(RwLock::new(uuid::Uuid::new_v4().to_string())),
-        voice_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        voice_active: voice_active.clone(),
         voice_pipeline: Arc::new(RwLock::new(voice_pipeline)),
         health: health.clone(),
         scheduler: scheduler_arc,
@@ -1797,7 +2312,10 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
         telegram_bridge,
         mcp_manager: mcp_manager.clone(),
         gw_client_ref: gw_client_ref.clone(),
-        orchestrator: orchestrator.clone(),
+        colab_runtime: colab_runtime.clone(),
+        orchestrator: orch_cell.clone(),
+        orchestrator_active_turns: orchestrator_active_turns.clone(),
+        orchestrator_last_activity_at: orchestrator_last_activity_at.clone(),
     };
 
     if handle.state::<AppStateCell>().set(state).is_err() {
@@ -1806,57 +2324,173 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
 
     tracing::info!("[INIT] AppState set — frontend is now unblocked");
 
-    // ── Forward orchestrator events to Tauri frontend ─────────────────────────
-    if orchestrator.is_some() {
-        let handle_orch = handle.clone();
-        let mut rx = event_bus.subscribe();
+    // ── Background orchestrator startup (non-blocking) ────────────────────────
+    // Spawning llama-server and waiting for /health can take 30-180 seconds.
+    // We do it after AppState.set() so the UI is immediately responsive.
+    if orch_enabled {
+        let orch_cell_bg = orch_cell.clone();
+        let model_router_bg = model_router_bg_ref.clone();
+        let health_bg = health.clone();
+        let event_bus_bg = event_bus.clone();
+        let active_turns_bg = orchestrator_active_turns.clone();
+        let last_activity_bg = orchestrator_last_activity_at.clone();
+        let voice_active_bg = voice_active.clone();
+        let handle_bg = handle.clone();
+
         tokio::spawn(async move {
-            use kria_core::infra::event_bus::KriaEvent;
-            loop {
-                match rx.recv().await {
-                    Ok(KriaEvent::LlmSwapStarted { from_ngl, to_ngl, emergency }) => {
-                        let _ = handle_orch.emit(
-                            "orchestrator:swap_started",
-                            serde_json::json!({
-                                "from_ngl": from_ngl,
-                                "to_ngl": to_ngl,
-                                "emergency": emergency,
-                            }),
+            tracing::info!("orchestrator: starting in background");
+            match Orchestrator::start(
+                orch_config,
+                orch_model_path,
+                orch_mmproj_path,
+                event_bus_bg.clone(),
+                health_bg.clone(),
+            )
+            .await
+            {
+                Ok(orch) => {
+                    // orch is Arc<Orchestrator> from Orchestrator::start()
+                    // Wire server manager into model router (uses OnceLock — idempotent).
+                    model_router_bg.attach_server_manager(orch.server_manager.clone());
+                    tracing::info!(
+                        backend = ?orch.backend,
+                        api_url = %orch.api_url(),
+                        "orchestrator: started and attached to model router"
+                    );
+
+                    // Publish to the UI that the LLM runtime is up.
+                    let _ = handle_bg.emit("orchestrator:ready", serde_json::json!({
+                        "api_url": orch.api_url(),
+                        "backend": format!("{:?}", orch.backend),
+                    }));
+
+                    // Start idle-release monitor if enabled.
+                    if orch.config.idle_release_enabled {
+                        let idle_after_secs = orch.config.idle_release_after_secs.max(30);
+                        let check_interval_secs = orch.config.idle_release_check_interval_secs.max(1);
+                        let active_turns = active_turns_bg.clone();
+                        let last_activity = last_activity_bg.clone();
+                        let voice_active_idle = voice_active_bg.clone();
+                        let handle_idle = handle_bg.clone();
+                        let orch_idle = orch.clone();
+
+                        tracing::info!(
+                            idle_after_secs,
+                            check_interval_secs,
+                            "orchestrator: idle release monitor enabled"
                         );
+
+                        tokio::spawn(async move {
+                            let idle_after = std::time::Duration::from_secs(idle_after_secs);
+                            let check_interval = std::time::Duration::from_secs(check_interval_secs);
+                            loop {
+                                tokio::time::sleep(check_interval).await;
+                                if voice_active_idle.load(std::sync::atomic::Ordering::Relaxed) {
+                                    continue;
+                                }
+                                if active_turns.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                                    continue;
+                                }
+                                if orch_idle.server_manager.is_swapping() {
+                                    continue;
+                                }
+                                let idle_for = {
+                                    let lock = last_activity.lock().await;
+                                    lock.elapsed()
+                                };
+                                if idle_for < idle_after {
+                                    continue;
+                                }
+                                if !orch_idle.server_manager.has_live_process().await {
+                                    continue;
+                                }
+                                match orch_idle.release_if_idle("desktop_idle_timeout").await {
+                                    Ok(true) => {
+                                        let _ = handle_idle.emit(
+                                            "orchestrator:idle_released",
+                                            serde_json::json!({ "idle_for_secs": idle_for.as_secs() }),
+                                        );
+                                        touch_orchestrator_activity(&last_activity).await;
+                                    }
+                                    Ok(false) => {}
+                                    Err(e) => {
+                                        tracing::warn!(?e, "orchestrator: idle release attempt failed");
+                                        touch_orchestrator_activity(&last_activity).await;
+                                    }
+                                }
+                            }
+                        });
                     }
-                    Ok(KriaEvent::LlmSwapCompleted { new_ngl, new_context, duration_ms }) => {
-                        let _ = handle_orch.emit(
-                            "orchestrator:swap_completed",
-                            serde_json::json!({
-                                "new_ngl": new_ngl,
-                                "new_context": new_context,
-                                "duration_ms": duration_ms,
-                            }),
-                        );
+
+                    // Start orchestrator event forwarder.
+                    {
+                        let handle_orch = handle_bg.clone();
+                        let mut rx = event_bus_bg.subscribe();
+                        tokio::spawn(async move {
+                            use kria_core::infra::event_bus::KriaEvent;
+                            loop {
+                                match rx.recv().await {
+                                    Ok(KriaEvent::LlmSwapStarted { from_ngl, to_ngl, emergency }) => {
+                                        let _ = handle_orch.emit(
+                                            "orchestrator:swap_started",
+                                            serde_json::json!({
+                                                "from_ngl": from_ngl,
+                                                "to_ngl": to_ngl,
+                                                "emergency": emergency,
+                                            }),
+                                        );
+                                    }
+                                    Ok(KriaEvent::LlmSwapCompleted { new_ngl, new_context, duration_ms }) => {
+                                        let _ = handle_orch.emit(
+                                            "orchestrator:swap_completed",
+                                            serde_json::json!({
+                                                "new_ngl": new_ngl,
+                                                "new_context": new_context,
+                                                "duration_ms": duration_ms,
+                                            }),
+                                        );
+                                    }
+                                    Ok(KriaEvent::LlmDegradationChanged { level }) => {
+                                        let _ = handle_orch.emit(
+                                            "orchestrator:degradation_changed",
+                                            serde_json::json!({ "level": level }),
+                                        );
+                                    }
+                                    Ok(KriaEvent::LlmStreamInterrupted) => {
+                                        let _ = handle_orch.emit(
+                                            "orchestrator:stream_interrupted",
+                                            serde_json::json!({}),
+                                        );
+                                    }
+                                    Ok(KriaEvent::VramPressure { free_vram_mb }) => {
+                                        let _ = handle_orch.emit(
+                                            "orchestrator:vram_pressure",
+                                            serde_json::json!({ "free_vram_mb": free_vram_mb }),
+                                        );
+                                    }
+                                    Ok(_) => {}
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                        tracing::debug!("orchestrator event forwarder lagged by {n}");
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                }
+                            }
+                        });
                     }
-                    Ok(KriaEvent::LlmDegradationChanged { level }) => {
-                        let _ = handle_orch.emit(
-                            "orchestrator:degradation_changed",
-                            serde_json::json!({ "level": level }),
-                        );
-                    }
-                    Ok(KriaEvent::LlmStreamInterrupted) => {
-                        let _ = handle_orch.emit(
-                            "orchestrator:stream_interrupted",
-                            serde_json::json!({}),
-                        );
-                    }
-                    Ok(KriaEvent::VramPressure { free_vram_mb }) => {
-                        let _ = handle_orch.emit(
-                            "orchestrator:vram_pressure",
-                            serde_json::json!({ "free_vram_mb": free_vram_mb }),
-                        );
-                    }
-                    Ok(_) => {} // Ignore other events
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::debug!("orchestrator event forwarder lagged by {n}");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+
+                    // Finally, store the orchestrator in the shared cell so
+                    // command handlers can access it via state.orchestrator.
+                    *orch_cell_bg.write().await = Some(orch);
+                }
+                Err(e) => {
+                    tracing::error!("orchestrator: failed to start (non-fatal): {e}");
+                    health_bg.register("orchestrator");
+                    health_bg.update(
+                        "orchestrator",
+                        ServiceStatus::Degraded,
+                        Some(format!("{e}")),
+                    );
+                    let _ = handle_bg.emit("orchestrator:error", serde_json::json!({ "error": e.to_string() }));
                 }
             }
         });
@@ -1876,6 +2510,7 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
         let tool_reg_bg = tool_registry.clone();
         let mcp_mgr_bg = mcp_manager.clone();
         let gw_ref_bg = gw_client_ref.clone();
+        let colab_runtime_bg = colab_runtime.clone();
         let health_bg = health.clone();
         let handle_bg = handle.clone();
         tokio::spawn(async move {
@@ -1898,6 +2533,53 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
             }
 
             let statuses = mgr.status().await;
+
+            let colab_server_name = {
+                let runtime = colab_runtime_bg.read().await;
+                runtime.sidecar_server_name.clone()
+            };
+            {
+                let mut runtime = colab_runtime_bg.write().await;
+                if runtime.state != ColabRuntimeState::Disconnected {
+                    match statuses.iter().find(|s| s.name == colab_server_name) {
+                        Some(status) if status.state == McpServerState::Running => {
+                            let has_notebook = runtime
+                                .selected_notebook
+                                .as_ref()
+                                .map(|value| !value.trim().is_empty())
+                                .unwrap_or(false);
+
+                            runtime.state = if status.tool_count == 0 {
+                                runtime.selected_notebook = None;
+                                ColabRuntimeState::AwaitingBrowserConnection
+                            } else if has_notebook {
+                                ColabRuntimeState::Ready
+                            } else {
+                                ColabRuntimeState::NotebookSelectionRequired
+                            };
+                            runtime.last_error = None;
+                        }
+                        Some(status) => {
+                            runtime.state = ColabRuntimeState::Degraded;
+                            runtime.last_error = status.error.clone().or_else(|| {
+                                Some(format!(
+                                    "MCP server '{}' is {}",
+                                    colab_server_name,
+                                    mcp_state_name(status.state)
+                                ))
+                            });
+                        }
+                        None => {
+                            runtime.state = ColabRuntimeState::Degraded;
+                            runtime.last_error = Some(format!(
+                                "MCP server '{}' not found in runtime status",
+                                colab_server_name
+                            ));
+                        }
+                    }
+                }
+            }
+
             let running = statuses.iter().filter(|s| s.tool_count > 0).count();
             health_bg.update(
                 "mcp_servers",
@@ -1918,6 +2600,20 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
                     "tools": tool_reg_bg.len(),
                 }),
             );
+
+            {
+                let runtime = colab_runtime_bg.read().await;
+                let _ = handle_bg.emit(
+                    "colab:status",
+                    serde_json::json!({
+                        "state": runtime.state.as_str(),
+                        "server": runtime.sidecar_server_name,
+                        "selected_notebook": runtime.selected_notebook,
+                        "last_error": runtime.last_error,
+                    }),
+                );
+            }
+
             tracing::info!(
                 "[MCP] background startup complete — {} tools available",
                 tool_reg_bg.len()
@@ -1932,16 +2628,88 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tauri::command]
-pub async fn send_message(
+pub async fn shutdown_runtime(handle: &AppHandle) {
+    let state_cell: tauri::State<'_, AppStateCell> = handle.state();
+    let Some(state) = state_cell.get() else {
+        tracing::info!("shutdown requested before runtime initialization finished");
+        return;
+    };
+
+    tracing::info!("runtime shutdown started");
+
+    state
+        .voice_active
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+
+    {
+        let voice_pipeline = state.voice_pipeline.read().await.clone();
+        voice_pipeline.stop().await;
+    }
+
+    {
+        let mut bridge_guard = state.telegram_bridge.write().await;
+        if let Some(bridge) = bridge_guard.take() {
+            bridge.stop();
+            tracing::info!("shutdown: telegram bridge stopped");
+        }
+    }
+
+    {
+        let mut manager = state.mcp_manager.lock().await;
+        manager.stop_all().await;
+    }
+
+    if let Err(e) = state.sidecar.shutdown().await {
+        tracing::warn!("shutdown: failed to stop sidecar cleanly: {e}");
+    }
+
+    if let Some(orchestrator) = state.orchestrator.read().await.as_ref().cloned() {
+        orchestrator.shutdown().await;
+    }
+
+    tracing::info!("runtime shutdown completed");
+}
+
+async fn send_message_with_profile(
     message: String,
+    execution_profile: TurnExecutionProfile,
     state: State<'_, AppStateCell>,
     app: AppHandle,
 ) -> Result<serde_json::Value, String> {
     let state = state
         .get()
         .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
-    tracing::info!("User message: {}", &message);
+
+    enforce_colab_dispatch_requirements(state, &app).await?;
+
+    touch_orchestrator_activity(&state.orchestrator_last_activity_at).await;
+    let orchestrator_snapshot = state.orchestrator.read().await.clone();
+    if orchestrator_snapshot.is_some() {
+        emit_agent_stage(
+            &app,
+            "ensuring_local_runtime",
+            "Ensuring local LLM runtime is ready",
+            None,
+        );
+    }
+    if let Err(e) = ensure_orchestrator_ready_for_turn(orchestrator_snapshot.as_ref(), "ui_turn").await {
+        emit_agent_stage(
+            &app,
+            "failed",
+            "Local runtime preflight failed",
+            Some(serde_json::json!({ "error": e.clone() })),
+        );
+        return Err(e);
+    }
+
+    tracing::info!(chars = message.chars().count(), "user prompt received");
+    if kria_core::infra::pipeline_trace::pipeline_debug_enabled() {
+        tracing::debug!(
+            target: "kria_pipeline",
+            prompt = %kria_core::infra::pipeline_trace::sanitize_text_for_logs(&message, 320),
+            "send_message prompt preview"
+        );
+    }
 
     emit_agent_stage(
         &app,
@@ -1952,10 +2720,20 @@ pub async fn send_message(
         })),
     );
 
-    let _ = app.emit(
-        "agent:thinking",
-        serde_json::json!({"status": "processing"}),
-    );
+    let event_scope_prefix = match execution_profile.mode {
+        TurnExecutionMode::Assistant => "agent",
+        TurnExecutionMode::PromptLab => "prompt_lab",
+    };
+    let ev_thinking = format!("{event_scope_prefix}:thinking");
+    let ev_token = format!("{event_scope_prefix}:token");
+    let ev_done = format!("{event_scope_prefix}:done");
+    let ev_tool_call = format!("{event_scope_prefix}:tool_call");
+    let ev_tool_result = format!("{event_scope_prefix}:tool_result");
+    let ev_approval_required = format!("{event_scope_prefix}:approval_required");
+    let ev_approval_result = format!("{event_scope_prefix}:approval_result");
+    let ev_tool_choice_required = format!("{event_scope_prefix}:tool_choice_required");
+
+    let _ = app.emit(&ev_thinking, serde_json::json!({"status": "processing"}));
 
     let agent_loop = state.agent_loop.clone();
     let memory_store = state.memory_store.clone();
@@ -1973,31 +2751,7 @@ pub async fn send_message(
 
     // Build the system prompt with tool descriptions and user context
     let tool_defs = tool_registry.list_for_tier(hw_tier);
-    let tool_descriptions = tool_defs
-        .iter()
-        .map(|d| {
-            let params: Vec<String> = d
-                .parameters
-                .iter()
-                .map(|p| {
-                    format!(
-                        "  - {}: {} ({}{})",
-                        p.name,
-                        p.description,
-                        p.param_type,
-                        if p.required { ", required" } else { "" }
-                    )
-                })
-                .collect();
-            format!(
-                "### {}\n{}\nParameters:\n{}",
-                d.name,
-                d.description,
-                params.join("\n")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    let tool_descriptions = build_tool_descriptions_for_prompt(&tool_defs);
 
     emit_agent_stage(
         &app,
@@ -2166,7 +2920,12 @@ pub async fn send_message(
     );
 
     // Create event channel and run agent loop
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
+    let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
+    state
+        .orchestrator_active_turns
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let active_turns_for_tracking = state.orchestrator_active_turns.clone();
+    let last_activity_for_tracking = state.orchestrator_last_activity_at.clone();
 
     let app_handle = app.clone();
     let session_id_clone = session_id.clone();
@@ -2174,12 +2933,20 @@ pub async fn send_message(
     let embeddings_clone = state.embeddings.clone();
     let vectors_clone = state.vectors.clone();
     let user_message_clone = message.clone();
+    let orchestrator_for_recovery = state.orchestrator.read().await.clone();
+    let retry_agent = agent_loop.clone();
+    let retry_session_id = session_id.clone();
+    let retry_execution_profile = execution_profile.clone();
+    let retry_messages_seed = messages.clone();
 
     // Spawn agent loop in background
     let agent = agent_loop.clone();
     let sid = session_id.clone();
+    let run_profile = execution_profile.clone();
     tauri::async_runtime::spawn(async move {
-        agent.run(&sid, &mut messages, event_tx).await;
+        agent
+            .run_with_profile(&sid, &mut messages, event_tx, Some(run_profile))
+            .await;
     });
 
     emit_agent_stage(
@@ -2193,6 +2960,10 @@ pub async fn send_message(
     tauri::async_runtime::spawn(async move {
         let mut full_response = String::new();
         let mut saw_first_token = false;
+        let mut successful_tool_count = 0usize;
+        let mut last_successful_tool: Option<(String, serde_json::Value)> = None;
+        let mut recovery_attempted = false;
+        let mut active_rx = event_rx;
         let mut pending_tool_params: std::collections::HashMap<String, serde_json::Value> =
             std::collections::HashMap::new();
 
@@ -2206,7 +2977,7 @@ pub async fn send_message(
         loop {
             let event = match tokio::time::timeout(
                 std::time::Duration::from_secs(AGENT_EVENT_IDLE_TIMEOUT_SECS),
-                event_rx.recv(),
+                active_rx.recv(),
             )
             .await
             {
@@ -2223,7 +2994,7 @@ pub async fn send_message(
                     );
                     full_response = AGENT_TIMEOUT_MESSAGE.to_string();
                     let _ = app_handle.emit(
-                        "agent:token",
+                        &ev_token,
                         serde_json::json!({
                             "text": AGENT_TIMEOUT_MESSAGE,
                         }),
@@ -2245,14 +3016,21 @@ pub async fn send_message(
                     }
                     full_response.push_str(&text);
                     let _ = app_handle.emit(
-                        "agent:token",
+                        &ev_token,
                         serde_json::json!({
                             "text": text,
                         }),
                     );
                 }
                 StreamEvent::ToolStart { name, params } => {
-                    tracing::info!("Tool call: {} with {:?}", name, params);
+                    if kria_core::infra::pipeline_trace::pipeline_debug_enabled() {
+                        tracing::debug!(
+                            target: "kria_pipeline",
+                            tool = %name,
+                            params = ?kria_core::infra::pipeline_trace::sanitize_json_for_logs(&params, 280, 8),
+                            "tool call event"
+                        );
+                    }
                     pending_tool_params.insert(name.clone(), params.clone());
                     emit_agent_stage(
                         &app_handle,
@@ -2263,7 +3041,7 @@ pub async fn send_message(
                         })),
                     );
                     let _ = app_handle.emit(
-                        "agent:tool_call",
+                        &ev_tool_call,
                         serde_json::json!({
                             "name": name,
                             "params": params,
@@ -2275,7 +3053,20 @@ pub async fn send_message(
                     result,
                     success,
                 } => {
-                    tracing::info!("Tool result: {} success={}", name, success);
+                    if success {
+                        successful_tool_count = successful_tool_count.saturating_add(1);
+                        last_successful_tool = Some((name.clone(), result.clone()));
+                    }
+
+                    if kria_core::infra::pipeline_trace::pipeline_debug_enabled() {
+                        tracing::debug!(
+                            target: "kria_pipeline",
+                            tool = %name,
+                            success,
+                            result = ?kria_core::infra::pipeline_trace::sanitize_json_for_logs(&result, 280, 8),
+                            "tool result event"
+                        );
+                    }
                     emit_agent_stage(
                         &app_handle,
                         "tool_finished",
@@ -2293,7 +3084,7 @@ pub async fn send_message(
                         .get("metadata")
                         .cloned()
                         .unwrap_or(serde_json::Value::Null);
-                    let _ = app_handle.emit("agent:tool_result", payload);
+                    let _ = app_handle.emit(&ev_tool_result, payload);
 
                     let persisted_payload = serde_json::json!({
                         "name": name,
@@ -2320,6 +3111,29 @@ pub async fn send_message(
                         timestamp: Utc::now(),
                     });
                 }
+                StreamEvent::ToolProgress { call_id, message, percent } => {
+                    let _ = app_handle.emit(
+                        "kria:tool-progress",
+                        serde_json::json!({
+                            "call_id": call_id,
+                            "message": message,
+                            "percent": percent,
+                            "session_id": session_id_clone,
+                        }),
+                    );
+                }
+                StreamEvent::ToolPayloadChunk { call_id, seq, is_final, data } => {
+                    let _ = app_handle.emit(
+                        "kria:tool-payload-chunk",
+                        serde_json::json!({
+                            "call_id": call_id,
+                            "seq": seq,
+                            "is_final": is_final,
+                            "data": data,
+                            "session_id": session_id_clone,
+                        }),
+                    );
+                }
                 StreamEvent::ApprovalRequired {
                     request_id,
                     action,
@@ -2336,7 +3150,7 @@ pub async fn send_message(
                         })),
                     );
                     let _ = app_handle.emit(
-                        "agent:approval_required",
+                        &ev_approval_required,
                         serde_json::json!({
                             "requestId": request_id,
                             "toolName": action,
@@ -2357,7 +3171,7 @@ pub async fn send_message(
                         })),
                     );
                     let _ = app_handle.emit(
-                        "agent:approval_result",
+                        &ev_approval_result,
                         serde_json::json!({
                             "action": action,
                             "approved": approved,
@@ -2392,7 +3206,7 @@ pub async fn send_message(
                         })
                         .collect();
                     let _ = app_handle.emit(
-                        "agent:tool_choice_required",
+                        &ev_tool_choice_required,
                         serde_json::json!({
                             "query": query,
                             "confidence": confidence,
@@ -2411,7 +3225,7 @@ pub async fn send_message(
                         })),
                     );
                     let _ = app_handle.emit(
-                        "agent:thinking",
+                        &ev_thinking,
                         serde_json::json!({
                             "status": "planning",
                             "plan": plan,
@@ -2420,6 +3234,121 @@ pub async fn send_message(
                 }
                 StreamEvent::Error(err) => {
                     tracing::error!("Agent error: {}", err);
+                    let is_transport_failure = is_likely_local_llm_transport_error(&err);
+
+                    if is_transport_failure
+                        && full_response.is_empty()
+                        && successful_tool_count == 0
+                        && !recovery_attempted
+                    {
+                        recovery_attempted = true;
+                        emit_agent_stage(
+                            &app_handle,
+                            "llm_transport_error_recovery_started",
+                            "LLM transport failed early; attempting orchestrator recovery and single retry",
+                            Some(serde_json::json!({
+                                "mode": match retry_execution_profile.mode {
+                                    TurnExecutionMode::Assistant => "assistant",
+                                    TurnExecutionMode::PromptLab => "prompt_lab",
+                                },
+                            })),
+                        );
+
+                        if let Some(orchestrator) = orchestrator_for_recovery.as_ref() {
+                            match orchestrator.restart("transport_failure").await {
+                                Ok(()) => {
+                                    emit_agent_stage(
+                                        &app_handle,
+                                        "llm_transport_error_recovery_succeeded",
+                                        "Orchestrator recovered; retrying this turn once",
+                                        None,
+                                    );
+
+                                    let (retry_tx, retry_rx) =
+                                        tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
+                                    let mut retry_messages = retry_messages_seed.clone();
+                                    let retry_agent_clone = retry_agent.clone();
+                                    let retry_sid_clone = retry_session_id.clone();
+                                    let retry_profile_clone = retry_execution_profile.clone();
+
+                                    tauri::async_runtime::spawn(async move {
+                                        retry_agent_clone
+                                            .run_with_profile(
+                                                &retry_sid_clone,
+                                                &mut retry_messages,
+                                                retry_tx,
+                                                Some(retry_profile_clone),
+                                            )
+                                            .await;
+                                    });
+
+                                    active_rx = retry_rx;
+                                    continue;
+                                }
+                                Err(restart_err) => {
+                                    tracing::error!(
+                                        ?restart_err,
+                                        "orchestrator restart failed after transport error"
+                                    );
+                                    emit_agent_stage(
+                                        &app_handle,
+                                        "llm_transport_error_recovery_failed",
+                                        "Orchestrator recovery failed; falling back to error handling",
+                                        Some(serde_json::json!({
+                                            "error": restart_err.to_string(),
+                                        })),
+                                    );
+                                }
+                            }
+                        } else {
+                            emit_agent_stage(
+                                &app_handle,
+                                "llm_transport_error_recovery_unavailable",
+                                "No orchestrator active; skipping auto-recovery",
+                                None,
+                            );
+                        }
+                    }
+
+                    if is_transport_failure && full_response.is_empty() && successful_tool_count > 0 {
+                        if let Some((tool_name, tool_result)) = last_successful_tool.as_ref() {
+                            let fallback_text = build_tool_only_fallback_message(
+                                tool_name,
+                                true,
+                                tool_result,
+                            );
+                            full_response = fallback_text.clone();
+                            emit_agent_stage(
+                                &app_handle,
+                                "llm_transport_error_tool_fallback",
+                                "LLM transport failed after tool success; returning tool-only fallback",
+                                Some(serde_json::json!({
+                                    "tool": tool_name,
+                                    "successful_tool_count": successful_tool_count,
+                                })),
+                            );
+                            let _ = app_handle.emit(
+                                &ev_token,
+                                serde_json::json!({
+                                    "text": fallback_text,
+                                }),
+                            );
+                            continue;
+                        }
+                    }
+
+                    if is_transport_failure && !full_response.is_empty() {
+                        emit_agent_stage(
+                            &app_handle,
+                            "llm_transport_error_after_partial_output",
+                            "LLM transport failed after partial response; preserving generated content",
+                            Some(serde_json::json!({
+                                "response_chars": full_response.chars().count(),
+                            })),
+                        );
+                        continue;
+                    }
+
                     let user_visible_error = format!("⚠️ {err}");
                     if full_response.is_empty() {
                         full_response = user_visible_error.clone();
@@ -2433,7 +3362,7 @@ pub async fn send_message(
                         })),
                     );
                     let _ = app_handle.emit(
-                        "agent:token",
+                        &ev_token,
                         serde_json::json!({
                             "text": user_visible_error,
                         }),
@@ -2507,12 +3436,77 @@ pub async fn send_message(
             None,
         );
 
-        let _ = app_handle.emit("agent:done", serde_json::json!({}));
+        let _ = app_handle.emit(&ev_done, serde_json::json!({}));
+        decrement_active_turn_counter(&active_turns_for_tracking);
+        touch_orchestrator_activity(&last_activity_for_tracking).await;
     });
 
     Ok(serde_json::json!({
         "status": "processing",
     }))
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct LabExecutionProfileInput {
+    pub app_lock: Option<String>,
+    pub tool_lock: Option<String>,
+    pub strategy: Option<String>,
+}
+
+impl LabExecutionProfileInput {
+    fn tool_selection_strategy(&self) -> PromptLabToolSelectionStrategy {
+        match self
+            .strategy
+            .as_deref()
+            .map(|value| value.trim().to_ascii_lowercase())
+        {
+            Some(value)
+                if value == "direct"
+                    || value == "direct_locked_tool"
+                    || value == "direct-locked-tool" =>
+            {
+                PromptLabToolSelectionStrategy::DirectLockedTool
+            }
+            _ => PromptLabToolSelectionStrategy::RoutedWithinLock,
+        }
+    }
+
+    fn to_core_profile(&self) -> TurnExecutionProfile {
+        TurnExecutionProfile::prompt_lab(
+            self.app_lock.clone(),
+            self.tool_lock.clone(),
+            self.tool_selection_strategy(),
+        )
+    }
+}
+
+#[tauri::command]
+pub async fn send_message(
+    message: String,
+    state: State<'_, AppStateCell>,
+    app: AppHandle,
+) -> Result<serde_json::Value, String> {
+    send_message_with_profile(message, TurnExecutionProfile::assistant(), state, app).await
+}
+
+#[tauri::command]
+pub async fn send_lab_message(
+    message: String,
+    profile: Option<LabExecutionProfileInput>,
+    state: State<'_, AppStateCell>,
+    app: AppHandle,
+) -> Result<serde_json::Value, String> {
+    let execution_profile = profile
+        .map(|value| value.to_core_profile())
+        .unwrap_or_else(|| {
+            TurnExecutionProfile::prompt_lab(
+                None,
+                None,
+                PromptLabToolSelectionStrategy::RoutedWithinLock,
+            )
+        });
+    send_message_with_profile(message, execution_profile, state, app).await
 }
 
 #[tauri::command]
@@ -2706,6 +3700,18 @@ pub async fn cancel_request(state: State<'_, AppStateCell>) -> Result<(), String
 }
 
 #[tauri::command]
+pub async fn cancel_turn(
+    session_id: String,
+    state: State<'_, AppStateCell>,
+) -> Result<(), String> {
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    state.agent_loop.cancel_session(&session_id);
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn approve_action(
     request_id: String,
     state: State<'_, AppStateCell>,
@@ -2738,9 +3744,19 @@ pub async fn deny_action(
 
 #[tauri::command]
 pub async fn get_health(state: State<'_, AppStateCell>) -> Result<serde_json::Value, String> {
-    let state = state
-        .get()
-        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    // If AppState is not yet initialized, return a "starting" payload so the
+    // UI can show "Warming up" instead of staying stuck on "Booting".
+    let Some(state) = state.get() else {
+        return Ok(serde_json::json!({
+            "status": "starting",
+            "uptime_secs": 0,
+            "tool_count": 0,
+            "services": [
+                {"name": "runtime", "status": "starting", "message": "KRIA is initializing…"}
+            ],
+            "hardware": {}
+        }));
+    };
     // Refresh LLM server health on each call
     let mr_status = state.model_router.status().await;
     let mr_healthy = mr_status["local_healthy"].as_bool().unwrap_or(false);
@@ -3093,6 +4109,9 @@ pub async fn start_voice(state: State<'_, AppStateCell>, app: AppHandle) -> Resu
     let embeddings = state.embeddings.clone();
     let vectors = state.vectors.clone();
     let hw_info_voice = state.hardware_info.clone();
+    let orchestrator_voice = state.orchestrator.read().await.clone();
+    let active_turns_voice = state.orchestrator_active_turns.clone();
+    let last_activity_voice = state.orchestrator_last_activity_at.clone();
 
     tauri::async_runtime::spawn(async move {
         while let Some(event) = event_rx.recv().await {
@@ -3124,7 +4143,21 @@ pub async fn start_voice(state: State<'_, AppStateCell>, app: AppHandle) -> Resu
                     let language = frame.language;
                     let confidence = frame.confidence;
 
-                    tracing::info!(transcript = %text, language = %language, confidence, "voice: transcript received");
+                    tracing::info!(
+                        language = %language,
+                        confidence,
+                        chars = text.chars().count(),
+                        "voice transcript received"
+                    );
+                    if kria_core::infra::pipeline_trace::pipeline_debug_enabled() {
+                        tracing::debug!(
+                            target: "kria_pipeline",
+                            transcript = %kria_core::infra::pipeline_trace::sanitize_text_for_logs(&text, 320),
+                            language = %language,
+                            confidence,
+                            "voice transcript preview"
+                        );
+                    }
                     let _ = app_handle.emit(
                         "voice:transcript",
                         serde_json::json!({
@@ -3135,37 +4168,30 @@ pub async fn start_voice(state: State<'_, AppStateCell>, app: AppHandle) -> Resu
                         }),
                     );
 
+                    touch_orchestrator_activity(&last_activity_voice).await;
+                    if let Err(e) = ensure_orchestrator_ready_for_turn(
+                        orchestrator_voice.as_ref(),
+                        "voice_turn",
+                    )
+                    .await
+                    {
+                        tracing::warn!(?e, "voice turn preflight failed");
+                        let _ = app_handle.emit(
+                            "agent:token",
+                            serde_json::json!({ "text": format!("⚠️ {e}") }),
+                        );
+                        let _ = app_handle.emit("agent:done", serde_json::json!({}));
+                        continue;
+                    }
+                    active_turns_voice.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
                     // Feed transcript through the agent loop (same as send_message)
                     let session_id = session_id_lock.read().await.clone();
                     let config_guard = config.read().await;
                     let hw_tier = hw_info_voice.tier.as_str();
 
-                    let tool_descriptions = tool_registry
-                        .list_for_tier(hw_tier)
-                        .iter()
-                        .map(|d| {
-                            let params: Vec<String> = d
-                                .parameters
-                                .iter()
-                                .map(|p| {
-                                    format!(
-                                        "  - {}: {} ({}{})",
-                                        p.name,
-                                        p.description,
-                                        p.param_type,
-                                        if p.required { ", required" } else { "" }
-                                    )
-                                })
-                                .collect();
-                            format!(
-                                "### {}\n{}\nParameters:\n{}",
-                                d.name,
-                                d.description,
-                                params.join("\n")
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n\n");
+                    let tool_defs = tool_registry.list_for_tier(hw_tier);
+                    let tool_descriptions = build_tool_descriptions_for_prompt(&tool_defs);
 
                     let user_name = memory_store
                         .get_preference("user_name")
@@ -3263,8 +4289,10 @@ pub async fn start_voice(state: State<'_, AppStateCell>, app: AppHandle) -> Resu
 
                     // Collect agent response for TTS
                     let mut full_response = String::new();
-                    let mut pending_tool_params: std::collections::HashMap<String, serde_json::Value> =
-                        std::collections::HashMap::new();
+                    let mut pending_tool_params: std::collections::HashMap<
+                        String,
+                        serde_json::Value,
+                    > = std::collections::HashMap::new();
                     let app2 = app_handle.clone();
                     let ms2 = memory_store.clone();
                     let sid2 = session_id.clone();
@@ -3335,6 +4363,29 @@ pub async fn start_voice(state: State<'_, AppStateCell>, app: AppHandle) -> Resu
                                     tokens_used: None,
                                     timestamp: Utc::now(),
                                 });
+                            }
+                            StreamEvent::ToolProgress { call_id, message, percent } => {
+                                let _ = app2.emit(
+                                    "kria:tool-progress",
+                                    serde_json::json!({
+                                        "call_id": call_id,
+                                        "message": message,
+                                        "percent": percent,
+                                        "session_id": sid2,
+                                    }),
+                                );
+                            }
+                            StreamEvent::ToolPayloadChunk { call_id, seq, is_final, data } => {
+                                let _ = app2.emit(
+                                    "kria:tool-payload-chunk",
+                                    serde_json::json!({
+                                        "call_id": call_id,
+                                        "seq": seq,
+                                        "is_final": is_final,
+                                        "data": data,
+                                        "session_id": sid2,
+                                    }),
+                                );
                             }
                             StreamEvent::ApprovalRequired {
                                 request_id,
@@ -3420,6 +4471,8 @@ pub async fn start_voice(state: State<'_, AppStateCell>, app: AppHandle) -> Resu
                     }
 
                     let _ = app2.emit("agent:done", serde_json::json!({}));
+                    decrement_active_turn_counter(&active_turns_voice);
+                    touch_orchestrator_activity(&last_activity_voice).await;
                 }
                 VoicePipelineEvent::SpeakingStarted => {
                     let _ =
@@ -3506,6 +4559,26 @@ pub async fn send_image_message(
         return Err("image too large (max 10 MB)".into());
     }
 
+    touch_orchestrator_activity(&state.orchestrator_last_activity_at).await;
+    let orchestrator_img = state.orchestrator.read().await.clone();
+    if orchestrator_img.is_some() {
+        emit_agent_stage(
+            &app,
+            "ensuring_local_runtime",
+            "Ensuring local LLM runtime is ready for image analysis",
+            None,
+        );
+    }
+    if let Err(e) = ensure_orchestrator_ready_for_turn(orchestrator_img.as_ref(), "image_turn").await {
+        emit_agent_stage(
+            &app,
+            "failed",
+            "Local runtime preflight failed",
+            Some(serde_json::json!({ "error": e.clone() })),
+        );
+        return Err(e);
+    }
+
     // Store image to ~/.kria/attachments/ with hash-based filename
     let config = state.config.read().await;
     let paths = config.resolve_paths().map_err(|e| e.to_string())?;
@@ -3568,31 +4641,7 @@ pub async fn send_image_message(
     );
 
     let tool_defs = tool_registry.list_for_tier(hw_tier);
-    let tool_descriptions = tool_defs
-        .iter()
-        .map(|d| {
-            let params: Vec<String> = d
-                .parameters
-                .iter()
-                .map(|p| {
-                    format!(
-                        "  - {}: {} ({}{})",
-                        p.name,
-                        p.description,
-                        p.param_type,
-                        if p.required { ", required" } else { "" }
-                    )
-                })
-                .collect();
-            format!(
-                "### {}\n{}\nParameters:\n{}",
-                d.name,
-                d.description,
-                params.join("\n")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    let tool_descriptions = build_tool_descriptions_for_prompt(&tool_defs);
 
     emit_agent_stage(
         &app,
@@ -3600,6 +4649,13 @@ pub async fn send_image_message(
         "Tool descriptions prepared",
         Some(serde_json::json!({ "tool_count": tool_defs.len() })),
     );
+
+    let llm_context_window = config.llm.context_window.max(1024);
+    let visual_token_cap = image_visual_token_cap_for_context(llm_context_window);
+    let response_reserve = if llm_context_window <= 2048 { 480 } else { 640 };
+    let system_reserve = if llm_context_window <= 2048 { 320 } else { 480 };
+    let history_reserve = if llm_context_window <= 2048 { 320 } else { 700 };
+    let ocr_token_cap = if llm_context_window <= 2048 { 256 } else { 320 };
 
     let (preanalysis_summary, llm_images): (Option<String>, Vec<ImageAttachment>) = if let Some(
         handler,
@@ -3617,6 +4673,14 @@ pub async fn send_image_message(
             "path": image_path_for_llm.clone(),
             "operations": ["metadata", "ocr", "features", "thumbnail"],
             "intent": image_intent.clone(),
+            "context_window": llm_context_window,
+            "response_reserve": response_reserve,
+            "system_reserve": system_reserve,
+            "history_reserve": history_reserve,
+            "ocr_token_cap": ocr_token_cap,
+            "metadata_token_cap": 72,
+            "hard_visual_token_cap": visual_token_cap,
+            "max_images_per_turn": IMAGE_SAFE_MAX_ATTACHMENTS_PER_TURN,
         });
 
         match tokio::time::timeout(
@@ -3627,8 +4691,18 @@ pub async fn send_image_message(
         {
             Ok(result) if result.success => {
                 let summary = extract_image_preanalysis_summary(&result.data);
-                let images = extract_preprocessed_image_attachments(&result.data, &mime_type)
+                let extracted_images =
+                    extract_preprocessed_image_attachments(&result.data, &mime_type)
                     .unwrap_or_default();
+                let mut images =
+                    constrain_runtime_image_attachments(extracted_images, llm_context_window);
+                if images.is_empty() {
+                    if let Some(native) =
+                        build_native_preprocessed_attachment_with_max(&image_path_for_llm, 640)
+                    {
+                        images.push(native);
+                    }
+                }
                 let step_status = build_preprocessing_step_status(&result.data, &image_intent);
                 emit_agent_stage(
                     &app,
@@ -3637,6 +4711,8 @@ pub async fn send_image_message(
                     Some(serde_json::json!({
                         "has_summary": summary.is_some(),
                         "llm_image_count": images.len(),
+                        "context_window": llm_context_window,
+                        "visual_token_cap": visual_token_cap,
                         "step_status": step_status,
                     })),
                 );
@@ -3774,6 +4850,23 @@ pub async fn send_image_message(
         name: None,
         images: None,
     });
+
+    if let Some(summary) = preanalysis_summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        messages.push(ChatMessage {
+            role: "system".into(),
+            content: format!(
+                "Automatic pre-analysis context (already validated):\n{}",
+                summary
+            ),
+            name: None,
+            images: None,
+        });
+    }
+
     for turn in &recent_turns {
         messages.push(ChatMessage {
             role: turn.role.clone(),
@@ -3788,7 +4881,7 @@ pub async fn send_image_message(
             &user_text,
             &image_path_for_llm,
             &image_intent,
-            preanalysis_summary.as_deref(),
+            None,
         ),
         name: None,
         images: Some(llm_images),
@@ -3845,12 +4938,18 @@ pub async fn send_image_message(
     );
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
+    state
+        .orchestrator_active_turns
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let active_turns_for_tracking = state.orchestrator_active_turns.clone();
+    let last_activity_for_tracking = state.orchestrator_last_activity_at.clone();
     let app_handle = app.clone();
     let session_id_clone = session_id.clone();
     let memory_store_clone = memory_store.clone();
     let embeddings_clone = state.embeddings.clone();
     let vectors_clone = state.vectors.clone();
     let user_message_clone = user_text.clone();
+    let preanalysis_summary_fallback = preanalysis_summary.clone();
 
     let agent = agent_loop.clone();
     let sid = session_id.clone();
@@ -3990,6 +5089,27 @@ pub async fn send_image_message(
                         timestamp: Utc::now(),
                     });
                 }
+                StreamEvent::ToolProgress { call_id, message, percent } => {
+                    let _ = app_handle.emit(
+                        "kria:tool-progress",
+                        serde_json::json!({
+                            "call_id": call_id,
+                            "message": message,
+                            "percent": percent,
+                        }),
+                    );
+                }
+                StreamEvent::ToolPayloadChunk { call_id, seq, is_final, data } => {
+                    let _ = app_handle.emit(
+                        "kria:tool-payload-chunk",
+                        serde_json::json!({
+                            "call_id": call_id,
+                            "seq": seq,
+                            "is_final": is_final,
+                            "data": data,
+                        }),
+                    );
+                }
                 StreamEvent::ApprovalRequired {
                     request_id,
                     action,
@@ -4072,6 +5192,38 @@ pub async fn send_image_message(
                     );
                 }
                 StreamEvent::Error(err) => {
+                    let lower_err = err.to_ascii_lowercase();
+                    let is_transport_failure = lower_err.contains("error sending request for url")
+                        || lower_err.contains("connection refused")
+                        || lower_err.contains("tcp connect")
+                        || lower_err.contains("dns error")
+                        || lower_err.contains("timed out");
+
+                    if (lower_err.contains("circuit open")
+                        || lower_err.contains("local llm unavailable")
+                        || is_transport_failure)
+                        && full_response.is_empty()
+                    {
+                        if let Some(summary) = preanalysis_summary_fallback.as_ref() {
+                            let fallback_text = format!(
+                                "⚠️ Local vision model is temporarily unavailable. Here is the image pre-analysis:\n\n{}",
+                                summary
+                            );
+                            full_response = fallback_text.clone();
+                            emit_agent_stage(
+                                &app_handle,
+                                "llm_unavailable_preanalysis_fallback",
+                                "LLM unavailable; returning pre-analysis summary fallback",
+                                None,
+                            );
+                            let _ = app_handle.emit(
+                                "agent:token",
+                                serde_json::json!({ "text": fallback_text }),
+                            );
+                            continue;
+                        }
+                    }
+
                     let user_visible_error = format!("⚠️ {err}");
                     if full_response.is_empty() {
                         full_response = user_visible_error.clone();
@@ -4157,6 +5309,8 @@ pub async fn send_image_message(
         );
 
         let _ = app_handle.emit("agent:done", serde_json::json!({}));
+        decrement_active_turn_counter(&active_turns_for_tracking);
+        touch_orchestrator_activity(&last_activity_for_tracking).await;
     });
 
     Ok(serde_json::json!({
@@ -4195,6 +5349,77 @@ async fn sync_google_workspace_client_ref(
         gw::set_client(&state.gw_client_ref, client).await;
     } else {
         *state.gw_client_ref.write().await = None;
+    }
+}
+
+async fn sync_colab_runtime_snapshot(state: &AppState, statuses: &[McpServerStatus]) {
+    let colab_cfg = { state.config.read().await.colab.clone() };
+    let mut runtime = state.colab_runtime.write().await;
+    runtime.sidecar_server_name = colab_cfg.mcp_server_name.clone();
+
+    if !colab_cfg.enabled {
+        runtime.state = ColabRuntimeState::Disconnected;
+        runtime.selected_notebook = None;
+        runtime.last_error = None;
+        return;
+    }
+
+    match statuses
+        .iter()
+        .find(|s| s.name == runtime.sidecar_server_name)
+    {
+        Some(status) if status.state == McpServerState::Running => {
+            let category = format!("mcp_{}", runtime.sidecar_server_name);
+            let category_tools = state.tool_registry.list_by_category(&category);
+            let bootstrap_only = status.tool_count == 1
+                && category_tools.len() == 1
+                && category_tools
+                    .first()
+                    .map(|tool| is_colab_bootstrap_tool_name(&tool.name))
+                    .unwrap_or(false);
+
+            let has_notebook = runtime
+                .selected_notebook
+                .as_ref()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false);
+
+            let next_state = if status.tool_count == 0 {
+                runtime.selected_notebook = None;
+                ColabRuntimeState::AwaitingBrowserConnection
+            } else if bootstrap_only {
+                ColabRuntimeState::AwaitingBrowserConnection
+            } else if has_notebook {
+                ColabRuntimeState::Ready
+            } else {
+                ColabRuntimeState::NotebookSelectionRequired
+            };
+
+            runtime.state = next_state;
+            if matches!(
+                next_state,
+                ColabRuntimeState::Ready | ColabRuntimeState::NotebookSelectionRequired
+            ) {
+                runtime.last_error = None;
+            }
+        }
+        Some(status) => {
+            runtime.state = ColabRuntimeState::Degraded;
+            runtime.last_error = status.error.clone().or_else(|| {
+                Some(format!(
+                    "MCP server '{}' is {}",
+                    runtime.sidecar_server_name,
+                    mcp_state_name(status.state)
+                ))
+            });
+        }
+        None => {
+            runtime.state = ColabRuntimeState::Degraded;
+            runtime.last_error = Some(format!(
+                "MCP server '{}' not found in runtime status",
+                runtime.sidecar_server_name
+            ));
+        }
     }
 }
 
@@ -4245,6 +5470,7 @@ async fn apply_mcp_runtime_from_config(state: &AppState) -> serde_json::Value {
     drop(manager);
 
     sync_google_workspace_client_ref(state, gw_client).await;
+    sync_colab_runtime_snapshot(state, &statuses).await;
     update_mcp_health_status(state, &statuses).await;
 
     let status_json: Vec<serde_json::Value> = statuses.iter().map(mcp_status_to_json).collect();
@@ -4293,17 +5519,21 @@ pub async fn list_mcp_servers(state: State<'_, AppStateCell>) -> Result<serde_js
 
 #[tauri::command]
 pub async fn reconcile_mcp_runtime(
+    app: AppHandle,
     state: State<'_, AppStateCell>,
 ) -> Result<serde_json::Value, String> {
     let state = state
         .get()
         .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
-    Ok(apply_mcp_runtime_from_config(state).await)
+    let report = apply_mcp_runtime_from_config(state).await;
+    emit_colab_status_event(&app, state).await;
+    Ok(report)
 }
 
 #[tauri::command]
 pub async fn restart_mcp_server_runtime(
     name: String,
+    app: AppHandle,
     state: State<'_, AppStateCell>,
 ) -> Result<serde_json::Value, String> {
     let state = state
@@ -4320,7 +5550,9 @@ pub async fn restart_mcp_server_runtime(
     drop(manager);
 
     sync_google_workspace_client_ref(state, gw_client).await;
+    sync_colab_runtime_snapshot(state, &statuses).await;
     update_mcp_health_status(state, &statuses).await;
+    emit_colab_status_event(&app, state).await;
 
     let servers: Vec<serde_json::Value> = statuses.iter().map(mcp_status_to_json).collect();
     Ok(serde_json::json!({
@@ -4761,6 +5993,482 @@ pub async fn delete_workflow(
     }
 }
 
+// ── Colab Cloud Tier Commands ───────────────────────────────────────────────
+
+fn migrate_legacy_colab_server_command(server: &mut kria_core::config::McpServerConfig) -> bool {
+    if server.command != COLAB_LEGACY_NPX_COMMAND {
+        return false;
+    }
+
+    if !server
+        .args
+        .iter()
+        .any(|arg| arg == COLAB_LEGACY_NPX_PACKAGE)
+    {
+        return false;
+    }
+
+    server.command = COLAB_OFFICIAL_COMMAND.to_string();
+    server.args = vec![COLAB_OFFICIAL_SOURCE.to_string()];
+    true
+}
+
+fn default_colab_server_config() -> kria_core::config::McpServerConfig {
+    kria_core::config::McpServerConfig {
+        name: COLAB_DEFAULT_SERVER_NAME.to_string(),
+        command: COLAB_OFFICIAL_COMMAND.to_string(),
+        args: vec![COLAB_OFFICIAL_SOURCE.to_string()],
+        env: std::collections::HashMap::new(),
+        enabled: true,
+        trust_level: "YELLOW".into(),
+        tool_overrides: std::collections::HashMap::new(),
+    }
+}
+
+fn build_colab_tier_status_payload(
+    config: &ColabConfig,
+    runtime: &ColabRuntimeSnapshot,
+    mcp_runtime: Option<&McpServerStatus>,
+    capability_summary: &serde_json::Value,
+    additional_warnings: &[String],
+) -> serde_json::Value {
+    let (mcp_state, mcp_tool_count, mcp_error, mcp_running) = match mcp_runtime {
+        Some(status) => (
+            mcp_state_name(status.state).to_string(),
+            status.tool_count,
+            status.error.clone(),
+            status.state == McpServerState::Running,
+        ),
+        None => ("not_configured".to_string(), 0usize, None, false),
+    };
+
+    let browser_connected = matches!(
+        runtime.state,
+        ColabRuntimeState::NotebookSelectionRequired | ColabRuntimeState::Ready
+    );
+    let connected = config.enabled && mcp_running && browser_connected;
+
+    let selected_notebook = runtime
+        .selected_notebook
+        .as_ref()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+
+    let mut capability_missing: Vec<String> = capability_summary
+        .get("ready_requirements")
+        .and_then(|v| v.get("missing"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if selected_notebook {
+        capability_missing.retain(|item| item != "notebook_selection_or_discovery");
+    }
+
+    let capability_ready = capability_missing.is_empty();
+    let ready_for_cloud_task =
+        connected && runtime.state == ColabRuntimeState::Ready && capability_ready;
+    let notebook_selection_required =
+        connected && runtime.state == ColabRuntimeState::NotebookSelectionRequired;
+
+    let discovered_tool_count = capability_summary
+        .get("tool_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+
+    let bootstrap_only = capability_summary
+        .get("discovered_tools")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.len() == 1
+                && arr.iter().any(|entry| {
+                    entry
+                        .get("operation")
+                        .and_then(|v| v.as_str())
+                        .map(is_colab_bootstrap_tool_name)
+                        .unwrap_or(false)
+                        || entry
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .map(is_colab_bootstrap_tool_name)
+                            .unwrap_or(false)
+                })
+        })
+        .unwrap_or(false);
+
+    let mut warnings: Vec<String> = Vec::new();
+    if !config.enabled {
+        warnings.push("Colab tier is disabled in config".into());
+    }
+    if !mcp_running {
+        warnings.push(format!(
+            "Colab MCP runtime is not running (state={})",
+            mcp_state
+        ));
+    }
+    if runtime.state == ColabRuntimeState::AwaitingBrowserConnection {
+        warnings.push("Awaiting browser connection to Colab session".into());
+    }
+    if mcp_running && bootstrap_only {
+        warnings.push(
+            "Colab MCP is exposing only bootstrap tooling. Use Connect Colab to open browser session and unlock notebook tools".into(),
+        );
+    }
+    if mcp_running && discovered_tool_count == 0 {
+        warnings.push(format!(
+            "Colab MCP server '{}' is running but no tools were discovered",
+            runtime.sidecar_server_name
+        ));
+    }
+    if connected && !capability_ready {
+        if !capability_missing.is_empty() {
+            warnings.push(format!(
+                "Colab capability requirements are not satisfied: {}",
+                capability_missing.join(", ")
+            ));
+        }
+    }
+    if notebook_selection_required {
+        warnings.push("Notebook must be selected before executing cloud tasks".into());
+    }
+    if let Some(err) = runtime.last_error.as_ref() {
+        warnings.push(format!("Last runtime error: {err}"));
+    }
+    warnings.extend(additional_warnings.iter().cloned());
+
+    serde_json::json!({
+        "enabled": config.enabled,
+        "connected": connected,
+        "ready_for_cloud_task": ready_for_cloud_task,
+        "notebook_selection_required": notebook_selection_required,
+        "runtime_state": runtime.state.as_str(),
+        "selected_notebook": runtime.selected_notebook,
+        "mcp_server_name": runtime.sidecar_server_name,
+        "auto_escalate": config.auto_escalate,
+        "fallback_to_local": config.fallback_to_local,
+        "connect_timeout_secs": config.connect_timeout_secs,
+        "keepalive_interval_secs": config.keepalive_interval_secs,
+        "checkpoint_interval_secs": config.checkpoint_interval_secs,
+        "mcp": {
+            "state": mcp_state,
+            "tool_count": mcp_tool_count,
+            "error": mcp_error,
+        },
+        "capabilities": capability_summary.clone(),
+        "warnings": warnings,
+    })
+}
+
+async fn maybe_bootstrap_colab_browser_connection(state: &AppState, server_name: &str) {
+    let client = {
+        let manager = state.mcp_manager.lock().await;
+        manager.get_client(server_name).cloned()
+    };
+
+    let Some(client) = client else {
+        return;
+    };
+
+    let tools = client.tools().await;
+    let has_bootstrap_tool = tools
+        .iter()
+        .any(|tool| is_colab_bootstrap_tool_name(&tool.name));
+
+    if !has_bootstrap_tool {
+        return;
+    }
+
+    match client.call_tool(COLAB_BROWSER_BOOTSTRAP_TOOL, None).await {
+        Ok(result) => {
+            let connected = result.content.iter().any(|content| {
+                content
+                    .text
+                    .as_ref()
+                    .map(|text| {
+                        let normalized = text.trim().to_ascii_lowercase();
+                        normalized == "true"
+                            || normalized.contains("\"result\": true")
+                            || normalized.contains("connected")
+                    })
+                    .unwrap_or(false)
+            });
+
+            tracing::info!(
+                server = %server_name,
+                connected,
+                "invoked Colab browser bootstrap MCP tool"
+            );
+
+            if connected {
+                let mut runtime = state.colab_runtime.write().await;
+                runtime.last_error = None;
+            }
+
+            let mut manager = state.mcp_manager.lock().await;
+            if let Err(err) = manager
+                .refresh_server_tools(server_name, &state.tool_registry)
+                .await
+            {
+                tracing::warn!(
+                    server = %server_name,
+                    error = %err,
+                    "colab MCP tool refresh after bootstrap failed"
+                );
+                let mut runtime = state.colab_runtime.write().await;
+                runtime.last_error = Some(format!(
+                    "Colab MCP tool refresh after bootstrap failed: {err}"
+                ));
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                server = %server_name,
+                error = %err,
+                "colab browser bootstrap tool invocation failed"
+            );
+            let mut runtime = state.colab_runtime.write().await;
+            runtime.last_error = Some(format!(
+                "Colab browser bootstrap failed: {err}"
+            ));
+        }
+    }
+}
+
+async fn collect_colab_tier_status(state: &AppState) -> serde_json::Value {
+    let colab_config = {
+        let config = state.config.read().await;
+        config.colab.clone()
+    };
+
+    let colab_server_name = {
+        let runtime = state.colab_runtime.read().await;
+        runtime.sidecar_server_name.clone()
+    };
+
+    let mut transient_warnings: Vec<String> = Vec::new();
+
+    let statuses = {
+        let mut manager = state.mcp_manager.lock().await;
+        if colab_config.enabled {
+            if let Err(err) = manager
+                .refresh_server_tools(&colab_server_name, &state.tool_registry)
+                .await
+            {
+                tracing::warn!(
+                    server = %colab_server_name,
+                    error = %err,
+                    "colab MCP tool refresh failed"
+                );
+                transient_warnings.push(format!(
+                    "Colab MCP tool refresh failed: {err}"
+                ));
+            }
+        }
+        manager.status().await
+    };
+
+    sync_colab_runtime_snapshot(state, &statuses).await;
+
+    let runtime = state.colab_runtime.read().await.clone();
+    let mcp_runtime = statuses
+        .iter()
+        .find(|s| s.name == runtime.sidecar_server_name);
+
+    let capability_summary =
+        build_colab_capability_summary(&state.tool_registry, &runtime.sidecar_server_name);
+
+    build_colab_tier_status_payload(
+        &colab_config,
+        &runtime,
+        mcp_runtime,
+        &capability_summary,
+        &transient_warnings,
+    )
+}
+
+#[tauri::command]
+pub async fn get_colab_tier_status(
+    state: State<'_, AppStateCell>,
+) -> Result<serde_json::Value, String> {
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+
+    Ok(collect_colab_tier_status(state).await)
+}
+
+#[tauri::command]
+pub async fn connect_colab_tier(
+    server_name: Option<String>,
+    app: AppHandle,
+    state: State<'_, AppStateCell>,
+) -> Result<serde_json::Value, String> {
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+
+    let mut changed = false;
+    let mut server_found = false;
+    let resolved_server_name = {
+        let mut config = state.config.write().await;
+
+        if let Some(name) = server_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let next = name.to_string();
+            if config.colab.mcp_server_name != next {
+                config.colab.mcp_server_name = next;
+                changed = true;
+            }
+        }
+
+        if !config.colab.enabled {
+            config.colab.enabled = true;
+            changed = true;
+        }
+
+        let server_name = config.colab.mcp_server_name.clone();
+        if let Some(server) = config.mcp.servers.iter_mut().find(|s| s.name == server_name) {
+            server_found = true;
+            if migrate_legacy_colab_server_command(server) {
+                changed = true;
+            }
+            if !server.enabled {
+                server.enabled = true;
+                changed = true;
+            }
+        } else if server_name == COLAB_DEFAULT_SERVER_NAME {
+            config.mcp.servers.push(default_colab_server_config());
+            server_found = true;
+            changed = true;
+        }
+
+        if changed {
+            config.save().map_err(|e| e.to_string())?;
+        }
+
+        server_name
+    };
+
+    {
+        let mut runtime = state.colab_runtime.write().await;
+        runtime.sidecar_server_name = resolved_server_name.clone();
+        runtime.selected_notebook = None;
+        runtime.state = ColabRuntimeState::SidecarStarting;
+        runtime.last_error = if server_found {
+            None
+        } else {
+            Some(format!(
+                "Configured MCP server '{}' is missing from mcp.servers",
+                resolved_server_name
+            ))
+        };
+    }
+
+    let runtime_report = apply_mcp_runtime_from_config(state).await;
+
+    if server_found {
+        maybe_bootstrap_colab_browser_connection(state, &resolved_server_name).await;
+    }
+
+    let colab_status = collect_colab_tier_status(state).await;
+    let _ = app.emit("colab:status", colab_status.clone());
+
+    Ok(serde_json::json!({
+        "status": "connecting",
+        "server_name": resolved_server_name,
+        "server_found": server_found,
+        "runtime": runtime_report,
+        "colab": colab_status,
+    }))
+}
+
+#[tauri::command]
+pub async fn disconnect_colab_tier(
+    app: AppHandle,
+    state: State<'_, AppStateCell>,
+) -> Result<serde_json::Value, String> {
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+
+    let mut changed = false;
+    {
+        let mut config = state.config.write().await;
+        if config.colab.enabled {
+            config.colab.enabled = false;
+            changed = true;
+        }
+
+        let target_server = config.colab.mcp_server_name.clone();
+        if let Some(server) = config.mcp.servers.iter_mut().find(|s| s.name == target_server) {
+            if server.enabled {
+                server.enabled = false;
+                changed = true;
+            }
+        }
+
+        if changed {
+            config.save().map_err(|e| e.to_string())?;
+        }
+    }
+
+    {
+        let mut runtime = state.colab_runtime.write().await;
+        runtime.state = ColabRuntimeState::Disconnected;
+        runtime.selected_notebook = None;
+        runtime.last_error = None;
+    }
+
+    let runtime_report = apply_mcp_runtime_from_config(state).await;
+
+    let colab_status = collect_colab_tier_status(state).await;
+    let _ = app.emit("colab:status", colab_status.clone());
+
+    Ok(serde_json::json!({
+        "status": "disconnected",
+        "runtime": runtime_report,
+        "colab": colab_status,
+    }))
+}
+
+#[tauri::command]
+pub async fn set_colab_selected_notebook(
+    notebook_id: String,
+    app: AppHandle,
+    state: State<'_, AppStateCell>,
+) -> Result<serde_json::Value, String> {
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+
+    let notebook_id = notebook_id.trim();
+    if notebook_id.is_empty() {
+        return Err("Notebook identifier cannot be empty".into());
+    }
+
+    {
+        let mut runtime = state.colab_runtime.write().await;
+        if runtime.state == ColabRuntimeState::Disconnected {
+            return Err("Colab tier is disconnected. Connect it first.".into());
+        }
+        runtime.selected_notebook = Some(notebook_id.to_string());
+        runtime.state = ColabRuntimeState::Ready;
+        runtime.last_error = None;
+    }
+
+    let colab_status = collect_colab_tier_status(state).await;
+    let _ = app.emit("colab:status", colab_status.clone());
+    Ok(colab_status)
+}
+
 // ── Google Workspace Commands ────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -5100,9 +6808,7 @@ pub async fn disconnect_google_workspace(
         )
     };
 
-    let token_path = config_dir
-        .join("tokens")
-        .join(format!("{}.json", account));
+    let token_path = config_dir.join("tokens").join(format!("{}.json", account));
 
     if token_path.exists() {
         std::fs::remove_file(&token_path).map_err(|e| format!("Failed to remove token: {e}"))?;
@@ -5130,16 +6836,35 @@ pub async fn get_orchestrator_status(
     let state = state
         .get()
         .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
-    match &state.orchestrator {
+    let orch_guard = state.orchestrator.read().await.clone();
+    match orch_guard.as_ref() {
         Some(orch) => {
             let snap = orch.snapshot();
+            let process_alive = orch.server_manager.has_live_process().await;
+            let state_healthy = snap.server_healthy;
+            let active_turns = state
+                .orchestrator_active_turns
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let idle_for_secs = {
+                let lock = state.orchestrator_last_activity_at.lock().await;
+                lock.elapsed().as_secs()
+            };
             Ok(serde_json::json!({
                 "enabled": true,
                 "backend": format!("{:?}", snap.backend),
                 "current_ngl": snap.current_ngl,
                 "current_context": snap.current_context,
                 "degradation": format!("{:?}", snap.degradation),
-                "server_healthy": snap.server_healthy,
+                "server_healthy": state_healthy && process_alive,
+                "server_healthy_state": state_healthy,
+                "process_alive": process_alive,
+                "server_state_code": orch.server_manager.state(),
+                "server_swapping": orch.server_manager.is_swapping(),
+                "idle_release_enabled": orch.config.idle_release_enabled,
+                "idle_release_after_secs": orch.config.idle_release_after_secs,
+                "idle_release_check_interval_secs": orch.config.idle_release_check_interval_secs,
+                "active_turns": active_turns,
+                "idle_for_secs": idle_for_secs,
                 "api_url": orch.api_url(),
             }))
         }
@@ -5152,13 +6877,20 @@ pub async fn get_orchestrator_status(
 #[cfg(test)]
 mod tests {
     use super::{
+        build_colab_tier_status_payload,
         build_google_workspace_status_payload, build_image_llm_user_content,
         build_tool_result_event_payload, extract_image_preanalysis_summary,
         extract_preprocessed_image_attachments, infer_image_intent_from_text, local_api_chat,
-        sync_telegram_mcp_server_config, GoogleWorkspaceRuntimeSnapshot, LocalApiBridgeState,
-        LocalApiChatRequest, LocalApiResponder, OCR_HEALTH_PROBE_IMAGE_BYTES,
+        migrate_legacy_colab_server_command, sync_telegram_mcp_server_config, ColabRuntimeSnapshot,
+        ColabRuntimeState,
+        GoogleWorkspaceRuntimeSnapshot, LocalApiBridgeState, LocalApiChatRequest,
+        LocalApiResponder, COLAB_OFFICIAL_COMMAND, COLAB_OFFICIAL_SOURCE,
+        OCR_HEALTH_PROBE_IMAGE_BYTES,
     };
     use async_trait::async_trait;
+    use kria_core::config::ColabConfig;
+    use kria_core::mcp::client::McpServerState;
+    use kria_core::mcp::server_manager::McpServerStatus;
     use std::path::Path;
 
     fn assert_confidence_range(metadata: &serde_json::Value) {
@@ -5180,6 +6912,155 @@ mod tests {
                     .any(|w| w.as_str().map(|s| s.contains(needle)).unwrap_or(false))
             })
             .unwrap_or(false)
+    }
+
+    #[test]
+    fn migrate_legacy_colab_server_command_rewrites_npx_entry() {
+        let mut server = kria_core::config::McpServerConfig {
+            name: "colab-mcp".into(),
+            command: "npx".into(),
+            args: vec!["-y".into(), "@googlecolab/colab-mcp".into()],
+            env: std::collections::HashMap::new(),
+            enabled: true,
+            trust_level: "YELLOW".into(),
+            tool_overrides: std::collections::HashMap::new(),
+        };
+
+        let changed = migrate_legacy_colab_server_command(&mut server);
+
+        assert!(changed);
+        assert_eq!(server.command, COLAB_OFFICIAL_COMMAND);
+        assert_eq!(server.args, vec![COLAB_OFFICIAL_SOURCE.to_string()]);
+    }
+
+    #[test]
+    fn migrate_legacy_colab_server_command_keeps_official_entry() {
+        let mut server = kria_core::config::McpServerConfig {
+            name: "colab-mcp".into(),
+            command: COLAB_OFFICIAL_COMMAND.into(),
+            args: vec![COLAB_OFFICIAL_SOURCE.into()],
+            env: std::collections::HashMap::new(),
+            enabled: true,
+            trust_level: "YELLOW".into(),
+            tool_overrides: std::collections::HashMap::new(),
+        };
+
+        let changed = migrate_legacy_colab_server_command(&mut server);
+
+        assert!(!changed);
+        assert_eq!(server.command, COLAB_OFFICIAL_COMMAND);
+        assert_eq!(server.args, vec![COLAB_OFFICIAL_SOURCE.to_string()]);
+    }
+
+    #[test]
+    fn colab_ready_allows_selected_notebook_without_discovery_tool() {
+        let mut config = ColabConfig::default();
+        config.enabled = true;
+
+        let runtime = ColabRuntimeSnapshot {
+            state: ColabRuntimeState::Ready,
+            sidecar_server_name: "colab-mcp".into(),
+            selected_notebook: Some("mcp_test.ipynb".into()),
+            last_error: None,
+        };
+
+        let mcp_status = McpServerStatus {
+            name: "colab-mcp".into(),
+            command: "uvx".into(),
+            enabled: true,
+            state: McpServerState::Running,
+            tool_count: 1,
+            error: None,
+        };
+
+        let capability_summary = serde_json::json!({
+            "category": "mcp_colab-mcp",
+            "tool_count": 1,
+            "discovered_tools": [],
+            "features": {
+                "notebook_discovery": false,
+                "notebook_selection": false,
+                "cell_execution": true,
+                "artifact_io": false,
+                "runtime_lifecycle": true,
+                "package_management": false,
+                "checkpointing": false
+            },
+            "ready_requirements": {
+                "requires": ["cell_execution", "notebook_selection_or_discovery"],
+                "satisfied": false,
+                "missing": ["notebook_selection_or_discovery"]
+            }
+        });
+
+        let payload = build_colab_tier_status_payload(
+            &config,
+            &runtime,
+            Some(&mcp_status),
+            &capability_summary,
+            &[],
+        );
+
+        assert_eq!(payload["connected"], serde_json::json!(true));
+        assert_eq!(payload["ready_for_cloud_task"], serde_json::json!(true));
+        assert!(!has_warning(
+            &payload,
+            "Colab capability requirements are not satisfied"
+        ));
+    }
+
+    #[test]
+    fn colab_ready_still_requires_cell_execution_even_with_selected_notebook() {
+        let mut config = ColabConfig::default();
+        config.enabled = true;
+
+        let runtime = ColabRuntimeSnapshot {
+            state: ColabRuntimeState::Ready,
+            sidecar_server_name: "colab-mcp".into(),
+            selected_notebook: Some("mcp_test.ipynb".into()),
+            last_error: None,
+        };
+
+        let mcp_status = McpServerStatus {
+            name: "colab-mcp".into(),
+            command: "uvx".into(),
+            enabled: true,
+            state: McpServerState::Running,
+            tool_count: 1,
+            error: None,
+        };
+
+        let capability_summary = serde_json::json!({
+            "category": "mcp_colab-mcp",
+            "tool_count": 1,
+            "discovered_tools": [],
+            "features": {
+                "notebook_discovery": false,
+                "notebook_selection": false,
+                "cell_execution": false,
+                "artifact_io": false,
+                "runtime_lifecycle": true,
+                "package_management": false,
+                "checkpointing": false
+            },
+            "ready_requirements": {
+                "requires": ["cell_execution", "notebook_selection_or_discovery"],
+                "satisfied": false,
+                "missing": ["cell_execution", "notebook_selection_or_discovery"]
+            }
+        });
+
+        let payload = build_colab_tier_status_payload(
+            &config,
+            &runtime,
+            Some(&mcp_status),
+            &capability_summary,
+            &[],
+        );
+
+        assert_eq!(payload["ready_for_cloud_task"], serde_json::json!(false));
+        assert!(has_warning(&payload, "cell_execution"));
+        assert!(!has_warning(&payload, "notebook_selection_or_discovery"));
     }
 
     #[test]
@@ -5327,6 +7208,34 @@ mod tests {
             serde_json::Value::Null,
             "web region_match should be null"
         );
+    }
+
+    #[test]
+    fn tool_result_payload_google_includes_contract_meta_keys() {
+        let result = serde_json::json!({
+            "provider": "google_workspace",
+            "kind": "gmail",
+            "tool": "searchGmail",
+            "data": {
+                "messages": [
+                    {"id": "m1", "subject": "Hello"}
+                ]
+            },
+            "_meta": {
+                "schema_version": "1.1",
+                "correlation_id": "cid-123",
+                "account": "personal"
+            }
+        });
+
+        let payload = build_tool_result_event_payload("gw_gmail_search", &result, true);
+        let metadata = &payload["metadata"];
+
+        assert_eq!(metadata["kind"], serde_json::json!("gmail"));
+        assert_eq!(metadata["source_count"], serde_json::json!(1));
+        assert_eq!(metadata["schema_version"], serde_json::json!("1.1"));
+        assert_eq!(metadata["correlation_id"], serde_json::json!("cid-123"));
+        assert_eq!(metadata["account"], serde_json::json!("personal"));
     }
 
     #[test]
@@ -5610,9 +7519,7 @@ pub async fn start_provisioning(handle: AppHandle) -> Result<serde_json::Value, 
     let mut engine = kria_core::infra::provisioning::ProvisioningEngine::new(cancel);
 
     // Run hardware detection synchronously (fast)
-    engine
-        .run_hardware_detection()
-        .map_err(|e| e.to_string())?;
+    engine.run_hardware_detection().map_err(|e| e.to_string())?;
 
     let profile = engine
         .state
@@ -5620,16 +7527,25 @@ pub async fn start_provisioning(handle: AppHandle) -> Result<serde_json::Value, 
         .as_ref()
         .ok_or("hardware detection failed")?;
 
-    let result = serde_json::json!({
+    let event_payload = serde_json::json!({
         "step": "hardware_detection",
         "status": "done",
         "profile": profile,
     });
 
     // Emit event to frontend
-    let _ = handle_clone.emit("provisioning:state_changed", &result);
+    let _ = handle_clone.emit("provisioning:state_changed", &event_payload);
 
-    Ok(result)
+    serde_json::to_value(&engine.state).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn complete_provisioning() -> Result<serde_json::Value, String> {
+    let mut state = kria_core::infra::provisioning::ProvisioningState::load();
+    state.current_step = kria_core::infra::provisioning::ProvisioningStep::Complete;
+    state.complete_step(kria_core::infra::provisioning::ProvisioningStep::Complete);
+    state.save().map_err(|e| e.to_string())?;
+    serde_json::to_value(&state).map_err(|e| e.to_string())
 }
 
 #[tauri::command]

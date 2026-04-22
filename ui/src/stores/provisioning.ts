@@ -168,6 +168,15 @@ async function runStep(step: "model_download" | "sidecar_setup" | "server_verifi
   }
 }
 
+async function completeProvisioning() {
+  try {
+    const raw = await invoke<ProvisioningState>("complete_provisioning");
+    applyState(raw);
+  } catch (e) {
+    console.error("complete_provisioning failed:", e);
+  }
+}
+
 async function getDiagnostics(): Promise<string> {
   try {
     return await invoke<string>("get_provisioning_diagnostics");
@@ -262,6 +271,7 @@ export const provisioningStore = {
   startProvisioning,
   selectBackend,
   runStep,
+  completeProvisioning,
   getDiagnostics,
   getHardwareProfile,
 

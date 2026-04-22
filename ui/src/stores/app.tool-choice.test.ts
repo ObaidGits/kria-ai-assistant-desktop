@@ -8,6 +8,8 @@ const { invokeMock, listenMock, listenerMap, setSessionHistory } = vi.hoisted(()
     switch (command) {
       case "send_message":
         return { status: "ok", message: args?.message };
+      case "create_session":
+        return { session_id: "mock-created-session" };
       case "list_sessions":
         return [];
       case "switch_session":
@@ -84,6 +86,12 @@ function emit(eventName: string, payload: any) {
   callback({ payload });
 }
 
+async function flushAsync(cycles = 2) {
+  for (let i = 0; i < cycles; i += 1) {
+    await Promise.resolve();
+  }
+}
+
 describe("appStore low-confidence tool choice flow", () => {
   beforeEach(() => {
     invokeMock.mockClear();
@@ -131,7 +139,7 @@ describe("appStore low-confidence tool choice flow", () => {
     });
 
     appStore.submitToolChoice("gw_gmail_inbox");
-    await Promise.resolve();
+    await flushAsync(8);
 
     expect(invokeMock).toHaveBeenCalledWith("send_message", {
       message: "#tool:gw_gmail_inbox check my unread emails",
@@ -230,5 +238,110 @@ describe("appStore session history hydration", () => {
       args: { query: "in:inbox is:unread", max_results: 3 },
     });
     expect(hydrated[0].toolCalls?.[0].metadata?.sourceCount).toBe(3);
+  });
+});
+
+describe("appStore stream scope parity", () => {
+  beforeEach(async () => {
+    invokeMock.mockClear();
+    setSessionHistory([]);
+
+    appStore.setCurrentEnvironment("assistant");
+    await flushAsync();
+    await appStore.switchSession("assistant-reset");
+
+    appStore.setCurrentEnvironment("prompt_lab");
+    await flushAsync();
+    await appStore.switchSession("prompt-lab-reset");
+
+    appStore.setCurrentEnvironment("assistant");
+    await flushAsync();
+  });
+
+  it("keeps agent and prompt_lab token streams isolated", async () => {
+    emit("agent:token", { text: "assistant token" });
+    expect(appStore.messages()).toHaveLength(1);
+    expect(appStore.messages()[0].content).toBe("assistant token");
+
+    appStore.setCurrentEnvironment("prompt_lab");
+    await flushAsync();
+    expect(appStore.messages()).toHaveLength(0);
+
+    emit("prompt_lab:token", { text: "lab token" });
+    expect(appStore.messages()).toHaveLength(1);
+    expect(appStore.messages()[0].content).toBe("lab token");
+
+    appStore.setCurrentEnvironment("assistant");
+    await flushAsync();
+    expect(appStore.messages()).toHaveLength(1);
+    expect(appStore.messages()[0].content).toBe("assistant token");
+  });
+
+  it("tracks current session independently per environment", async () => {
+    appStore.setCurrentEnvironment("assistant");
+    await flushAsync();
+    await appStore.switchSession("assistant-session-1");
+    expect(appStore.currentSession()).toBe("assistant-session-1");
+
+    appStore.setCurrentEnvironment("prompt_lab");
+    await flushAsync();
+    await appStore.switchSession("prompt-lab-session-1");
+    expect(appStore.currentSession()).toBe("prompt-lab-session-1");
+
+    appStore.setCurrentEnvironment("assistant");
+    await flushAsync();
+    expect(appStore.currentSession()).toBe("assistant-session-1");
+  });
+});
+
+describe("appStore colab stage visibility", () => {
+  beforeEach(() => {
+    invokeMock.mockClear();
+    setSessionHistory([]);
+  });
+
+  it("captures colab fallback stage details into warning state", () => {
+    emit("agent:stage", {
+      step: "colab_dispatch_fallback_local",
+      message: "Colab tier requirements were not satisfied; using local fallback",
+      detail: {
+        reason: "missing capabilities: cell_execution",
+        requested_mode: "colab",
+        effective_mode: "local",
+        runtime_state: "awaiting_browser_connection",
+      },
+      ts: "2026-04-20T00:00:00Z",
+    });
+
+    expect(appStore.latestAgentStage()?.step).toBe("colab_dispatch_fallback_local");
+    expect(appStore.colabDispatchWarning()).toContain("colab -> local");
+    expect(appStore.colabDispatchWarning()).toContain("missing capabilities: cell_execution");
+  });
+
+  it("clears colab warning when ready stage is emitted", () => {
+    emit("agent:stage", {
+      step: "colab_dispatch_fallback_local",
+      message: "fallback",
+      detail: {
+        reason: "runtime_state=awaiting_browser_connection",
+        requested_mode: "colab",
+        effective_mode: "local",
+      },
+      ts: "2026-04-20T00:00:00Z",
+    });
+
+    expect(appStore.colabDispatchWarning()).not.toBeNull();
+
+    emit("agent:stage", {
+      step: "colab_dispatch_ready",
+      message: "Colab tier requirements are satisfied",
+      detail: {
+        requested_mode: "colab",
+        effective_mode: "colab",
+      },
+      ts: "2026-04-20T00:00:01Z",
+    });
+
+    expect(appStore.colabDispatchWarning()).toBeNull();
   });
 });

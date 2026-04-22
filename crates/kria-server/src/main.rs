@@ -3,10 +3,9 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize logging
-    tracing_subscriber::fmt()
-        .with_env_filter("kria_server=debug,kria_core=debug,tower_http=info")
-        .init();
+    // Initialize logging (shared profile with desktop runtime)
+    let paths = kria_core::platform::paths::KriaPaths::resolve();
+    kria_core::infra::logging::setup_logging(&paths.logs_dir);
 
     let config = kria_core::config::KriaConfig::load(None)?;
     let bind_addr = format!("{}:{}", config.server.host, config.server.port,);

@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { appStore } from "../stores/app";
 import { SUPPORTED_LANGUAGES, setLocale } from "../stores/i18n";
 
-type Tab = "llm" | "voice" | "safety" | "ui" | "assistant" | "labs" | "search" | "services" | "telegram" | "automation" | "hardware" | "knowledge" | "google";
+type Tab = "llm" | "voice" | "safety" | "ui" | "assistant" | "labs" | "search" | "services" | "telegram" | "automation" | "hardware" | "knowledge" | "google" | "colab";
 
 interface AssistantFrontendPrefs {
   persona: "operator" | "coach" | "researcher" | "chief_of_staff";
@@ -31,7 +31,7 @@ interface McpCatalogItem {
 }
 
 const SettingsModal: Component = () => {
-  const { setShowSettings, settings, loadSettings, saveSettings, models, loadModels, audioDevices, loadAudioDevices, theme, applyTheme, mcpServers, loadMcpServers, addMcpServer, removeMcpServer, toggleMcpServer, healthInfo, loadHealth, scheduledTasks, loadScheduledTasks, addScheduledTask, removeScheduledTask, macros, loadMacros, deleteMacro, workflows, loadWorkflows, deleteWorkflow, hardwareInfo, loadHardwareInfo, knowledgeBase, loadKnowledgeBase, telegramConfig, telegramBotInfo, loadTelegramConfig, saveTelegramConfig, testTelegramConnection, startTelegramMcp, stopTelegramMcp, googleStatus, loadGoogleStatus, setGoogleAccount, connectGoogle, disconnectGoogle, reconcileMcpRuntime, restartMcpServerRuntime } = appStore;
+  const { setShowSettings, settings, loadSettings, saveSettings, models, loadModels, audioDevices, loadAudioDevices, theme, applyTheme, mcpServers, loadMcpServers, addMcpServer, removeMcpServer, toggleMcpServer, healthInfo, loadHealth, scheduledTasks, loadScheduledTasks, addScheduledTask, removeScheduledTask, macros, loadMacros, deleteMacro, workflows, loadWorkflows, deleteWorkflow, hardwareInfo, loadHardwareInfo, knowledgeBase, loadKnowledgeBase, telegramConfig, telegramBotInfo, loadTelegramConfig, saveTelegramConfig, testTelegramConnection, startTelegramMcp, stopTelegramMcp, googleStatus, loadGoogleStatus, setGoogleAccount, connectGoogle, disconnectGoogle, colabStatus, loadColabStatus, connectColab, disconnectColab, setColabNotebook, reconcileMcpRuntime, restartMcpServerRuntime } = appStore;
 
   const [activeTab, setActiveTab] = createSignal<Tab>("llm");
   const [draft, setDraft] = createSignal<Record<string, any>>({});
@@ -63,6 +63,12 @@ const SettingsModal: Component = () => {
   const [gwConnecting, setGwConnecting] = createSignal(false);
   const [gwPollTimer, setGwPollTimer] = createSignal<ReturnType<typeof setInterval> | null>(null);
   const [gwMessage, setGwMessage] = createSignal("");
+
+  // Colab tier state
+  const [colabServerName, setColabServerName] = createSignal("colab-mcp");
+  const [colabNotebookId, setColabNotebookId] = createSignal("");
+  const [colabBusy, setColabBusy] = createSignal(false);
+  const [colabMessage, setColabMessage] = createSignal("");
 
   // Frontend-only assistant/labs preferences
   const [assistantPrefs, setAssistantPrefs] = createSignal<AssistantFrontendPrefs>({
@@ -129,9 +135,16 @@ const SettingsModal: Component = () => {
       await loadKnowledgeBase();
       await loadTelegramConfig();
       const initialGoogleStatus = await loadGoogleStatus();
+      const initialColabStatus = await loadColabStatus();
       if (disposed) return;
       if (initialGoogleStatus?.account) {
         setGwAccount(initialGoogleStatus.account);
+      }
+      if (initialColabStatus?.mcp_server_name) {
+        setColabServerName(initialColabStatus.mcp_server_name);
+      }
+      if (initialColabStatus?.selected_notebook) {
+        setColabNotebookId(initialColabStatus.selected_notebook);
       }
 
       // Restore frontend-only preferences from local storage.
@@ -230,6 +243,17 @@ const SettingsModal: Component = () => {
   });
 
   createEffect(() => {
+    const status = colabStatus();
+    if (!status || colabBusy()) return;
+    if (status.mcp_server_name) {
+      setColabServerName(status.mcp_server_name);
+    }
+    if (status.selected_notebook) {
+      setColabNotebookId(status.selected_notebook);
+    }
+  });
+
+  createEffect(() => {
     localStorage.setItem("kria_assistant_frontend_prefs", JSON.stringify(assistantPrefs()));
   });
 
@@ -298,6 +322,16 @@ const SettingsModal: Component = () => {
     return "stopped";
   };
 
+  const normalizedRoutingMode = (): string => {
+    const raw = String(draft()?.llm?.routing_mode ?? "local").toLowerCase();
+    if (raw === "cloud") return "gemini";
+    if (raw === "hybrid") return "local";
+    if (["local", "colab", "gemini", "external"].includes(raw)) {
+      return raw;
+    }
+    return "local";
+  };
+
   const googleStatusMessage = (): string => {
     const status = googleStatus();
     if (!status) {
@@ -333,6 +367,42 @@ const SettingsModal: Component = () => {
       ["Meet via Calendar", capabilities.meet_via_calendar],
     ] as const;
   };
+
+  const colabStatusMessage = (): string => {
+    const status = colabStatus();
+    if (!status) {
+      return "Checking Colab tier status...";
+    }
+    if (!status.enabled) {
+      return "Colab tier is disabled.";
+    }
+    if (status.ready_for_cloud_task) {
+      return `Ready on ${status.mcp_server_name}${status.selected_notebook ? ` (${status.selected_notebook})` : ""}`;
+    }
+    if (status.notebook_selection_required) {
+      return "Connected. Select an active notebook to run prompts.";
+    }
+    if (status.runtime_state === "awaiting_browser_connection") {
+      return "Waiting for Colab browser session/tool discovery.";
+    }
+    return `Colab is not ready (state=${status.runtime_state}).`;
+  };
+
+  const colabCapabilityEntries = () => {
+    const features = colabStatus()?.capabilities?.features;
+    if (!features) return [];
+    return [
+      ["Notebook discovery", features.notebook_discovery],
+      ["Notebook selection", features.notebook_selection],
+      ["Cell execution", features.cell_execution],
+      ["Artifacts IO", features.artifact_io],
+      ["Runtime lifecycle", features.runtime_lifecycle],
+      ["Package management", features.package_management],
+      ["Checkpointing", features.checkpointing],
+    ] as const;
+  };
+
+  const colabDiscoveredTools = () => colabStatus()?.capabilities?.discovered_tools ?? [];
 
   const setAssistantPref = <K extends keyof AssistantFrontendPrefs>(key: K, value: AssistantFrontendPrefs[K]) => {
     setAssistantPrefs((prev) => ({ ...prev, [key]: value }));
@@ -424,6 +494,12 @@ const SettingsModal: Component = () => {
           label: "Google",
           icon: "G",
           description: "Manage Google auth, runtime health, capabilities, and synchronization warnings.",
+        },
+        {
+          id: "colab",
+          label: "Colab",
+          icon: "C",
+          description: "Manage Google Colab cloud-tier runtime, notebook selection, and tool capability readiness.",
         },
       ],
     },
@@ -520,13 +596,15 @@ const SettingsModal: Component = () => {
               <div class="settings-field">
                 <label>Mode</label>
                 <select
-                  value={draft()?.llm?.routing_mode ?? "local"}
+                  value={normalizedRoutingMode()}
                   onChange={(e) => updateField("llm", "routing_mode", e.currentTarget.value)}
                 >
-                  <option value="local">Local Only</option>
-                  <option value="cloud">Cloud Only</option>
-                  <option value="hybrid">Hybrid (Local + Cloud Fallback)</option>
+                  <option value="local">Local</option>
+                  <option value="colab">Google Colab</option>
+                  <option value="gemini">Google Gemini</option>
+                  <option value="external">External API</option>
                 </select>
+                <span class="field-hint">Use Colab mode for notebook-driven prompt-to-code execution via Colab MCP tools.</span>
               </div>
 
               <h3>Local LLM</h3>
@@ -1895,6 +1973,256 @@ const SettingsModal: Component = () => {
                   <li>Come back here and click <strong>Connect with Google</strong></li>
                   <li>Sign in and click <strong>Allow</strong> - KRIA can now access your Workspace</li>
                   <li>Meet requests use calendar conference-link mode (<code>calendar_conference_link</code>)</li>
+                </ol>
+              </div>
+            </section>
+          </Show>
+
+          {/* Colab Tab */}
+          <Show when={activeTab() === "colab"}>
+            <section class="settings-section">
+              <h3>Google Colab Cloud Tier</h3>
+              <p class="field-hint">
+                Use Colab MCP tools for prompt-to-code workflows like creating notebooks,
+                writing code, executing cells, and collecting outputs.
+              </p>
+
+              <Show when={colabStatus()}>
+                {(status) => (
+                  <>
+                    <div
+                      class={`tg-status-banner ${status().ready_for_cloud_task ? "tg-connected" : ""}`}
+                      style={status().ready_for_cloud_task
+                        ? ""
+                        : "background:var(--surface-2,#2a2a2a);border-left:3px solid var(--text-muted,#888)"}
+                    >
+                      <span
+                        class={`mcp-status-dot ${status().ready_for_cloud_task ? "running" : runtimeDotClass(status().mcp?.state)}`}
+                      ></span>
+                      <span>{colabStatusMessage()}</span>
+                    </div>
+
+                    <div class="settings-field" style="margin-top:0.5rem">
+                      <label>Runtime signals</label>
+                      <div style="display:flex;flex-wrap:wrap;gap:0.45rem;margin-top:0.35rem">
+                        <span class="mcp-server-trust">Enabled: {status().enabled ? "yes" : "no"}</span>
+                        <span class="mcp-server-trust">Runtime: {runtimeStateLabel(status().mcp?.state)}</span>
+                        <span class="mcp-server-trust">Ready: {status().ready_for_cloud_task ? "yes" : "no"}</span>
+                        <span class="mcp-server-trust">Tools: {status().mcp?.tool_count ?? 0}</span>
+                        <span class="mcp-server-trust">Selected notebook: {status().selected_notebook || "none"}</span>
+                      </div>
+                    </div>
+
+                    <div class="settings-field" style="margin-top:0.75rem">
+                      <label>Capabilities</label>
+                      <div style="display:flex;flex-wrap:wrap;gap:0.45rem;margin-top:0.35rem">
+                        <For each={colabCapabilityEntries()}>
+                          {(entry) => (
+                            <span class="mcp-server-trust" style={entry[1] ? "" : "opacity:0.7"}>
+                              {entry[0]}: {entry[1] ? "yes" : "no"}
+                            </span>
+                          )}
+                        </For>
+                      </div>
+                      <span class="field-hint">
+                        Ready requirements: {status().capabilities?.ready_requirements?.satisfied ? "satisfied" : "missing requirements"}
+                      </span>
+                    </div>
+
+                    <Show when={status().mcp?.error}>
+                      <div class="settings-error" style="margin-top:0.6rem">
+                        <strong>MCP runtime error:</strong> {status().mcp?.error}
+                      </div>
+                    </Show>
+
+                    <Show when={(status().warnings?.length ?? 0) > 0}>
+                      <div class="settings-error" style="margin-top:0.6rem">
+                        <strong>Warnings</strong>
+                        <ul style="margin:0.4rem 0 0 1.2rem;padding:0">
+                          <For each={status().warnings}>
+                            {(warning) => <li>{warning}</li>}
+                          </For>
+                        </ul>
+                      </div>
+                    </Show>
+                  </>
+                )}
+              </Show>
+
+              <div class="settings-field" style="margin-top:1rem">
+                <label>Colab MCP server name</label>
+                <input
+                  type="text"
+                  value={colabServerName()}
+                  onInput={(e) => setColabServerName(e.currentTarget.value)}
+                  placeholder="colab-mcp"
+                  disabled={colabBusy()}
+                  style="max-width:260px"
+                />
+                <span class="field-hint">
+                  This should match an MCP server entry in config/mcp_servers.json.
+                </span>
+              </div>
+
+              <div class="settings-field">
+                <label>Active notebook identifier</label>
+                <input
+                  type="text"
+                  value={colabNotebookId()}
+                  onInput={(e) => setColabNotebookId(e.currentTarget.value)}
+                  placeholder="mcp_test.ipynb"
+                  disabled={colabBusy()}
+                />
+                <span class="field-hint">
+                  Set this after connection so Colab execution prompts target the selected notebook.
+                </span>
+              </div>
+
+              <Show when={colabMessage()}>
+                <div class={`tg-test-result ${colabMessage().toLowerCase().startsWith("failed") ? "tg-error" : "tg-success"}`} style="margin-top:0.5rem">
+                  {colabMessage()}
+                </div>
+              </Show>
+
+              <div class="tg-actions" style="margin-top:1rem">
+                <button
+                  class="btn-primary"
+                  disabled={colabBusy()}
+                  onClick={async () => {
+                    setColabBusy(true);
+                    setColabMessage("");
+                    try {
+                      const status = await connectColab(colabServerName().trim() || undefined);
+                      await loadMcpServers();
+                      setColabMessage(status?.ready_for_cloud_task
+                        ? "Colab connected and ready."
+                        : "Colab connected. Select notebook if required.");
+                    } catch (e) {
+                      setColabMessage(`Failed to connect Colab: ${e}`);
+                    } finally {
+                      setColabBusy(false);
+                    }
+                  }}
+                >
+                  {colabBusy() ? "Connecting..." : "Connect Colab"}
+                </button>
+
+                <button
+                  class="btn-secondary"
+                  disabled={colabBusy()}
+                  onClick={async () => {
+                    await loadColabStatus();
+                    await loadMcpServers();
+                    setColabMessage("Colab status refreshed.");
+                    setTimeout(() => setColabMessage(""), 2500);
+                  }}
+                >
+                  Refresh status
+                </button>
+
+                <button
+                  class="btn-secondary"
+                  disabled={colabBusy()}
+                  onClick={async () => {
+                    try {
+                      await reconcileMcpRuntime();
+                      await loadMcpServers();
+                      await loadColabStatus();
+                      setColabMessage("MCP runtime reconciled.");
+                    } catch (e) {
+                      setColabMessage(`Failed to reconcile runtime: ${e}`);
+                    }
+                  }}
+                >
+                  Reconcile runtime
+                </button>
+
+                <button
+                  class="btn-secondary"
+                  disabled={colabBusy()}
+                  onClick={async () => {
+                    try {
+                      await restartMcpServerRuntime(colabServerName().trim() || "colab-mcp");
+                      await loadMcpServers();
+                      await loadColabStatus();
+                      setColabMessage("Colab runtime restarted.");
+                    } catch (e) {
+                      setColabMessage(`Failed to restart runtime: ${e}`);
+                    }
+                  }}
+                >
+                  Restart runtime
+                </button>
+
+                <button
+                  class="btn-secondary"
+                  disabled={colabBusy() || !colabNotebookId().trim()}
+                  onClick={async () => {
+                    try {
+                      await setColabNotebook(colabNotebookId().trim());
+                      await loadColabStatus();
+                      setColabMessage("Active notebook updated.");
+                    } catch (e) {
+                      setColabMessage(`Failed to set notebook: ${e}`);
+                    }
+                  }}
+                >
+                  Set active notebook
+                </button>
+
+                <button
+                  class="btn-secondary"
+                  onClick={() => {
+                    window.open("https://colab.research.google.com", "_blank", "noopener,noreferrer");
+                  }}
+                >
+                  Open Colab
+                </button>
+
+                <Show when={colabStatus()?.enabled}>
+                  <button
+                    class="btn-danger"
+                    disabled={colabBusy()}
+                    onClick={async () => {
+                      setColabBusy(true);
+                      try {
+                        await disconnectColab();
+                        await loadMcpServers();
+                        setColabMessage("Colab disconnected.");
+                      } catch (e) {
+                        setColabMessage(`Failed to disconnect Colab: ${e}`);
+                      } finally {
+                        setColabBusy(false);
+                      }
+                    }}
+                  >
+                    Disconnect
+                  </button>
+                </Show>
+              </div>
+
+              <h3 style="margin-top:1.5rem">Discovered Colab Tools</h3>
+              <div class="mcp-server-list">
+                <For each={colabDiscoveredTools()} fallback={<div class="mcp-empty">No Colab tools discovered yet.</div>}>
+                  {(tool) => (
+                    <div class="mcp-server-card">
+                      <div class="mcp-server-info">
+                        <div class="mcp-server-name">{tool.operation || tool.name}</div>
+                        <div class="mcp-server-cmd">{tool.name}</div>
+                        <div class="mcp-server-trust">Params: {tool.parameter_count}</div>
+                      </div>
+                    </div>
+                  )}
+                </For>
+              </div>
+
+              <h3 style="margin-top:1.5rem">Prompt Examples</h3>
+              <div class="tg-howto">
+                <ol>
+                  <li>Create a Google Colab notebook named mcp_test.ipynb and set it as active.</li>
+                  <li>Write merge sort in Python in the active notebook and run it with sample input.</li>
+                  <li>Install numpy in the notebook and run a quick matrix multiplication demo.</li>
+                  <li>Train a small classifier in the active notebook and show accuracy plus saved checkpoint path.</li>
                 </ol>
               </div>
             </section>

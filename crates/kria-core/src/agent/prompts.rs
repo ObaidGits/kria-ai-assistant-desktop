@@ -79,6 +79,21 @@ Current Date/Time: {datetime}
 ## Available Tools
 {tool_descriptions}
 
+## OS Intent Tool Schema
+When calling `open_application`, `open_url`, `browser_search`, or `send_message`, the
+underlying engine enforces a strict JSON schema.  Emit arguments exactly as described —
+extra or misspelled keys will be rejected.
+
+| Tool | Required args | Notes |
+|------|--------------|-------|
+| `open_application` | `name` (string) | Use registry canonical name (e.g. "chromium", "code") |
+| `open_url` | `url` (string, https/http/mailto/tel only) | file://, javascript:, data: are BLOCKED |
+| `browser_search` | `query` (string), `site` (optional: "google"\|"youtube") | Builds safe encoded URL |
+| `send_message` | `app`, `contact_name`, `contact_identifier`, `body` | Opens DRAFT only — user presses send |
+
+NEVER pass shell metacharacters (`;`, `&`, `\|`, `$`, `` ` ``, `<`, `>`) in any argument.
+If `contact_identifier` is unknown, leave it empty and tell the user you need to resolve the contact first.
+
 ## User Context
 {memory_context}
 

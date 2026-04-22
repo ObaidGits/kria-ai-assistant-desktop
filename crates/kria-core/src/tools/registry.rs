@@ -157,6 +157,41 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// Remove all tools in a category.
+    /// Returns the number of removed tools.
+    pub fn unregister_category(&self, category: &str) -> usize {
+        let names: Vec<String> = {
+            let defs = self.defs.read().expect("tool registry defs lock poisoned");
+            defs.values()
+                .filter(|d| d.category == category)
+                .map(|d| d.name.clone())
+                .collect()
+        };
+
+        if names.is_empty() {
+            return 0;
+        }
+
+        {
+            let mut defs = self.defs.write().expect("tool registry defs lock poisoned");
+            for name in &names {
+                defs.remove(name);
+            }
+        }
+
+        {
+            let mut handlers = self
+                .handlers
+                .write()
+                .expect("tool registry handlers lock poisoned");
+            for name in &names {
+                handlers.remove(name);
+            }
+        }
+
+        names.len()
+    }
+
     /// Get all category names.
     pub fn categories(&self) -> Vec<String> {
         let defs = self.defs.read().expect("tool registry defs lock poisoned");

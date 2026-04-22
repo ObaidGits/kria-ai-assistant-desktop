@@ -4,6 +4,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use kria_core::infra::pipeline_trace::{log_pipeline_step, sanitize_text_for_logs};
 use std::sync::Arc;
 
 pub fn api_routes() -> Router<Arc<ServerState>> {
@@ -42,17 +43,52 @@ async fn chat(
     State(_state): State<Arc<ServerState>>,
     Json(req): Json<ChatRequest>,
 ) -> Json<serde_json::Value> {
+    let session_id = req
+        .session_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    log_pipeline_step(
+        &session_id,
+        "server_chat_received",
+        "Server /api/chat request received",
+        Some(serde_json::json!({
+            "source": req.source.clone().unwrap_or_else(|| "api".to_string()),
+            "chat_id": req.chat_id,
+            "from_user": req.from_user.clone(),
+            "message_preview": sanitize_text_for_logs(&req.message, 260),
+        })),
+    );
+
     // TODO: In production, this routes to the AgentLoop and returns the response.
     // For now, return a structured response that the Telegram MCP server can parse.
-    Json(serde_json::json!({
+    let message = req.message.clone();
+    let response = serde_json::json!({
         "status": "received",
-        "message": req.message,
+        "message": message.clone(),
         "source": req.source.unwrap_or_else(|| "api".to_string()),
         "chat_id": req.chat_id,
         "from_user": req.from_user,
-        "session_id": req.session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-        "reply": format!("I received your message: \"{}\"", req.message),
-    }))
+        "session_id": session_id,
+        "reply": format!("I received your message: \"{}\"", message),
+    });
+
+    log_pipeline_step(
+        response
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("server"),
+        "server_chat_done",
+        "Server /api/chat stub response returned",
+        Some(serde_json::json!({
+            "reply_preview": sanitize_text_for_logs(
+                response.get("reply").and_then(|v| v.as_str()).unwrap_or(""),
+                220,
+            ),
+        })),
+    );
+
+    Json(response)
 }
 
 async fn list_sessions() -> Json<Vec<serde_json::Value>> {

@@ -183,7 +183,7 @@ impl SidecarBridge {
                             {
                                 tracing::warn!(target: "sidecar_stderr", "{}", trimmed);
                             } else {
-                                tracing::info!(target: "sidecar_stderr", "{}", trimmed);
+                                tracing::debug!(target: "sidecar_stderr", "{}", trimmed);
                             }
                         }
                     }

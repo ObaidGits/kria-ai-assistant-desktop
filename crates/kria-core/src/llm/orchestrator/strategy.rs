@@ -125,7 +125,7 @@ pub fn calculate_target_params(
     };
 
     // Vision requires enough GPU capacity — disable below ngl=15
-    let enable_vision = profile.has_vision_projector && ngl >= 15;
+    let enable_vision = profile.has_vision_projector && ngl >= profile.vision_min_ngl;
 
     let degradation = degradation_level(ngl, context, profile);
 
@@ -200,6 +200,7 @@ mod tests {
             max_context: 8192,
             has_vision_projector: true,
             mmproj_vram_mb: 0,
+            vision_min_ngl: 15,
         }
     }
 

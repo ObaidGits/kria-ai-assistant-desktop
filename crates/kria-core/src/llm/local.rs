@@ -1,4 +1,5 @@
 use crate::infra::circuit_breaker::{CircuitBreaker, CircuitBreakerError, CircuitState};
+use crate::infra::pipeline_trace::sanitize_text_for_logs;
 use crate::llm::orchestrator::server_manager::LlamaServerManager;
 use crate::llm::{
     extract_openai_content_text, extract_openai_message_text, extract_openai_tool_calls,
@@ -85,11 +86,22 @@ impl LocalBackend {
     }
 
     /// Check if the server is in a swapping state.
+    #[allow(dead_code)]
     fn is_swapping(&self) -> bool {
         self.server_manager
             .get()
             .map(|mgr| mgr.is_swapping())
             .unwrap_or(false)
+    }
+
+    /// Wait for any in-progress swap to finish, returning `false` on timeout.
+    /// Replaces the busy-poll loops used before the Notify refactor (Phase 5).
+    async fn wait_for_swap(&self, timeout_secs: u64) -> bool {
+        let Some(mgr) = self.server_manager.get() else {
+            return true;
+        };
+        mgr.wait_for_swap_done(Duration::from_secs(timeout_secs))
+            .await
     }
 
     /// Query the llama.cpp `/v1/models` endpoint to detect the actually loaded model.
@@ -112,6 +124,70 @@ impl LocalBackend {
     /// Update the model label dynamically (e.g. after detecting from server).
     pub fn set_model_label(&mut self, label: String) {
         self.model_label = label;
+    }
+
+    fn looks_like_context_overflow_response(status: reqwest::StatusCode, body: &str) -> bool {
+        if matches!(status.as_u16(), 400 | 413 | 422) {
+            return true;
+        }
+
+        let lower = body.to_ascii_lowercase();
+        lower.contains("context")
+            && (lower.contains("too large")
+                || lower.contains("too long")
+                || lower.contains("overflow")
+                || lower.contains("token limit")
+                || lower.contains("max tokens")
+                || lower.contains("exceeds"))
+    }
+
+    fn looks_like_transport_connectivity_error(message: &str) -> bool {
+        let lower = message.to_ascii_lowercase();
+        lower.contains("error sending request")
+            || lower.contains("connection refused")
+            || lower.contains("tcp connect")
+            || lower.contains("dns error")
+            || lower.contains("timed out")
+            || lower.contains("connection reset")
+            || lower.contains("broken pipe")
+    }
+
+    fn should_ignore_for_circuit(error: &anyhow::Error) -> bool {
+        if error.downcast_ref::<ContextTooLargeError>().is_some() {
+            return true;
+        }
+
+        Self::looks_like_transport_connectivity_error(&error.to_string())
+    }
+
+    async fn health_check_once(&self) -> bool {
+        let health_url = self.resolve_api_url().replace("/v1", "/health");
+        self.client
+            .get(&health_url)
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+    }
+
+    async fn try_recover_open_circuit(&self, name: &str, attempt: usize) -> bool {
+        tracing::warn!(
+            circuit = %name,
+            attempt,
+            "local LLM circuit is open; probing health for fast recovery"
+        );
+
+        let healthy = tokio::time::timeout(Duration::from_secs(3), self.health_check_once())
+            .await
+            .unwrap_or(false);
+
+        if healthy {
+            self.circuit.reset().await;
+            tracing::info!(circuit = %name, "local LLM circuit reset after successful health probe");
+            return true;
+        }
+
+        false
     }
 
     async fn chat_inner(
@@ -172,19 +248,142 @@ impl LocalBackend {
         }
 
         let url = format!("{}/chat/completions", self.resolve_api_url());
-        let resp = self.client.post(&url).json(&payload).send().await?;
+        let resp = self
+            .client
+            .post(&url)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("local LLM transport error to {url}: {e}"))?;
         let status = resp.status();
 
-        if status.as_u16() == 400 {
-            return Err(ContextTooLargeError.into());
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            if Self::looks_like_context_overflow_response(status, &body_text) {
+                return Err(ContextTooLargeError.into());
+            }
+
+            anyhow::bail!(
+                "local LLM request failed (status {status}): {}",
+                sanitize_text_for_logs(&body_text, 220)
+            );
         }
 
-        let body: serde_json::Value = resp.error_for_status()?.json().await?;
+        let body: serde_json::Value = resp.json().await?;
 
         let choice = &body["choices"][0];
         let message = &choice["message"];
         let content = extract_openai_message_text(message);
         let tool_calls = extract_openai_tool_calls(message);
+
+        let usage = body["usage"].as_object().map(|u| crate::llm::TokenUsage {
+            prompt_tokens: u["prompt_tokens"].as_u64().unwrap_or(0) as u32,
+            completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0) as u32,
+            total_tokens: u["total_tokens"].as_u64().unwrap_or(0) as u32,
+        });
+
+        Ok(LlmResponse {
+            content,
+            model: self.model_label.clone(),
+            usage,
+            tool_calls,
+        })
+    }
+
+    /// Grammar-constrained chat call.
+    ///
+    /// Posts a `json_schema` field to llama.cpp `/v1/chat/completions`, which
+    /// activates llguidance-backed constrained decoding inside llama.cpp.
+    /// The schema **must** be a valid JSON Schema object describing the exact
+    /// structure of the tool-call(s) the LLM may emit.
+    ///
+    /// Falls back transparently to the standard `chat` path if the server
+    /// returns an error for the grammar field (older llama.cpp builds).
+    pub async fn chat_with_grammar(
+        &self,
+        messages: &[ChatMessage],
+        json_schema: serde_json::Value,
+        temperature: f32,
+        max_tokens: u32,
+    ) -> anyhow::Result<LlmResponse> {
+        // Wait for any in-progress swap before sending (Notify-based, no busy-poll).
+        if !self.wait_for_swap(120).await {
+            anyhow::bail!("local LLM: swap timeout exceeded (120s) waiting for grammar chat");
+        }
+
+        let wire_messages: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|m| {
+                if m.has_images() {
+                    serde_json::json!({ "role": m.role, "content": m.to_multimodal_content() })
+                } else {
+                    let mut msg = serde_json::json!({ "role": m.role, "content": m.content });
+                    if let Some(ref name) = m.name {
+                        msg["name"] = serde_json::json!(name);
+                    }
+                    msg
+                }
+            })
+            .collect();
+
+        let payload = serde_json::json!({
+            "model": self.model_label,
+            "messages": wire_messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": false,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "tool_call",
+                    "strict": true,
+                    "schema": json_schema,
+                }
+            }
+        });
+
+        let url = format!("{}/chat/completions", self.resolve_api_url());
+        let resp = self
+            .client
+            .post(&url)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("grammar chat transport error to {url}: {e}"))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            // If the server doesn't support json_schema (older llama.cpp), fall back to
+            // standard chat without grammar constraint but log a warning.
+            if matches!(status.as_u16(), 400 | 422) && body_text.to_ascii_lowercase().contains("json_schema") {
+                tracing::warn!(
+                    "[LocalBackend] llama.cpp does not support json_schema response_format; \
+                     falling back to unconstrained chat. Upgrade llama.cpp for llguidance support."
+                );
+                return self.chat(messages, None, temperature, max_tokens).await;
+            }
+            if Self::looks_like_context_overflow_response(status, &body_text) {
+                return Err(ContextTooLargeError.into());
+            }
+            anyhow::bail!(
+                "grammar chat request failed (status {status}): {}",
+                sanitize_text_for_logs(&body_text, 220)
+            );
+        }
+
+        let body: serde_json::Value = resp.json().await?;
+        let choice = &body["choices"][0];
+        let message = &choice["message"];
+        let content = extract_openai_message_text(message);
+
+        // With json_schema mode, the model emits structured JSON in the content field.
+        // Try to extract tool_calls from the JSON content if it looks like a tool-call object.
+        let tool_calls = if content.trim_start().starts_with('{') || content.trim_start().starts_with('[') {
+            extract_tool_calls_from_json_content(&content).or_else(|| extract_openai_tool_calls(message))
+        } else {
+            extract_openai_tool_calls(message)
+        };
 
         let usage = body["usage"].as_object().map(|u| crate::llm::TokenUsage {
             prompt_tokens: u["prompt_tokens"].as_u64().unwrap_or(0) as u32,
@@ -215,6 +414,10 @@ impl LlmBackend for LocalBackend {
         true
     }
 
+    fn tokenizer_base_url(&self) -> String {
+        self.resolve_api_url()
+    }
+
     async fn chat(
         &self,
         messages: &[ChatMessage],
@@ -223,15 +426,8 @@ impl LlmBackend for LocalBackend {
         max_tokens: u32,
     ) -> anyhow::Result<LlmResponse> {
         // V10: Wait for swap to complete before sending a request
-        if self.is_swapping() {
-            tracing::info!("local LLM: waiting for swap to complete before chat");
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-            while self.is_swapping() {
-                if tokio::time::Instant::now() > deadline {
-                    anyhow::bail!("local LLM: swap timeout exceeded (120s)");
-                }
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
+        if !self.wait_for_swap(120).await {
+            anyhow::bail!("local LLM: swap timeout exceeded (120s)");
         }
 
         let mut current_messages = messages.to_vec();
@@ -241,13 +437,19 @@ impl LlmBackend for LocalBackend {
                 .circuit
                 .call(
                     self.chat_inner(&current_messages, tools, temperature, max_tokens),
-                    |e: &anyhow::Error| e.downcast_ref::<ContextTooLargeError>().is_some(),
+                    |e: &anyhow::Error| Self::should_ignore_for_circuit(e),
                 )
                 .await
             {
                 Ok(resp) => return Ok(resp),
                 Err(CircuitBreakerError::Open(name)) => {
-                    anyhow::bail!("local LLM unavailable (circuit open: {name})");
+                    if attempt < 2 && self.try_recover_open_circuit(&name, attempt).await {
+                        continue;
+                    }
+
+                    anyhow::bail!(
+                        "local LLM unavailable (circuit open: {name}). Health probe failed; retry in 20-30s or restart the local model runtime"
+                    );
                 }
                 Err(CircuitBreakerError::Inner(e)) => {
                     if e.downcast_ref::<ContextTooLargeError>().is_some() {
@@ -283,18 +485,14 @@ impl LlmBackend for LocalBackend {
         max_tokens: u32,
     ) -> anyhow::Result<Pin<Box<dyn Stream<Item = String> + Send>>> {
         // V10: Wait for swap to complete
-        if self.is_swapping() {
-            tracing::info!("local LLM: waiting for swap to complete before stream");
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-            while self.is_swapping() {
-                if tokio::time::Instant::now() > deadline {
-                    anyhow::bail!("local LLM: swap timeout exceeded (120s)");
-                }
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
+        if !self.wait_for_swap(120).await {
+            anyhow::bail!("local LLM: swap timeout exceeded (120s)");
         }
 
-        if matches!(self.circuit.state().await, CircuitState::Open) {
+        if matches!(self.circuit.state().await, CircuitState::Open)
+            && !self.try_recover_open_circuit("local-llm", 0).await
+            && matches!(self.circuit.state().await, CircuitState::Open)
+        {
             anyhow::bail!("local LLM stream unavailable (circuit open)");
         }
 
@@ -343,17 +541,19 @@ impl LlmBackend for LocalBackend {
             }
         };
 
-        if resp.status().as_u16() == 400 {
-            return Err(ContextTooLargeError.into());
-        }
-
-        let resp = match resp.error_for_status() {
-            Ok(resp) => resp,
-            Err(e) => {
-                self.circuit.on_failure().await;
-                return Err(e.into());
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            if Self::looks_like_context_overflow_response(status, &body_text) {
+                return Err(ContextTooLargeError.into());
             }
-        };
+
+            self.circuit.on_failure().await;
+            anyhow::bail!(
+                "local LLM stream request failed (status {status}): {}",
+                sanitize_text_for_logs(&body_text, 220)
+            );
+        }
 
         self.circuit.on_success().await;
 
@@ -407,12 +607,47 @@ impl LlmBackend for LocalBackend {
     }
 
     async fn health_check(&self) -> bool {
-        let health_url = self.resolve_api_url().replace("/v1", "/health");
-        self.client
-            .get(&health_url)
-            .send()
-            .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false)
+        self.health_check_once().await
     }
+}
+
+/// Parse tool calls from a JSON content string emitted under json_schema mode.
+/// Handles both single `{"tool": "...", "arguments": {...}}` and
+/// array `[{"tool": "...", "arguments": {...}}, ...]` forms.
+/// Returns the same `Vec<serde_json::Value>` shape as `extract_openai_tool_calls`.
+fn extract_tool_calls_from_json_content(content: &str) -> Option<Vec<serde_json::Value>> {
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(content) else {
+        return None;
+    };
+
+    let items: Vec<serde_json::Value> = if val.is_array() {
+        val.as_array().cloned().unwrap_or_default()
+    } else {
+        vec![val]
+    };
+
+    let calls: Vec<serde_json::Value> = items
+        .into_iter()
+        .filter_map(|item| {
+            let name = item.get("tool")
+                .or_else(|| item.get("name"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())?;
+            let arguments = item.get("arguments")
+                .or_else(|| item.get("args"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Object(Default::default()));
+            // Emit in the OpenAI tool_calls format so the rest of the pipeline is unchanged.
+            Some(serde_json::json!({
+                "id": format!("grammar_{}", uuid::Uuid::new_v4()),
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": serde_json::to_string(&arguments).unwrap_or_default(),
+                }
+            }))
+        })
+        .collect();
+
+    if calls.is_empty() { None } else { Some(calls) }
 }

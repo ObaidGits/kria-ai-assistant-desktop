@@ -4,6 +4,7 @@ pub mod model_manager;
 pub mod model_router;
 pub mod orchestrator;
 pub mod server_binary;
+pub mod tokenize;
 
 use async_trait::async_trait;
 use futures::Stream;
@@ -169,6 +170,14 @@ pub trait LlmBackend: Send + Sync {
     fn capabilities(&self) -> &[String];
     fn is_configured(&self) -> bool;
 
+    /// Returns the base HTTP URL of the backend's inference server, if any.
+    /// Used by the tokenizer helper (`llm::tokenize::count_tokens`) to obtain
+    /// exact token counts without adding a new crate dependency.
+    /// Backends that do not expose a local HTTP server should return `""`.
+    fn tokenizer_base_url(&self) -> String {
+        String::new()
+    }
+
     async fn chat(
         &self,
         messages: &[ChatMessage],
@@ -195,6 +204,13 @@ pub struct ContextTooLargeError;
 
 /// Max chars for tool results in context.
 pub const TOOL_RESULT_MAX_CHARS: usize = 3000;
+
+/// Per-tool token budget for shaped LLM injection (≈ 1 024 tokens).
+pub const LLM_TOOL_RESULT_TOKEN_BUDGET: usize = 1024;
+
+/// Per-turn aggregate token budget for all tool outputs combined (≈ 4 096 tokens).
+/// When the turn total exceeds this, subsequent tools are short-circuited.
+pub const LLM_TURN_TOOL_BUDGET: usize = 4096;
 
 /// Trim messages to fit context window.
 ///

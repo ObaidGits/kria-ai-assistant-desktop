@@ -68,7 +68,49 @@ static DIRECT_TOOL_RE: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
             r"(?i)\b(network|internet)\s*(status|info|connection)\b",
             "get_network_status",
         ),
-        // App lifecycle
+        // App lifecycle — specific patterns first, generic fallback last
+        //
+        // browser_search: "open Chrome and search X", "search for X on YouTube",
+        //                 "play X on YouTube", "google X", "youtube search X"
+        (
+            r"(?i)\b(open|launch)\s+\w+\s+(and\s+)?(search|google|look\s*up|find)\b",
+            "browser_search",
+        ),
+        (
+            r"(?i)\b(search|google|look\s*up)\b.*\b(on\s+)?(youtube|chrome|firefox|browser|web)\b",
+            "browser_search",
+        ),
+        (
+            r"(?i)\b(youtube|yt)\s+(search|play|find|look\s*up)\b",
+            "browser_search",
+        ),
+        (
+            r"(?i)\b(play|search)\b.{0,40}\b(on|in|via)\s+(youtube|yt)\b",
+            "browser_search",
+        ),
+        // send_message: "text/message/WhatsApp/signal Anjali", "send a WhatsApp to X"
+        (
+            r"(?i)\b(text|message|msg)\s+\w+\b",
+            "send_message",
+        ),
+        (
+            r"(?i)\b(send|open)\s+(a\s+)?(whatsapp|telegram|signal)\b",
+            "send_message",
+        ),
+        (
+            r"(?i)\b(whatsapp|telegram|signal)\s+(message|msg|text)?\s*(to\s+)?\w+\b",
+            "send_message",
+        ),
+        (
+            r"(?i)\bsend\s+(a\s+)?message\s+(to\s+)?\w+\b",
+            "send_message",
+        ),
+        // open_url: "open https://...", "go to <url>"
+        (
+            r"(?i)\b(open|go\s+to|navigate\s+to|visit)\s+https?://\S+",
+            "open_url",
+        ),
+        // open_application: generic — last resort for "open/launch/start <app>"
         (
             r"(?i)\b(open|launch|start|run)\s+(\w+)\b",
             "open_application",
@@ -87,6 +129,22 @@ static DIRECT_TOOL_RE: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
         (
             r"(?i)\b(search|find|look\s*for|locate)\b.*\b(google\s+drive|drive\s+files?|drive)\b",
             "gw_drive_search",
+        ),
+        (
+            r"(?i)\b(read|open|view|download|fetch)\b.*\b(google\s+drive|drive)\b.*\b(file|document|doc|spreadsheet|sheet|slides?|presentation)\b",
+            "gw_drive_read",
+        ),
+        (
+            r"(?i)\b(read|open|view|download|fetch)\b.*\b(file|document|doc|spreadsheet|sheet|slides?|presentation)\b.*\b(google\s+drive|drive)\b",
+            "gw_drive_read",
+        ),
+        (
+            r"(?i)\b(delete|remove|trash)\b.*\b(google\s+drive|drive)\b.*\b(file|document|doc|spreadsheet|sheet|slides?|presentation)\b",
+            "gw_drive_delete",
+        ),
+        (
+            r"(?i)\b(delete|remove|trash)\b.*\b(file|document|doc|spreadsheet|sheet|slides?|presentation)\b.*\b(google\s+drive|drive)\b",
+            "gw_drive_delete",
         ),
         (
             r"(?i)\b(latest|recent|today|current|updates?)\b.*\b(google\s+calendar|calendar|schedule|events?)\b",
@@ -142,7 +200,7 @@ static DIRECT_TOOL_RE: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
         ),
         // Internet
         (
-            r"(?i)^(?!.*\b(?:google\s+calendar|calendar|gmail|drive|docs?|sheets?|slides?|forms?)\b).*(?:\b(latest|breaking|today|current|recent)\b.*\b(news|headlines|updates?)\b)",
+            r"(?i)\b(latest|breaking|today|current|recent)\b.*\b(news|headlines|updates?)\b",
             "search_news",
         ),
         (
@@ -163,6 +221,14 @@ static DIRECT_TOOL_RE: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
         ),
         // Google Workspace (Gmail)
         (
+            r"(?i)\b(read|open|view|show)\b.*\b(gmail|gmails|email|emails?|mail)\b.*\b(message\s*id|message_id|id)\b",
+            "gw_gmail_read",
+        ),
+        (
+            r"(?i)\b(delete|remove|trash)\b.*\b(gmail|gmails|email|emails?|mail)\b",
+            "gw_gmail_delete",
+        ),
+        (
             r"(?i)\b(check|show|list|get|read|fetch)\b.*\b(gmail|gmails|inbox|emails?|mailbox)\b",
             "gw_gmail_inbox",
         ),
@@ -178,6 +244,10 @@ static DIRECT_TOOL_RE: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
             r"(?i)\b(search|find|look\s*for)\b.*\b(gmail|gmails|emails?|inbox)\b",
             "gw_gmail_search",
         ),
+        (
+            r#"(?i)\b(send|write|compose|draft)\b\s+(?:an?\s+|the\s+)?(.+?)\s+\b(mail|email|gmail)\b.*\bto\s+["']?[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}["']?"#,
+            "gw_gmail_send",
+        ),
         // Google Workspace (Calendar / Meet fallback via Calendar)
         (
             r"(?i)\b(what'?s|show|list|check|get|view)\b.*\b(calendar|schedule|events?)\b",
@@ -190,6 +260,10 @@ static DIRECT_TOOL_RE: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
         (
             r"(?i)\b(schedule|create|book|add|plan)\b.*\b(calendar\s+event|event|meeting|appointment|meet|call|invite)\b",
             "gw_calendar_create",
+        ),
+        (
+            r"(?i)\b(delete|remove|cancel)\b.*\b(calendar\s+event|event|meeting|appointment)\b",
+            "gw_calendar_delete",
         ),
         // Google Workspace (Docs)
         (
@@ -204,6 +278,10 @@ static DIRECT_TOOL_RE: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
             r"(?i)\b(edit|update|append|modify)\b.*\b(google\s+docs?|gdocs?|gdoc|document)\b",
             "gw_docs_edit",
         ),
+        (
+            r"(?i)\b(delete|remove|trash)\b.*\b(google\s+docs?|gdocs?|gdoc|document)\b",
+            "gw_drive_delete",
+        ),
         // Google Workspace (Sheets)
         (
             r"(?i)\b(create|new|start|make)\b.*\b(google\s+sheets?|gsheets?|spreadsheet|sheet)\b",
@@ -217,6 +295,10 @@ static DIRECT_TOOL_RE: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
             r"(?i)\b(edit|update|write|append|modify)\b.*\b(google\s+sheets?|gsheets?|spreadsheet|sheet)\b",
             "gw_sheets_edit",
         ),
+        (
+            r"(?i)\b(delete|remove|trash)\b.*\b(google\s+sheets?|gsheets?|spreadsheet|sheet)\b",
+            "gw_drive_delete",
+        ),
         // Google Workspace (Slides)
         (
             r"(?i)\b(create|new|start|make)\b.*\b(google\s+slides?|gslides?|presentation|deck)\b",
@@ -225,6 +307,10 @@ static DIRECT_TOOL_RE: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
         (
             r"(?i)\b(read|open|show|view)\b.*\b(google\s+slides?|gslides?|presentation|deck)\b",
             "gw_slides_read",
+        ),
+        (
+            r"(?i)\b(delete|remove|trash)\b.*\b(google\s+slides?|gslides?|presentation|deck)\b",
+            "gw_drive_delete",
         ),
         // Google Workspace (Forms)
         (
@@ -418,10 +504,32 @@ mod tests {
     }
 
     #[test]
+    fn routes_send_mail_prompts_to_gmail_send_tool() {
+        let result =
+            IntentRouter::classify("Send a Hye mail to \"zeeshanobaid335@gmail.com\"");
+        assert!(matches!(result.intent, Intent::DirectTool(_)));
+        assert_eq!(result.tool_hint.as_deref(), Some("gw_gmail_send"));
+    }
+
+    #[test]
+    fn routes_delete_gmail_prompts_to_gmail_delete_tool() {
+        let result = IntentRouter::classify("Delete this email message_id 18af9f0a8bcdef12");
+        assert!(matches!(result.intent, Intent::DirectTool(_)));
+        assert_eq!(result.tool_hint.as_deref(), Some("gw_gmail_delete"));
+    }
+
+    #[test]
     fn routes_schedule_meeting_to_calendar_create_tool() {
         let result = IntentRouter::classify("Schedule a Google Meet for tomorrow at 3pm");
         assert!(matches!(result.intent, Intent::DirectTool(_)));
         assert_eq!(result.tool_hint.as_deref(), Some("gw_calendar_create"));
+    }
+
+    #[test]
+    fn routes_calendar_cancel_prompts_to_calendar_delete_tool() {
+        let result = IntentRouter::classify("Cancel my calendar event with event id abc123def456");
+        assert!(matches!(result.intent, Intent::DirectTool(_)));
+        assert_eq!(result.tool_hint.as_deref(), Some("gw_calendar_delete"));
     }
 
     #[test]
@@ -450,6 +558,27 @@ mod tests {
         let result = IntentRouter::classify("List files in my Google drive");
         assert!(matches!(result.intent, Intent::DirectTool(_)));
         assert_eq!(result.tool_hint.as_deref(), Some("gw_drive_list"));
+    }
+
+    #[test]
+    fn routes_drive_read_prompts_to_drive_read_tool() {
+        let result = IntentRouter::classify("Read this file from Google Drive");
+        assert!(matches!(result.intent, Intent::DirectTool(_)));
+        assert_eq!(result.tool_hint.as_deref(), Some("gw_drive_read"));
+    }
+
+    #[test]
+    fn routes_docs_delete_prompts_to_drive_delete_tool() {
+        let result = IntentRouter::classify("Delete this Google Doc");
+        assert!(matches!(result.intent, Intent::DirectTool(_)));
+        assert_eq!(result.tool_hint.as_deref(), Some("gw_drive_delete"));
+    }
+
+    #[test]
+    fn routes_sheets_delete_prompts_to_drive_delete_tool() {
+        let result = IntentRouter::classify("Remove this spreadsheet from my drive");
+        assert!(matches!(result.intent, Intent::DirectTool(_)));
+        assert_eq!(result.tool_hint.as_deref(), Some("gw_drive_delete"));
     }
 
     #[test]

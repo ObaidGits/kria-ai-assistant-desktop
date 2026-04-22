@@ -41,11 +41,25 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 dirs = { workspace = true }
 open = { workspace = true }
+url = { workspace = true }
+unicode-normalization = { workspace = true }
 tokio-util = { workspace = true }
 nvml-wrapper = { workspace = true, optional = true }
+blake3 = { workspace = true }
+hex = { workspace = true }
+memmap2 = { workspace = true }
+fastembed = { workspace = true }
+llguidance = { workspace = true }
 
 [features]
 nvidia = ["nvml-wrapper"]
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Ring 4: Linux seccomp-bpf syscall filter
+seccompiler = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

@@ -241,25 +241,65 @@ pub fn get_available_package_managers() -> Vec<PackageManager> {
 }
 
 /// Attempt to detect NVIDIA GPU VRAM via nvidia-smi.
+///
+/// A 5-second timeout is enforced. If the NVIDIA driver is wedged or
+/// `nvidia-smi` hangs, returns `(None, None)` rather than blocking
+/// the caller indefinitely.
 fn detect_gpu() -> (Option<u64>, Option<String>) {
-    let output = Command::new("nvidia-smi")
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
+    let mut child = match Command::new("nvidia-smi")
         .args([
             "--query-gpu=memory.total,name",
             "--format=csv,noheader,nounits",
         ])
-        .output();
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return (None, None),
+    };
 
-    match output {
-        Ok(o) if o.status.success() => {
-            let text = String::from_utf8_lossy(&o.stdout);
-            let line = text.lines().next().unwrap_or("");
-            let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
-            let vram = parts.first().and_then(|s| s.parse::<u64>().ok());
-            let name = parts.get(1).map(|s| s.to_string());
-            (vram, name)
+    // Take stdout *before* waiting so we can read it after process exits.
+    let mut stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => return (None, None),
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return (None, None);
+                }
+                break;
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    tracing::warn!("detect_gpu: nvidia-smi timed out after 5s, killing");
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return (None, None);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return (None, None),
         }
-        _ => (None, None),
     }
+
+    let mut buf = String::new();
+    if stdout.read_to_string(&mut buf).is_err() {
+        return (None, None);
+    }
+
+    let line = buf.lines().next().unwrap_or("");
+    let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+    let vram = parts.first().and_then(|s| s.parse::<u64>().ok());
+    let name = parts.get(1).map(|s| s.to_string());
+    (vram, name)
 }
 
 /// Determine hardware tier from RAM + VRAM.

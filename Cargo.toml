@@ -86,8 +86,30 @@ dirs = "5"
 # Open URLs/files in default app
 open = "5"
 
+# URL parsing and construction
+url = { version = "2", features = ["serde"] }
+
+# Unicode text normalization (for contact matching)
+unicode-normalization = "0.1"
+
 # GPU telemetry (NVIDIA)
 nvml-wrapper = "0.10"
 
 # Async utilities (CancellationToken)
 tokio-util = "0.7"
+
+# Hashing
+blake3 = "1"
+hex = "0.4"
+
+# Memory-mapped files
+memmap2 = "0.9"
+
+# Semantic embeddings (ONNX-based, no Python)
+fastembed = "5"
+
+# Grammar-constrained LLM decoding
+llguidance = "0.7"
+
+# POSIX bindings (prctl, setsid, kill — Unix only)
+libc = "0.2"

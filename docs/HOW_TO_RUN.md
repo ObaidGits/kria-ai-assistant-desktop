@@ -1043,9 +1043,9 @@ The terminal where you ran `cargo tauri dev` shows live compact logs:
 
 ```
 INFO kria_desktop::commands: KRIA runtime initialized
-INFO kria_desktop::commands: User message: hello
-INFO kria_desktop::commands: Routing to backend: phi-4-mini
-INFO kria_desktop::commands: LLM response received (142 chars)
+INFO kria_desktop::commands: user prompt received chars=42
+INFO kria_desktop::commands: KRIA runtime initialized — agent loop active
+WARN kria_core::sidecar::bridge: sidecar pre-check: kria_modules not importable: ...
 ```
 
 #### Log files (JSON, daily rotation)
@@ -1069,7 +1069,14 @@ tail -f ~/.kria/logs/kria.log.$(date +%F) | jq .
 
 #### Controlling log verbosity
 
-Set the `RUST_LOG` environment variable:
+KRIA uses an essential-noise default profile when `RUST_LOG` is not set, and now includes essential pipeline traces in terminal (prompt intake, LLM request/response summary, tool calls/results, final output path). To inspect the full prompt→result pipeline with extra detail, enable the dedicated debug trace mode:
+
+```bash
+# Full pipeline trace (debug-only, sanitized + truncated payload previews)
+KRIA_PIPELINE_DEBUG=1 cargo tauri dev
+```
+
+Set `RUST_LOG` for manual overrides:
 
 ```bash
 # Verbose — show everything
@@ -1080,9 +1087,12 @@ RUST_LOG=error cargo tauri dev
 
 # Fine-grained
 RUST_LOG="kria_core=debug,kria_desktop=info" cargo tauri dev
+
+# Pipeline trace target + selected modules
+KRIA_PIPELINE_DEBUG=1 RUST_LOG="kria_pipeline=debug,kria_desktop=info,kria_core=info" cargo tauri dev
 ```
 
-Default levels (when `RUST_LOG` is not set): `info` globally, `debug` for `kria_core`, `kria_desktop`, and `kria_server`.
+Default levels (when `RUST_LOG` is not set): `info` globally with noisy subprocess targets clamped (`llama-server`, `mcp_stderr`, `sidecar_stderr` at `warn`) and `kria_pipeline=info` (`KRIA_PIPELINE_DEBUG=1` upgrades pipeline traces to debug detail).
 
 #### Browser DevTools (frontend)
 

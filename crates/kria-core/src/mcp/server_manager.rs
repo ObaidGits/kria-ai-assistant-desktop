@@ -14,7 +14,10 @@ use tokio::sync::Mutex;
 use super::client::{McpClient, McpServerState};
 use super::protocol::McpToolDef;
 use super::tool_bridge::McpToolHandler;
+use tokio::sync::broadcast;
+
 use crate::config::McpServerConfig;
+use crate::routing::cache::RouterCacheEvent;
 use crate::safety::RiskLevel;
 use crate::tools::{ToolDef, ToolHandler, ToolRegistry};
 
@@ -27,6 +30,8 @@ pub struct McpServerManager {
     configs: Vec<McpServerConfig>,
     /// Per-server consecutive ping failure count.
     ping_failures: HashMap<String, u64>,
+    /// Optional: notify the semantic router cache when tools change.
+    router_event_tx: Option<broadcast::Sender<RouterCacheEvent>>,
 }
 
 /// Summary of one reconcile pass between configured and runtime MCP servers.
@@ -45,6 +50,19 @@ impl McpServerManager {
             clients: HashMap::new(),
             configs,
             ping_failures: HashMap::new(),
+            router_event_tx: None,
+        }
+    }
+
+    /// Attach a sender so the router cache is invalidated when MCP tools change.
+    pub fn with_router_event_sender(mut self, tx: broadcast::Sender<RouterCacheEvent>) -> Self {
+        self.router_event_tx = Some(tx);
+        self
+    }
+
+    fn notify_tools_changed(&self) {
+        if let Some(tx) = &self.router_event_tx {
+            let _ = tx.send(RouterCacheEvent::ToolsChanged);
         }
     }
 
@@ -164,6 +182,7 @@ impl McpServerManager {
             "[MCP] start_all complete — {} server(s) running",
             self.clients.len()
         );
+        self.notify_tools_changed();
     }
 
     /// Start a single MCP server and register its tools.
@@ -265,6 +284,55 @@ impl McpServerManager {
     /// Get a client by name (for direct tool calls).
     pub fn get_client(&self, name: &str) -> Option<&Arc<McpClient>> {
         self.clients.get(name)
+    }
+
+    /// Refresh tools for a running server and re-register its MCP category.
+    pub async fn refresh_server_tools(
+        &mut self,
+        name: &str,
+        registry: &ToolRegistry,
+    ) -> anyhow::Result<usize> {
+        let client = self
+            .clients
+            .get(name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("unknown or stopped MCP server: {}", name))?;
+
+        let config = self
+            .configs
+            .iter()
+            .find(|cfg| cfg.name == name)
+            .ok_or_else(|| anyhow::anyhow!("missing MCP config for server: {}", name))?
+            .clone();
+
+        if client.state().await != McpServerState::Running {
+            anyhow::bail!("MCP server '{}' is not running", name);
+        }
+
+        let tools = client.refresh_tools().await?;
+        let category = format!("mcp_{}", name);
+        let removed = registry.unregister_category(&category);
+
+        for tool_def in &tools {
+            register_mcp_tool(
+                registry,
+                &client,
+                &config.name,
+                tool_def,
+                &config.trust_level,
+                &config.tool_overrides,
+            );
+        }
+
+        tracing::info!(
+            server = %name,
+            removed,
+            registered = tools.len(),
+            "refreshed MCP server tools"
+        );
+        self.notify_tools_changed();
+
+        Ok(tools.len())
     }
 
     /// Restart a crashed server.

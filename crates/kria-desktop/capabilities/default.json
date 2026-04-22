@@ -26,10 +26,16 @@
     "fs:default",
     "fs:allow-read-text-file",
     "fs:allow-write-text-file",
-    "shell:default",
-    "shell:allow-open",
     "process:default",
     "process:allow-exit",
     "process:allow-restart"
+  ],
+  "_removed_permissions_notes": [
+    "shell:default — removed: grants unrestricted shell:execute and shell:spawn.",
+    "shell:allow-execute — removed: would allow arbitrary command execution from the frontend.",
+    "shell:allow-spawn — removed: same risk as allow-execute.",
+    "shell:allow-open — removed: replaced by the Rust-side IntentDispatcher which enforces",
+    "  the scheme allow-list (https/http/mailto/tel and registered deep-links only).",
+    "  The `open` crate call happens inside kria-core, never driven by untrusted JS."
   ]
 }

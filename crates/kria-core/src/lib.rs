@@ -8,6 +8,7 @@ pub mod memory;
 pub mod platform;
 pub mod plugin;
 pub mod preprocessing;
+pub mod routing;
 pub mod safety;
 pub mod sidecar;
 pub mod tools;

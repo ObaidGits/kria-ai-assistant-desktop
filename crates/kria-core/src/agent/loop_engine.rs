@@ -1,21 +1,67 @@
 use chrono::{Datelike, Duration, Local, SecondsFormat, TimeZone, Utc};
 use once_cell::sync::Lazy;
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::agent::response_parser::{
     extract_text_response, parse_tool_calls_with_known, ParsedToolCall,
 };
 use crate::agent::router::IntentRouter;
 use crate::infra::isolation::run_isolated;
-use crate::llm::{ChatMessage, ModelRouter, ToolSchema, TOOL_RESULT_MAX_CHARS};
+use crate::infra::pipeline_trace::{
+    log_pipeline_step, sanitize_json_for_logs, sanitize_text_for_logs,
+};
+use crate::llm::tokenize::count_tokens;
+use crate::llm::{
+    ChatMessage, ModelRouter, ToolSchema, LLM_TOOL_RESULT_TOKEN_BUDGET, LLM_TURN_TOOL_BUDGET,
+    TOOL_RESULT_MAX_CHARS,
+};
+use crate::mcp::payload_shaper::shape_for_llm;
 use crate::safety::audit::{DecidedBy, Decision};
 use crate::safety::hitl::{ApprovalResponse, HitlGateway};
 use crate::safety::{AuditLogger, PolicyEngine, RiskLevel, RollbackManager};
 use crate::tools::mount_manager::{google_meet_fallback_metadata, ToolMountManager};
-use crate::tools::registry::ToolRegistry;
+use crate::tools::registry::{ToolDef, ToolRegistry};
+
+/// Compute a stable u64 hash for a `(tool_name, arguments)` pair.
+/// Used to detect duplicate failed tool calls within a single turn.
+fn call_dedup_hash(tool_name: &str, arguments: &serde_json::Value) -> u64 {
+    // Canonicalize argument JSON (sort keys) so {"a":1,"b":2} == {"b":2,"a":1}.
+    let canonical_args = canonical_json(arguments);
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    tool_name.hash(&mut h);
+    canonical_args.hash(&mut h);
+    h.finish()
+}
+
+/// Serialize a `serde_json::Value` with object keys sorted for stable comparison.
+fn canonical_json(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Object(map) => {
+            let mut pairs: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+            pairs.sort_by_key(|(k, _)| k.as_str());
+            let inner = pairs
+                .iter()
+                .map(|(k, v)| format!("\"{}\":{}", k, canonical_json(v)))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{inner}}}")
+        }
+        serde_json::Value::Array(arr) => {
+            let inner = arr
+                .iter()
+                .map(canonical_json)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("[{inner}]")
+        }
+        other => other.to_string(),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PackageIntent {
@@ -78,8 +124,57 @@ static CALENDAR_ATTENDEE_EMAIL_RE: Lazy<Regex> = Lazy::new(|| {
         .expect("valid calendar attendee email regex")
 });
 
+static GMAIL_SEND_BODY_BEFORE_MAIL_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?i)\b(?:send|write|compose|draft)\b\s+(?:an?\s+|the\s+)?(.+?)\s+\b(?:mail|email|gmail)\b",
+    )
+    .expect("valid gmail send body-before-mail regex")
+});
+
+static GMAIL_SEND_BODY_AFTER_SAYING_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\b(?:saying|say|with\s+message|message\s+is)\b\s+(.+?)(?:\s+\bto\b|$)")
+        .expect("valid gmail send body-after-saying regex")
+});
+
+static GMAIL_SEND_SUBJECT_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\bsubject\b\s*(?::|is)?\s+([^\n\r,;!?]+)")
+        .expect("valid gmail send subject regex")
+});
+
+static GMAIL_MESSAGE_ID_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\b(?:message[_\s-]?id|gmail[_\s-]?id|email[_\s-]?id)\b\s*[:=]?\s*([A-Za-z0-9_-]{10,})")
+        .expect("valid gmail message id regex")
+});
+
+static CALENDAR_EVENT_ID_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\b(?:event[_\s-]?id|calendar[_\s-]?event[_\s-]?id)\b\s*[:=]?\s*([A-Za-z0-9_@-]{8,})")
+        .expect("valid calendar event id regex")
+});
+
+static GENERIC_RESOURCE_ID_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\b(?:file[_\s-]?id|document[_\s-]?id|spreadsheet[_\s-]?id|presentation[_\s-]?id|id)\b\s*[:=]?\s*([A-Za-z0-9_-]{10,})")
+        .expect("valid generic resource id regex")
+});
+
+static SHEETS_RANGE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\b([A-Za-z0-9_]+![A-Z]+\d+(?::[A-Z]+\d+)?|[A-Z]+\d+(?::[A-Z]+\d+)?)\b")
+        .expect("valid sheets range regex")
+});
+
+static APPEND_TEXT_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\b(?:append|add|insert|write)\b\s+(.+?)(?:\s+\b(?:to|into|in)\b|$)")
+        .expect("valid append text regex")
+});
+
+static SEND_CONFIRMATION_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?i)^\s*(?:yes\s*,?\s*)?(?:send(?:\s+it)?|go\s+ahead|confirm|proceed)(?:\s+(?:now|immediately|right\s+now))?\s*[.!]?\s*$",
+    )
+    .expect("valid send confirmation regex")
+});
+
 static FORCED_TOOL_DIRECTIVE_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?is)^\s*#tool:\s*([a-zA-Z0-9_]+)\s*(.*)$")
+    Regex::new(r"(?is)^\s*#tool:\s*([a-zA-Z0-9_-]+)\s*(.*)$")
         .expect("valid forced tool directive regex")
 });
 
@@ -350,6 +445,46 @@ fn sanitize_assistant_text_response(text: &str) -> String {
         .to_string()
 }
 
+fn build_message_preview(messages: &[ChatMessage], max_messages: usize) -> serde_json::Value {
+    let start = messages.len().saturating_sub(max_messages);
+    let preview: Vec<serde_json::Value> = messages
+        .iter()
+        .skip(start)
+        .map(|m| {
+            let content_chars = m.content.chars().count();
+            let content_preview = if m.role.eq_ignore_ascii_case("system") {
+                format!("[system prompt omitted; {content_chars} chars]")
+            } else {
+                sanitize_text_for_logs(&m.content, 160)
+            };
+
+            serde_json::json!({
+                "role": m.role,
+                "name": m.name,
+                "has_images": m.has_images(),
+                "content": content_preview,
+                "content_chars": content_chars,
+            })
+        })
+        .collect();
+
+    serde_json::Value::Array(preview)
+}
+
+fn build_tool_calls_preview(tool_calls: &[ParsedToolCall]) -> serde_json::Value {
+    let preview: Vec<serde_json::Value> = tool_calls
+        .iter()
+        .map(|call| {
+            serde_json::json!({
+                "name": call.name,
+                "arguments": sanitize_json_for_logs(&call.arguments, 220, 8),
+            })
+        })
+        .collect();
+
+    serde_json::Value::Array(preview)
+}
+
 fn build_tool_call_history_content(tool_calls: &[ParsedToolCall]) -> String {
     tool_calls
         .iter()
@@ -364,7 +499,10 @@ fn build_tool_call_history_content(tool_calls: &[ParsedToolCall]) -> String {
 }
 
 fn is_gmail_tool_name(tool_name: &str) -> bool {
-    matches!(tool_name, "gw_gmail_inbox" | "gw_gmail_search" | "gw_gmail_read")
+    matches!(
+        tool_name,
+        "gw_gmail_inbox" | "gw_gmail_search" | "gw_gmail_read" | "gw_gmail_send"
+    )
 }
 
 fn looks_like_spurious_gmail_capability_line(line: &str) -> bool {
@@ -658,6 +796,509 @@ fn infer_gmail_search_query(user_text: &str) -> String {
     user_text.trim().to_string()
 }
 
+fn clean_gmail_body_candidate(candidate: &str) -> Option<String> {
+    let mut body = candidate
+        .trim()
+        .trim_matches(|c: char| c == '"' || c == '\'' || c == '`')
+        .trim()
+        .to_string();
+
+    if body.is_empty() {
+        return None;
+    }
+
+    // Avoid turning vague references into accidental sends.
+    let normalized = body.to_ascii_lowercase();
+    if matches!(normalized.as_str(), "mail" | "email" | "gmail" | "this" | "that" | "it") {
+        return None;
+    }
+
+    // Strip trailing connective phrases that can leak from loose extraction.
+    for marker in [" to ", " for "] {
+        if let Some((head, _)) = body.split_once(marker) {
+            let trimmed = head.trim();
+            if !trimmed.is_empty() {
+                body = trimmed.to_string();
+            }
+        }
+    }
+
+    if body.is_empty() {
+        None
+    } else {
+        Some(body)
+    }
+}
+
+fn infer_gmail_send_body(user_text: &str) -> Option<String> {
+    if let Some(caps) = GMAIL_SEND_BODY_AFTER_SAYING_RE.captures(user_text) {
+        if let Some(matched) = caps.get(1) {
+            if let Some(body) = clean_gmail_body_candidate(matched.as_str()) {
+                return Some(body);
+            }
+        }
+    }
+
+    if let Some(caps) = GMAIL_SEND_BODY_BEFORE_MAIL_RE.captures(user_text) {
+        if let Some(matched) = caps.get(1) {
+            if let Some(body) = clean_gmail_body_candidate(matched.as_str()) {
+                return Some(body);
+            }
+        }
+    }
+
+    if let Some(caps) = QUOTED_TEXT_RE.captures(user_text) {
+        if let Some(matched) = caps.get(1).or_else(|| caps.get(2)) {
+            if let Some(body) = clean_gmail_body_candidate(matched.as_str()) {
+                return Some(body);
+            }
+        }
+    }
+
+    None
+}
+
+fn infer_gmail_send_subject(user_text: &str, body: &str) -> String {
+    if let Some(caps) = GMAIL_SEND_SUBJECT_RE.captures(user_text) {
+        if let Some(matched) = caps.get(1) {
+            let subject = matched.as_str().trim();
+            if !subject.is_empty() {
+                return subject.to_string();
+            }
+        }
+    }
+
+    let one_line = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !one_line.is_empty() && one_line.len() <= 64 {
+        return one_line;
+    }
+
+    "Message from KRIA".to_string()
+}
+
+fn infer_gmail_send_arguments(user_text: &str) -> Option<serde_json::Value> {
+    let to = CALENDAR_ATTENDEE_EMAIL_RE
+        .captures(user_text)
+        .and_then(|caps| caps.get(1))
+        .map(|m| m.as_str().trim().to_ascii_lowercase())?;
+
+    let body = infer_gmail_send_body(user_text)?;
+    let subject = infer_gmail_send_subject(user_text, &body);
+
+    Some(serde_json::json!({
+        "to": to,
+        "subject": subject,
+        "body": body,
+    }))
+}
+
+fn clean_identifier_candidate(candidate: &str) -> Option<String> {
+    let id = candidate
+        .trim()
+        .trim_matches(|c: char| c == '"' || c == '\'' || c == '`' || c == '(' || c == ')')
+        .trim();
+
+    if id.len() < 8 {
+        return None;
+    }
+
+    if !id
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '@'))
+    {
+        return None;
+    }
+
+    Some(id.to_string())
+}
+
+fn clean_content_candidate(candidate: &str) -> Option<String> {
+    let cleaned = candidate
+        .trim()
+        .trim_matches(|c: char| c == '"' || c == '\'' || c == '`')
+        .trim()
+        .trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | '!'))
+        .trim();
+
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned.to_string())
+    }
+}
+
+fn extract_identifier_from_url_marker(text: &str, marker: &str) -> Option<String> {
+    let (_, rest) = text.split_once(marker)?;
+    let candidate = rest
+        .trim_start()
+        .split(|c: char| {
+            c.is_whitespace() || matches!(c, '/' | '?' | '&' | '#' | ',' | ';' | '"' | '\'')
+        })
+        .next()
+        .unwrap_or("");
+    clean_identifier_candidate(candidate)
+}
+
+fn extract_identifier_after_keyword(text: &str, keywords: &[&str]) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    for keyword in keywords {
+        if let Some(idx) = lower.find(keyword) {
+            let start = idx + keyword.len();
+            if let Some(rest) = text.get(start..) {
+                let candidate = rest
+                    .trim_start()
+                    .trim_start_matches(|c: char| matches!(c, ':' | '=' | '#' | '/'))
+                    .split(|c: char| {
+                        c.is_whitespace()
+                            || matches!(c, '/' | '?' | '&' | '#' | ',' | ';' | '"' | '\'' | '(' | ')')
+                    })
+                    .next()
+                    .unwrap_or("");
+                if let Some(id) = clean_identifier_candidate(candidate) {
+                    return Some(id);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn infer_google_resource_id(user_text: &str) -> Option<String> {
+    for marker in [
+        "/document/d/",
+        "/spreadsheets/d/",
+        "/presentation/d/",
+        "/file/d/",
+        "/folders/",
+        "id=",
+    ] {
+        if let Some(id) = extract_identifier_from_url_marker(user_text, marker) {
+            return Some(id);
+        }
+    }
+
+    if let Some(caps) = GENERIC_RESOURCE_ID_RE.captures(user_text) {
+        if let Some(matched) = caps.get(1) {
+            if let Some(id) = clean_identifier_candidate(matched.as_str()) {
+                return Some(id);
+            }
+        }
+    }
+
+    if let Some(id) = extract_identifier_after_keyword(
+        user_text,
+        &[
+            "file id",
+            "file_id",
+            "document id",
+            "document_id",
+            "spreadsheet id",
+            "spreadsheet_id",
+            "presentation id",
+            "presentation_id",
+            "id",
+        ],
+    ) {
+        return Some(id);
+    }
+
+    if let Some(caps) = QUOTED_TEXT_RE.captures(user_text) {
+        if let Some(matched) = caps.get(1).or_else(|| caps.get(2)) {
+            let candidate = matched.as_str().trim();
+            if candidate.len() >= 15 {
+                return clean_identifier_candidate(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+fn infer_gmail_message_id(user_text: &str) -> Option<String> {
+    if let Some(caps) = GMAIL_MESSAGE_ID_RE.captures(user_text) {
+        if let Some(matched) = caps.get(1) {
+            if let Some(id) = clean_identifier_candidate(matched.as_str()) {
+                return Some(id);
+            }
+        }
+    }
+
+    for marker in ["/#inbox/", "/#all/", "/#sent/"] {
+        if let Some(id) = extract_identifier_from_url_marker(user_text, marker) {
+            return Some(id);
+        }
+    }
+
+    let lower = user_text.to_ascii_lowercase();
+    if lower.contains("gmail") || lower.contains("email") || lower.contains("mail") {
+        return extract_identifier_after_keyword(user_text, &["message id", "message_id", "id"]);
+    }
+
+    None
+}
+
+fn infer_calendar_event_id(user_text: &str) -> Option<String> {
+    if let Some(caps) = CALENDAR_EVENT_ID_RE.captures(user_text) {
+        if let Some(matched) = caps.get(1) {
+            if let Some(id) = clean_identifier_candidate(matched.as_str()) {
+                return Some(id);
+            }
+        }
+    }
+
+    let lower = user_text.to_ascii_lowercase();
+    if lower.contains("calendar") || lower.contains("meeting") || lower.contains("event") {
+        return extract_identifier_after_keyword(user_text, &["event id", "event_id", "id"]);
+    }
+
+    None
+}
+
+fn infer_docs_edit_text(user_text: &str) -> Option<String> {
+    if let Some(caps) = QUOTED_TEXT_RE.captures(user_text) {
+        if let Some(matched) = caps.get(1).or_else(|| caps.get(2)) {
+            if let Some(text) = clean_content_candidate(matched.as_str()) {
+                return Some(text);
+            }
+        }
+    }
+
+    if let Some(caps) = APPEND_TEXT_RE.captures(user_text) {
+        if let Some(matched) = caps.get(1) {
+            if let Some(text) = clean_content_candidate(matched.as_str()) {
+                return Some(text);
+            }
+        }
+    }
+
+    None
+}
+
+fn infer_sheet_range(user_text: &str) -> Option<String> {
+    let caps = SHEETS_RANGE_RE.captures(user_text)?;
+    let matched = caps.get(1)?.as_str().trim();
+    if matched.is_empty() {
+        None
+    } else {
+        Some(matched.to_string())
+    }
+}
+
+fn infer_sheet_single_value(user_text: &str) -> Option<String> {
+    if let Some(caps) = QUOTED_TEXT_RE.captures(user_text) {
+        if let Some(matched) = caps.get(1).or_else(|| caps.get(2)) {
+            return clean_content_candidate(matched.as_str());
+        }
+    }
+
+    let lower = user_text.to_ascii_lowercase();
+    for marker in [" to ", " value is ", " value ", " as "] {
+        if let Some(idx) = lower.rfind(marker) {
+            let start = idx + marker.len();
+            if let Some(rest) = user_text.get(start..) {
+                let candidate = rest
+                    .trim_start()
+                    .split(|c: char| matches!(c, '\n' | '\r' | ',' | ';' | '!'))
+                    .next()
+                    .unwrap_or("")
+                    .trim();
+                if let Some(value) = clean_content_candidate(candidate) {
+                    return Some(value);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn looks_like_send_confirmation_prompt(user_text: &str) -> bool {
+    SEND_CONFIRMATION_RE.is_match(user_text.trim())
+}
+
+fn infer_confirmation_send_query_from_history(
+    last_user_text: &str,
+    messages: &[ChatMessage],
+) -> Option<String> {
+    if !looks_like_send_confirmation_prompt(last_user_text) {
+        return None;
+    }
+
+    let mut to: Option<String> = None;
+    let mut body: Option<String> = None;
+    let mut subject: Option<String> = None;
+    let mut skipped_current = false;
+
+    for message in messages.iter().rev() {
+        if message.role != "user" {
+            continue;
+        }
+
+        if !skipped_current && message.content.trim() == last_user_text.trim() {
+            skipped_current = true;
+            continue;
+        }
+
+        if to.is_none() {
+            to = CALENDAR_ATTENDEE_EMAIL_RE
+                .captures(&message.content)
+                .and_then(|caps| caps.get(1))
+                .map(|m| m.as_str().trim().to_ascii_lowercase());
+        }
+
+        if body.is_none() {
+            body = infer_gmail_send_body(&message.content);
+        }
+
+        if subject.is_none() {
+            if let Some(existing_body) = body.as_deref() {
+                subject = Some(infer_gmail_send_subject(&message.content, existing_body));
+            }
+        }
+
+        if to.is_some() && body.is_some() {
+            break;
+        }
+    }
+
+    let to = to?;
+    let body = body?;
+    let subject = subject.unwrap_or_else(|| infer_gmail_send_subject(last_user_text, &body));
+    let safe_body = body.replace('"', "'");
+    let safe_subject = subject.replace('"', "'");
+
+    Some(format!(
+        "Send \"{}\" mail to {} subject \"{}\"",
+        safe_body, to, safe_subject
+    ))
+}
+
+fn resolve_intent_fallback_query(last_user_text: &str, messages: &[ChatMessage]) -> String {
+    infer_confirmation_send_query_from_history(last_user_text, messages)
+        .unwrap_or_else(|| last_user_text.trim().to_string())
+}
+
+// ─── App-lifecycle intent extractors ─────────────────────────────────────────
+
+/// Extract the application name from utterances like "open chrome", "launch vscode", "start spotify".
+fn extract_app_name_from_query(text: &str) -> Option<String> {
+    let lower = text.to_lowercase();
+    let prefixes = ["open ", "launch ", "start ", "run "];
+    for prefix in prefixes {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            let name = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .to_string();
+            if !name.is_empty() {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
+/// Extract a bare https?:// URL from the query text.
+fn extract_url_from_query(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .find(|w| w.starts_with("http://") || w.starts_with("https://"))
+        .map(|s| s.trim_end_matches(&['.', ',', ')', ']', ';'][..]).to_string())
+}
+
+/// Extract (search_query, optional_site) from utterances like:
+/// - "open Chrome and search for lo-fi music"
+/// - "search YouTube for relaxing music"
+/// - "play Shape of You on YouTube"
+fn extract_browser_search_intent(text: &str) -> (String, Option<String>) {
+    let lower = text.to_lowercase();
+
+    // Detect site preference.
+    let site: Option<String> = if lower.contains("youtube") || lower.contains(" yt ") {
+        Some("youtube".into())
+    } else {
+        None
+    };
+
+    // Strip out the site/app name and leading verb phrases, leaving the actual query.
+    let after_verb = ["search for ", "search ", "google ", "look up ", "find ", "play "]
+        .iter()
+        .find_map(|prefix| lower.find(prefix).map(|i| text[i + prefix.len()..].trim().to_string()));
+
+    let query = after_verb.unwrap_or_else(|| {
+        // Fallback: strip "open <app> and" prefix, take the rest.
+        let s = lower
+            .strip_prefix("open ")
+            .and_then(|s| s.splitn(2, " and ").nth(1))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| text.trim().to_string());
+        s
+    });
+
+    // Remove "on youtube", "on chrome", "in browser" suffixes.
+    let suffixes = [" on youtube", " on chrome", " on firefox", " in browser", " on youtube.com", " in youtube"];
+    let clean_query = suffixes
+        .iter()
+        .fold(query.to_lowercase(), |q, suf| {
+            q.trim_end_matches(suf.trim()).trim().to_string()
+        });
+
+    let final_query = if clean_query.is_empty() { text.trim().to_string() } else { clean_query };
+    (final_query, site)
+}
+
+/// Extract (app, contact_name, body) from utterances like:
+/// - "WhatsApp Anjali 'are you free?'"
+/// - "text Anjali hey"
+/// - "send a WhatsApp to Anjali saying hello"
+fn extract_send_message_intent(text: &str) -> (String, String, String) {
+    let lower = text.to_lowercase();
+
+    // Detect messaging app.
+    let app = if lower.contains("telegram") {
+        "telegram"
+    } else if lower.contains("signal") {
+        "signal"
+    } else if lower.contains("gmail") || lower.contains("email") || lower.contains("mail") {
+        "gmail"
+    } else {
+        "whatsapp" // default
+    };
+
+    // Find contact name — the first capitalised word after the verb / app name.
+    // This is a best-effort heuristic; proper NLP lives in the LLM layer.
+    let trigger_words = ["to ", "message ", "text ", "msg "];
+    let contact_start = trigger_words
+        .iter()
+        .find_map(|tw| lower.find(tw).map(|i| i + tw.len()));
+
+    let (contact, body_start_idx) = if let Some(start) = contact_start {
+        let words: Vec<&str> = text[start..].split_whitespace().collect();
+        let name = words.first().copied().unwrap_or("").to_string();
+        let body_start = start + name.len() + 1;
+        (name, body_start.min(text.len()))
+    } else {
+        (String::new(), text.len())
+    };
+
+    // Rest of the text after the contact name is the message body.
+    let body_raw = text[body_start_idx..].trim();
+    // Strip common connective words.
+    let body = ["saying ", "say ", "with message ", "message "]
+        .iter()
+        .find_map(|prefix| body_raw.strip_prefix(prefix))
+        .unwrap_or(body_raw)
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim()
+        .to_string();
+
+    (app.to_string(), contact, body)
+}
+
+
+
 fn infer_file_search_kind(text_lower: &str) -> &'static str {
     if text_lower.contains("folder") || text_lower.contains("directory") {
         "dir"
@@ -830,6 +1471,100 @@ fn looks_like_google_workspace_request(text_lower: &str) -> bool {
     ]
     .iter()
     .any(|needle| text_lower.contains(needle))
+}
+
+fn looks_like_colab_request(text_lower: &str) -> bool {
+    [
+        "colab",
+        "google colab",
+        "notebook",
+        "jupyter",
+        "python notebook",
+        "cell",
+        "run code",
+        "train model",
+    ]
+    .iter()
+    .any(|needle| text_lower.contains(needle))
+}
+
+fn routing_focus_text_from_user_content(user_text: &str) -> String {
+    const IMAGE_PROMPT_MARKER: &str = "\n\nImage attachment is already included for this turn.";
+
+    if let Some((prefix, _)) = user_text.split_once(IMAGE_PROMPT_MARKER) {
+        let trimmed = prefix.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    user_text.trim().to_string()
+}
+
+fn looks_like_pure_image_analysis_request(text_lower: &str) -> bool {
+    let has_image_context = [
+        "image",
+        "photo",
+        "picture",
+        "screenshot",
+        "screen",
+        "scan",
+    ]
+    .iter()
+    .any(|needle| text_lower.contains(needle));
+
+    let has_analysis_intent = [
+        "analy",
+        "describe",
+        "what is",
+        "what's in",
+        "identify",
+        "detect",
+        "read",
+        "extract",
+        "ocr",
+        "summar",
+    ]
+    .iter()
+    .any(|needle| text_lower.contains(needle));
+
+    let has_non_image_action = [
+        "gmail",
+        "email",
+        "calendar",
+        "drive",
+        "doc",
+        "spreadsheet",
+        "sheet",
+        "slides",
+        "form",
+        "install",
+        "uninstall",
+        "delete",
+        "remove",
+        "rename",
+        "move",
+        "copy",
+        "web search",
+        "news",
+        "git",
+    ]
+    .iter()
+    .any(|needle| text_lower.contains(needle));
+
+    has_image_context && has_analysis_intent && !has_non_image_action
+}
+
+fn is_tool_allowed_for_image_focus(def: &ToolDef) -> bool {
+    if def.category.eq_ignore_ascii_case("vision") {
+        return true;
+    }
+
+    let name = def.name.to_ascii_lowercase();
+    name.contains("image")
+        || name.contains("ocr")
+        || name.contains("vision")
+        || name == "screenshot_analyze"
 }
 
 fn looks_like_drive_list_request(text_lower: &str) -> bool {
@@ -1053,6 +1788,42 @@ fn build_fallback_call_for_hint(
                 }),
             })
         }
+        "gw_gmail_send" if allowed_tool_names.contains("gw_gmail_send") => {
+            let args = infer_gmail_send_arguments(user_query)?;
+            Some(ParsedToolCall {
+                name: "gw_gmail_send".into(),
+                arguments: args,
+            })
+        }
+        "gw_gmail_read" if allowed_tool_names.contains("gw_gmail_read") => {
+            let message_id = infer_gmail_message_id(user_query)?;
+            Some(ParsedToolCall {
+                name: "gw_gmail_read".into(),
+                arguments: serde_json::json!({
+                    "message_id": message_id,
+                }),
+            })
+        }
+        "gw_gmail_delete" if allowed_tool_names.contains("gw_gmail_delete") => {
+            if let Some(message_id) = infer_gmail_message_id(user_query) {
+                Some(ParsedToolCall {
+                    name: "gw_gmail_delete".into(),
+                    arguments: serde_json::json!({
+                        "message_id": message_id,
+                    }),
+                })
+            } else if allowed_tool_names.contains("gw_gmail_search") {
+                Some(ParsedToolCall {
+                    name: "gw_gmail_search".into(),
+                    arguments: serde_json::json!({
+                        "query": infer_gmail_search_query(user_query),
+                        "max_results": 1,
+                    }),
+                })
+            } else {
+                None
+            }
+        }
         "gw_calendar_today" if allowed_tool_names.contains("gw_calendar_today") => {
             Some(ParsedToolCall {
                 name: "gw_calendar_today".into(),
@@ -1072,6 +1843,25 @@ fn build_fallback_call_for_hint(
                 Some(ParsedToolCall {
                     name: "gw_calendar_create".into(),
                     arguments: args,
+                })
+            } else if allowed_tool_names.contains("gw_calendar_search") {
+                Some(ParsedToolCall {
+                    name: "gw_calendar_search".into(),
+                    arguments: serde_json::json!({
+                        "query": user_query,
+                    }),
+                })
+            } else {
+                None
+            }
+        }
+        "gw_calendar_delete" if allowed_tool_names.contains("gw_calendar_delete") => {
+            if let Some(event_id) = infer_calendar_event_id(user_query) {
+                Some(ParsedToolCall {
+                    name: "gw_calendar_delete".into(),
+                    arguments: serde_json::json!({
+                        "event_id": event_id,
+                    }),
                 })
             } else if allowed_tool_names.contains("gw_calendar_search") {
                 Some(ParsedToolCall {
@@ -1105,12 +1895,90 @@ fn build_fallback_call_for_hint(
                 arguments: serde_json::json!({}),
             })
         }
+        "gw_drive_read" if allowed_tool_names.contains("gw_drive_read") => {
+            if let Some(file_id) = infer_google_resource_id(user_query) {
+                Some(ParsedToolCall {
+                    name: "gw_drive_read".into(),
+                    arguments: serde_json::json!({
+                        "file_id": file_id,
+                    }),
+                })
+            } else if allowed_tool_names.contains("gw_drive_search") {
+                Some(ParsedToolCall {
+                    name: "gw_drive_search".into(),
+                    arguments: serde_json::json!({
+                        "query": user_query,
+                    }),
+                })
+            } else {
+                None
+            }
+        }
+        "gw_drive_delete" if allowed_tool_names.contains("gw_drive_delete") => {
+            if let Some(file_id) = infer_google_resource_id(user_query) {
+                Some(ParsedToolCall {
+                    name: "gw_drive_delete".into(),
+                    arguments: serde_json::json!({
+                        "file_id": file_id,
+                    }),
+                })
+            } else if allowed_tool_names.contains("gw_drive_search") {
+                Some(ParsedToolCall {
+                    name: "gw_drive_search".into(),
+                    arguments: serde_json::json!({
+                        "query": user_query,
+                    }),
+                })
+            } else {
+                None
+            }
+        }
         "gw_docs_create" if allowed_tool_names.contains("gw_docs_create") => Some(ParsedToolCall {
             name: "gw_docs_create".into(),
             arguments: serde_json::json!({
                 "title": infer_title(user_query, "Untitled Document"),
             }),
         }),
+        "gw_docs_read" if allowed_tool_names.contains("gw_docs_read") => {
+            if let Some(document_id) = infer_google_resource_id(user_query) {
+                Some(ParsedToolCall {
+                    name: "gw_docs_read".into(),
+                    arguments: serde_json::json!({
+                        "document_id": document_id,
+                    }),
+                })
+            } else if allowed_tool_names.contains("gw_drive_search") {
+                Some(ParsedToolCall {
+                    name: "gw_drive_search".into(),
+                    arguments: serde_json::json!({
+                        "query": user_query,
+                    }),
+                })
+            } else {
+                None
+            }
+        }
+        "gw_docs_edit" if allowed_tool_names.contains("gw_docs_edit") => {
+            let text = infer_docs_edit_text(user_query)?;
+            if let Some(document_id) = infer_google_resource_id(user_query) {
+                Some(ParsedToolCall {
+                    name: "gw_docs_edit".into(),
+                    arguments: serde_json::json!({
+                        "document_id": document_id,
+                        "text": text,
+                    }),
+                })
+            } else if allowed_tool_names.contains("gw_drive_search") {
+                Some(ParsedToolCall {
+                    name: "gw_drive_search".into(),
+                    arguments: serde_json::json!({
+                        "query": user_query,
+                    }),
+                })
+            } else {
+                None
+            }
+        }
         "gw_sheets_create" if allowed_tool_names.contains("gw_sheets_create") => {
             Some(ParsedToolCall {
                 name: "gw_sheets_create".into(),
@@ -1119,6 +1987,50 @@ fn build_fallback_call_for_hint(
                 }),
             })
         }
+        "gw_sheets_read" if allowed_tool_names.contains("gw_sheets_read") => {
+            if let Some(spreadsheet_id) = infer_google_resource_id(user_query) {
+                Some(ParsedToolCall {
+                    name: "gw_sheets_read".into(),
+                    arguments: serde_json::json!({
+                        "spreadsheet_id": spreadsheet_id,
+                    }),
+                })
+            } else if allowed_tool_names.contains("gw_drive_search") {
+                Some(ParsedToolCall {
+                    name: "gw_drive_search".into(),
+                    arguments: serde_json::json!({
+                        "query": user_query,
+                    }),
+                })
+            } else {
+                None
+            }
+        }
+        "gw_sheets_edit" if allowed_tool_names.contains("gw_sheets_edit") => {
+            let range = infer_sheet_range(user_query)?;
+            let value = infer_sheet_single_value(user_query)?;
+            let values = serde_json::to_string(&vec![vec![value]]).ok()?;
+
+            if let Some(spreadsheet_id) = infer_google_resource_id(user_query) {
+                Some(ParsedToolCall {
+                    name: "gw_sheets_edit".into(),
+                    arguments: serde_json::json!({
+                        "spreadsheet_id": spreadsheet_id,
+                        "range": range,
+                        "values": values,
+                    }),
+                })
+            } else if allowed_tool_names.contains("gw_drive_search") {
+                Some(ParsedToolCall {
+                    name: "gw_drive_search".into(),
+                    arguments: serde_json::json!({
+                        "query": user_query,
+                    }),
+                })
+            } else {
+                None
+            }
+        }
         "gw_slides_create" if allowed_tool_names.contains("gw_slides_create") => {
             Some(ParsedToolCall {
                 name: "gw_slides_create".into(),
@@ -1126,6 +2038,25 @@ fn build_fallback_call_for_hint(
                     "title": infer_title(user_query, "Untitled Presentation"),
                 }),
             })
+        }
+        "gw_slides_read" if allowed_tool_names.contains("gw_slides_read") => {
+            if let Some(presentation_id) = infer_google_resource_id(user_query) {
+                Some(ParsedToolCall {
+                    name: "gw_slides_read".into(),
+                    arguments: serde_json::json!({
+                        "presentation_id": presentation_id,
+                    }),
+                })
+            } else if allowed_tool_names.contains("gw_drive_search") {
+                Some(ParsedToolCall {
+                    name: "gw_drive_search".into(),
+                    arguments: serde_json::json!({
+                        "query": user_query,
+                    }),
+                })
+            } else {
+                None
+            }
         }
         "gw_forms_list" if allowed_tool_names.contains("gw_forms_list") => Some(ParsedToolCall {
             name: "gw_forms_list".into(),
@@ -1226,6 +2157,63 @@ fn build_fallback_call_for_hint(
                 "max_results": 8,
             }),
         }),
+        // ── App lifecycle ─────────────────────────────────────────────────────
+
+        "open_application" if allowed_tool_names.contains("open_application") => {
+            // Extract the app name: "open <name>" / "launch <name>" / "start <name>"
+            let app_name = extract_app_name_from_query(user_query).unwrap_or_else(|| user_query.trim().to_string());
+            Some(ParsedToolCall {
+                name: "open_application".into(),
+                arguments: serde_json::json!({
+                    "name": app_name,
+                }),
+            })
+        }
+        "open_url" if allowed_tool_names.contains("open_url") => {
+            // Extract the first https?:// URL from the query.
+            let url = extract_url_from_query(user_query).unwrap_or_else(|| user_query.trim().to_string());
+            Some(ParsedToolCall {
+                name: "open_url".into(),
+                arguments: serde_json::json!({ "url": url }),
+            })
+        }
+        "browser_search" if allowed_tool_names.contains("browser_search") => {
+            // Extract the search query and optional site (youtube or default google).
+            let (search_query, site) = extract_browser_search_intent(user_query);
+            let mut args = serde_json::json!({ "query": search_query });
+            if let Some(s) = site {
+                args["site"] = serde_json::Value::String(s);
+            }
+            Some(ParsedToolCall {
+                name: "browser_search".into(),
+                arguments: args,
+            })
+        }
+        // Fallback: if browser_search not registered but open_application is, open the browser.
+        "browser_search" if allowed_tool_names.contains("open_application") => {
+            let (search_query, site) = extract_browser_search_intent(user_query);
+            let _ = site; // best-effort: just open the browser
+            Some(ParsedToolCall {
+                name: "open_application".into(),
+                arguments: serde_json::json!({ "name": "browser", "query": search_query }),
+            })
+        }
+        "send_message" if allowed_tool_names.contains("send_message") => {
+            // Extract messaging app, contact name, and message body.
+            // Note: contact_identifier intentionally left blank here — the LLM or
+            // contact-resolution step must fill it in. If the tool receives an empty
+            // identifier it will return an error asking for clarification.
+            let (app, contact, body) = extract_send_message_intent(user_query);
+            Some(ParsedToolCall {
+                name: "send_message".into(),
+                arguments: serde_json::json!({
+                    "app": app,
+                    "contact_name": contact,
+                    "contact_identifier": "",  // must be resolved before dispatch
+                    "body": body,
+                }),
+            })
+        }
         _ => None,
     }
 }
@@ -1240,12 +2228,92 @@ fn build_intent_fallback_tool_call(
         } else {
             forced_query.trim()
         };
-        return build_fallback_call_for_hint(&forced_tool, query, allowed_tool_names);
+
+        if let Some(call) = build_fallback_call_for_hint(&forced_tool, query, allowed_tool_names) {
+            return Some(call);
+        }
+
+        // Generic fallback for locked/dynamic tools (for example MCP tools discovered at runtime).
+        if allowed_tool_names.contains(&forced_tool) {
+            let arguments = if query.trim().is_empty() {
+                serde_json::json!({})
+            } else if let Ok(value) = serde_json::from_str::<serde_json::Value>(query) {
+                if value.is_object() {
+                    value
+                } else {
+                    serde_json::json!({ "input": value })
+                }
+            } else {
+                serde_json::json!({ "query": query })
+            };
+
+            return Some(ParsedToolCall {
+                name: forced_tool,
+                arguments,
+            });
+        }
+
+        return None;
     }
 
     let intent = IntentRouter::classify(user_text);
     let hint = intent.tool_hint?;
     let user_query = user_text.trim();
+
+    // Colab requests: override hint with the correct Colab flow entry-point.
+    if looks_like_colab_request(&user_text.to_ascii_lowercase()) {
+        if let Some((colab_intent, title, code)) = detect_colab_intent(user_text) {
+            match colab_intent {
+                ColabIntent::CreateNotebook => {
+                    let full_title = title
+                        .as_deref()
+                        .map(|t| if t.ends_with(".ipynb") { t.to_string() } else { format!("{}.ipynb", t) })
+                        .unwrap_or_else(|| "Untitled.ipynb".to_string());
+                    if allowed_tool_names.contains("gw_drive_create") {
+                        return Some(ParsedToolCall {
+                            name: "gw_drive_create".into(),
+                            arguments: serde_json::json!({
+                                "title": full_title,
+                                "mime_type": "application/vnd.google.colab",
+                            }),
+                        });
+                    }
+                    if allowed_tool_names.contains("mcp_colab-mcp_open_colab_browser_connection") {
+                        return Some(ParsedToolCall {
+                            name: "mcp_colab-mcp_open_colab_browser_connection".into(),
+                            arguments: serde_json::json!({}),
+                        });
+                    }
+                }
+                ColabIntent::OpenNotebook | ColabIntent::Generic => {
+                    if allowed_tool_names.contains("mcp_colab-mcp_open_colab_browser_connection") {
+                        return Some(ParsedToolCall {
+                            name: "mcp_colab-mcp_open_colab_browser_connection".into(),
+                            arguments: serde_json::json!({}),
+                        });
+                    }
+                }
+                ColabIntent::ExecuteCode => {
+                    // Gate: connection must be established first; let ColabFlowState handle it.
+                    if allowed_tool_names.contains("mcp_colab-mcp_open_colab_browser_connection") {
+                        return Some(ParsedToolCall {
+                            name: "mcp_colab-mcp_open_colab_browser_connection".into(),
+                            arguments: serde_json::json!({}),
+                        });
+                    }
+                    if let Some(snippet) = code {
+                        if allowed_tool_names.contains("mcp_colab-mcp_execute_cell") {
+                            return Some(ParsedToolCall {
+                                name: "mcp_colab-mcp_execute_cell".into(),
+                                arguments: serde_json::json!({ "code": snippet }),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     build_fallback_call_for_hint(hint.as_str(), user_query, allowed_tool_names)
 }
 
@@ -1262,13 +2330,23 @@ fn tool_choice_label(name: &str) -> String {
         "search_news" => "News Search".into(),
         "web_search" | "searxng_search" => "Web Search".into(),
         "search_files" | "find_files_by_pattern" | "mcp_fs_search_files" => "File Search".into(),
-        "gw_gmail_inbox" | "gw_gmail_search" => "Gmail".into(),
-        "gw_calendar_today" | "gw_calendar_search" | "gw_calendar_create" => "Google Calendar".into(),
-        "gw_drive_search" | "gw_drive_list" | "gw_drive_read" => "Google Drive".into(),
+        "open_application" => "Open App".into(),
+        "open_url" => "Open URL".into(),
+        "browser_search" => "Browser Search".into(),
+        "send_message" => "Send Message".into(),
+        "close_application" | "kill_process" => "Close App".into(),
+        "gw_gmail_inbox" | "gw_gmail_search" | "gw_gmail_read" | "gw_gmail_send"
+        | "gw_gmail_delete" => "Gmail".into(),
+        "gw_calendar_today" | "gw_calendar_search" | "gw_calendar_create"
+        | "gw_calendar_delete" => "Google Calendar".into(),
+        "gw_drive_search" | "gw_drive_list" | "gw_drive_read" | "gw_drive_delete" => {
+            "Google Drive".into()
+        }
         "gw_docs_create" | "gw_docs_read" | "gw_docs_edit" => "Google Docs".into(),
         "gw_sheets_create" | "gw_sheets_read" | "gw_sheets_edit" => "Google Sheets".into(),
         "gw_slides_create" | "gw_slides_read" => "Google Slides".into(),
         "gw_forms_list" | "gw_forms_create" => "Google Forms".into(),
+        other if other.starts_with("mcp_") && other.contains("colab") => "Google Colab".into(),
         other => other.to_string(),
     }
 }
@@ -1362,12 +2440,15 @@ fn build_tool_choice_candidates(
     if looks_like_google_workspace_request(&lower) {
         for tool in [
             "gw_gmail_inbox",
+            "gw_gmail_search",
+            "gw_gmail_send",
             "gw_calendar_search",
+            "gw_calendar_create",
             "gw_drive_list",
             "gw_drive_search",
-            "gw_docs_create",
-            "gw_sheets_create",
-            "gw_slides_create",
+            "gw_docs_read",
+            "gw_sheets_read",
+            "gw_slides_read",
             "gw_forms_list",
         ] {
             push_tool_choice_candidate(
@@ -1375,6 +2456,22 @@ fn build_tool_choice_candidates(
                 allowed_tool_names,
                 tool,
                 "Google Workspace request detected",
+                0.56,
+            );
+        }
+    }
+
+    if looks_like_colab_request(&lower) {
+        for tool in allowed_tool_names
+            .iter()
+            .filter(|name| name.starts_with("mcp_") && name.contains("colab"))
+            .take(6)
+        {
+            push_tool_choice_candidate(
+                &mut candidates,
+                allowed_tool_names,
+                tool,
+                "Google Colab request detected",
                 0.56,
             );
         }
@@ -1628,6 +2725,322 @@ fn compact_tool_result_for_llm(tool_name: &str, tool_result: &serde_json::Value)
     }
 
     compact_gmail_payload_for_llm(tool_result)
+}
+
+// ─── Colab workflow state machine ────────────────────────────────────────────
+
+/// What the user ultimately wants to do in Google Colab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColabIntent {
+    /// Create a new .ipynb notebook (via Google Drive, then open in Colab).
+    CreateNotebook,
+    /// Open an existing notebook URL in Colab.
+    OpenNotebook,
+    /// Execute code in the currently active Colab notebook.
+    ExecuteCode,
+    /// General Colab request that needs the browser bridge but nothing specific.
+    Generic,
+}
+
+/// Multi-step state machine that orchestrates the Colab workflow:
+///   1. For CreateNotebook: drive_create → open_colab_browser_connection
+///   2. For OpenNotebook / ExecuteCode / Generic: open_colab_browser_connection → (execute_cell)
+#[derive(Debug, Clone)]
+struct ColabFlowState {
+    intent: ColabIntent,
+    /// Notebook title supplied by the user (for CreateNotebook).
+    notebook_title: Option<String>,
+    /// Code supplied by the user (for ExecuteCode).
+    code_snippet: Option<String>,
+    /// Whether Drive file creation was attempted (CreateNotebook only).
+    drive_create_attempted: bool,
+    /// Whether Drive file creation succeeded and what the file ID is.
+    drive_file_id: Option<String>,
+    /// Whether open_colab_browser_connection has been called.
+    browser_open_attempted: bool,
+    /// Whether the browser session is confirmed connected.
+    browser_connected: bool,
+    /// Whether a code execute call has been dispatched.
+    execute_attempted: bool,
+}
+
+impl ColabFlowState {
+    fn from_user_text(text: &str) -> Option<Self> {
+        let (intent, title, code) = detect_colab_intent(text)?;
+        Some(Self {
+            intent,
+            notebook_title: title,
+            code_snippet: code,
+            drive_create_attempted: false,
+            drive_file_id: None,
+            browser_open_attempted: false,
+            browser_connected: false,
+            execute_attempted: false,
+        })
+    }
+
+    /// Drive-create tool call for CreateNotebook flow.
+    fn drive_create_call(&self) -> ParsedToolCall {
+        let title = self
+            .notebook_title
+            .as_deref()
+            .unwrap_or("Untitled Notebook");
+        // gworkspace MCP creates a Google Doc; we use the same pattern but
+        // flag it as an ipynb by appending the extension in the title.
+        let full_title = if title.ends_with(".ipynb") {
+            title.to_string()
+        } else {
+            format!("{}.ipynb", title)
+        };
+        ParsedToolCall {
+            name: "gw_drive_create".into(),
+            arguments: serde_json::json!({
+                "title": full_title,
+                "mime_type": "application/vnd.google.colab",
+            }),
+        }
+    }
+
+    /// Browser-connection bootstrap call.
+    fn browser_open_call() -> ParsedToolCall {
+        ParsedToolCall {
+            name: "mcp_colab-mcp_open_colab_browser_connection".into(),
+            arguments: serde_json::json!({}),
+        }
+    }
+
+    /// Execute-cell call (only for ExecuteCode intent).
+    fn execute_call(&self) -> Option<ParsedToolCall> {
+        let code = self.code_snippet.as_deref()?;
+        Some(ParsedToolCall {
+            name: "mcp_colab-mcp_execute_cell".into(),
+            arguments: serde_json::json!({ "code": code }),
+        })
+    }
+
+    /// Returns the next forced calls for this workflow, if any.
+    fn next_required_calls(&self, allowed_tool_names: &std::collections::HashSet<String>) -> Vec<ParsedToolCall> {
+        // Step 1 (CreateNotebook only): create the Drive file first.
+        if self.intent == ColabIntent::CreateNotebook && !self.drive_create_attempted {
+            let call = self.drive_create_call();
+            if allowed_tool_names.contains(&call.name) {
+                return vec![call];
+            }
+            // Drive tool not available — fall through to browser open.
+        }
+
+        // Step 2: open the browser connection (once Drive file exists or not needed).
+        if !self.browser_open_attempted {
+            let call = Self::browser_open_call();
+            if allowed_tool_names.contains(&call.name) {
+                return vec![call];
+            }
+        }
+
+        // Step 3 (ExecuteCode only): execute after browser is confirmed connected.
+        if self.intent == ColabIntent::ExecuteCode && self.browser_connected && !self.execute_attempted {
+            if let Some(call) = self.execute_call() {
+                if allowed_tool_names.contains(&call.name) {
+                    return vec![call];
+                }
+            }
+        }
+
+        vec![]
+    }
+
+    fn observe_tool_result(&mut self, call: &ParsedToolCall, success: bool, data: &serde_json::Value) {
+        match call.name.as_str() {
+            "gw_drive_create" => {
+                self.drive_create_attempted = true;
+                if success {
+                    self.drive_file_id = data
+                        .get("id")
+                        .or_else(|| data.get("file_id"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                }
+            }
+            n if n.contains("open_colab_browser_connection") => {
+                self.browser_open_attempted = true;
+                // The tool returns {result: true/false}.
+                let connected = data.get("result").and_then(|v| v.as_bool()).unwrap_or(success);
+                self.browser_connected = connected;
+            }
+            n if n.contains("execute_cell") => {
+                self.execute_attempted = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn status_summary(&self) -> String {
+        match self.intent {
+            ColabIntent::CreateNotebook => {
+                if self.browser_connected {
+                    format!(
+                        "Notebook '{}' created on Drive and opened in Colab.",
+                        self.notebook_title.as_deref().unwrap_or("Untitled")
+                    )
+                } else if self.drive_create_attempted {
+                    format!(
+                        "Notebook '{}' created on Drive. Opening Colab browser...",
+                        self.notebook_title.as_deref().unwrap_or("Untitled")
+                    )
+                } else {
+                    "Creating notebook on Google Drive...".into()
+                }
+            }
+            ColabIntent::OpenNotebook => {
+                if self.browser_connected {
+                    "Colab notebook opened in browser.".into()
+                } else {
+                    "Opening Colab browser connection...".into()
+                }
+            }
+            ColabIntent::ExecuteCode => {
+                if self.execute_attempted {
+                    "Code dispatched to Colab.".into()
+                } else if self.browser_connected {
+                    "Browser connected. Executing code...".into()
+                } else {
+                    "Connecting to Colab browser...".into()
+                }
+            }
+            ColabIntent::Generic => {
+                if self.browser_connected {
+                    "Colab browser connection established.".into()
+                } else {
+                    "Connecting to Colab browser...".into()
+                }
+            }
+        }
+    }
+}
+
+/// Detect whether the user text is a Colab-related request and classify its intent.
+/// Returns `(ColabIntent, optional_title, optional_code)` or `None` if not Colab.
+fn detect_colab_intent(text: &str) -> Option<(ColabIntent, Option<String>, Option<String>)> {
+    let lower = text.to_ascii_lowercase();
+
+    let is_colab = lower.contains("colab")
+        || lower.contains("google colab")
+        || (lower.contains("notebook") && (lower.contains("python") || lower.contains("jupyter") || lower.contains("ipynb")));
+
+    if !is_colab {
+        return None;
+    }
+
+    // Create intent
+    let is_create = ["create", "new", "make", "start a", "open a new", "banao", "bana"]
+        .iter()
+        .any(|kw| lower.contains(kw));
+
+    if is_create {
+        // Extract notebook title if present
+        let title = infer_title(text, "").pipe_nonempty()
+            .or_else(|| extract_notebook_title_from_text(text));
+        return Some((ColabIntent::CreateNotebook, title, None));
+    }
+
+    // Execute intent
+    let is_execute = ["run", "execute", "chalao", "chala", "print(", "import ", "code:"]
+        .iter()
+        .any(|kw| lower.contains(kw));
+
+    if is_execute {
+        let code = extract_code_from_text(text);
+        return Some((ColabIntent::ExecuteCode, None, code));
+    }
+
+    // Open intent
+    let is_open = ["open", "kholo", "kho do", "launch", "set as active", "active"]
+        .iter()
+        .any(|kw| lower.contains(kw));
+
+    if is_open {
+        return Some((ColabIntent::OpenNotebook, None, None));
+    }
+
+    // Generic Colab request
+    Some((ColabIntent::Generic, None, None))
+}
+
+/// Attempt to extract a notebook title from text like "named X" or "called X".
+fn extract_notebook_title_from_text(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    for marker in ["named ", "called ", "name ", "title "] {
+        if let Some(idx) = lower.find(marker) {
+            let rest = text[idx + marker.len()..].trim();
+            let title = rest
+                .split(|c: char| matches!(c, ' ') && !rest[..rest.find(c).unwrap_or(0)].ends_with('.'))
+                .next()
+                .unwrap_or(rest)
+                .trim_matches(|c: char| c == '"' || c == '\'' || c == '`' || c == '.')
+                .trim();
+            if !title.is_empty() {
+                return Some(title.to_string());
+            }
+        }
+    }
+
+    // Try quoted text
+    if let Some(caps) = QUOTED_TEXT_RE.captures(text) {
+        if let Some(m) = caps.get(1).or_else(|| caps.get(2)) {
+            let t = m.as_str().trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+/// Extract inline code from a user request (for execute intent).
+fn extract_code_from_text(text: &str) -> Option<String> {
+    // Fenced code block
+    if let Some(caps) = FENCED_CODE_BLOCK_RE.captures(text) {
+        if let Some(m) = caps.get(1) {
+            let code = m.as_str().trim();
+            if !code.is_empty() {
+                return Some(code.to_string());
+            }
+        }
+    }
+
+    // Backtick inline
+    if let Some(caps) = QUOTED_TEXT_RE.captures(text) {
+        if let Some(m) = caps.get(1).or_else(|| caps.get(2)) {
+            let code = m.as_str().trim();
+            if code.contains('\n') || code.contains('(') {
+                return Some(code.to_string());
+            }
+        }
+    }
+
+    // "run: ..." or "execute: ..."
+    let lower = text.to_ascii_lowercase();
+    for marker in ["run:", "execute:", "code:"] {
+        if let Some(idx) = lower.find(marker) {
+            let rest = text[idx + marker.len()..].trim();
+            if !rest.is_empty() {
+                return Some(rest.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+/// Helper: turn a `String` into `Option<String>`, returning `None` if empty.
+trait PipeNonEmpty {
+    fn pipe_nonempty(self) -> Option<String>;
+}
+impl PipeNonEmpty for String {
+    fn pipe_nonempty(self) -> Option<String> {
+        if self.is_empty() { None } else { Some(self) }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1919,6 +3332,23 @@ pub enum StreamEvent {
         result: serde_json::Value,
         success: bool,
     },
+    /// Mid-execution heartbeat / progress update from a long-running tool.
+    /// `call_id` matches the `name` field of the surrounding `ToolStart`/`ToolEnd`.
+    /// `percent` is `None` when progress is indeterminate.
+    ToolProgress {
+        call_id: String,
+        message: String,
+        percent: Option<u8>,
+    },
+    /// A chunk of the **full** MCP payload streamed directly to the UI.
+    /// The LLM only ever sees the compact summary; the UI can render full data
+    /// by reassembling these chunks.
+    ToolPayloadChunk {
+        call_id: String,
+        seq: u32,
+        is_final: bool,
+        data: serde_json::Value,
+    },
     /// Waiting for HITL approval.
     ApprovalRequired {
         request_id: String,
@@ -1943,6 +3373,114 @@ pub enum StreamEvent {
     Done(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnExecutionMode {
+    Assistant,
+    PromptLab,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptLabToolSelectionStrategy {
+    DirectLockedTool,
+    RoutedWithinLock,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnExecutionProfile {
+    pub mode: TurnExecutionMode,
+    pub app_lock: Option<String>,
+    pub tool_lock: Option<String>,
+    pub prompt_lab_strategy: PromptLabToolSelectionStrategy,
+}
+
+impl TurnExecutionProfile {
+    pub fn assistant() -> Self {
+        Self::default()
+    }
+
+    pub fn prompt_lab(
+        app_lock: Option<String>,
+        tool_lock: Option<String>,
+        prompt_lab_strategy: PromptLabToolSelectionStrategy,
+    ) -> Self {
+        Self {
+            mode: TurnExecutionMode::PromptLab,
+            app_lock: app_lock
+                .map(|value| value.trim().to_ascii_lowercase())
+                .filter(|value| !value.is_empty()),
+            tool_lock: tool_lock
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            prompt_lab_strategy,
+        }
+    }
+
+    fn is_prompt_lab(&self) -> bool {
+        matches!(self.mode, TurnExecutionMode::PromptLab)
+    }
+
+    fn uses_direct_strategy(&self) -> bool {
+        self.is_prompt_lab()
+            && matches!(
+                self.prompt_lab_strategy,
+                PromptLabToolSelectionStrategy::DirectLockedTool
+            )
+    }
+}
+
+impl Default for TurnExecutionProfile {
+    fn default() -> Self {
+        Self {
+            mode: TurnExecutionMode::Assistant,
+            app_lock: None,
+            tool_lock: None,
+            prompt_lab_strategy: PromptLabToolSelectionStrategy::RoutedWithinLock,
+        }
+    }
+}
+
+fn tool_matches_lab_app_lock(tool_name: &str, app_lock: &str) -> bool {
+    let lower = app_lock.to_ascii_lowercase();
+    let tool_name_lower = tool_name.to_ascii_lowercase();
+
+    match lower.as_str() {
+        "gmail" => tool_name_lower.starts_with("gw_gmail_"),
+        "drive" => tool_name_lower.starts_with("gw_drive_"),
+        "docs" => tool_name_lower.starts_with("gw_docs_"),
+        "sheets" => tool_name_lower.starts_with("gw_sheets_"),
+        "calendar" => tool_name_lower.starts_with("gw_calendar_"),
+        "slides" => tool_name_lower.starts_with("gw_slides_"),
+        "forms" => tool_name_lower.starts_with("gw_forms_"),
+        "google" | "gworkspace" | "google_workspace" => tool_name_lower.starts_with("gw_"),
+        "colab" | "google_colab" | "notebook" => {
+            tool_name_lower.starts_with("mcp_") && tool_name_lower.contains("colab")
+        }
+        _ => {
+            if let Some(prefix) = lower.strip_prefix("mcp_") {
+                tool_name_lower.starts_with(&format!("mcp_{}", prefix))
+            } else {
+                false
+            }
+        }
+    }
+}
+
+fn tool_allowed_by_execution_profile(profile: &TurnExecutionProfile, tool_name: &str) -> bool {
+    if !profile.is_prompt_lab() {
+        return true;
+    }
+
+    if let Some(tool_lock) = profile.tool_lock.as_deref() {
+        return tool_name == tool_lock;
+    }
+
+    if let Some(app_lock) = profile.app_lock.as_deref() {
+        return tool_matches_lab_app_lock(tool_name, app_lock);
+    }
+
+    true
+}
+
 /// The core ReAct agent loop.
 pub struct AgentLoop {
     model_router: Arc<ModelRouter>,
@@ -1953,10 +3491,16 @@ pub struct AgentLoop {
     audit_logger: Arc<AuditLogger>,
     #[allow(dead_code)]
     rollback_mgr: Arc<RollbackManager>,
+    /// Semantic router — None until initialised (falls back to regex router).
+    semantic_router: Option<Arc<crate::routing::Router>>,
     max_tool_rounds: usize,
     hardware_tier: String,
     min_confidence_to_act: f32,
     clarify_threshold: f32,
+    /// Per-session cancellation tokens.  A token is inserted when a turn starts
+    /// and removed when it ends.  Calling `cancel_session` cancels all in-flight
+    /// work for that session.
+    active_cancels: Arc<dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
 }
 
 impl AgentLoop {
@@ -1977,11 +3521,19 @@ impl AgentLoop {
             hitl_gateway,
             audit_logger,
             rollback_mgr,
+            semantic_router: None,
             max_tool_rounds: 10,
             hardware_tier: "standard".into(),
             min_confidence_to_act: 0.55,
             clarify_threshold: 0.40,
+            active_cancels: Arc::new(dashmap::DashMap::new()),
         }
+    }
+
+    /// Attach an initialised semantic Router.
+    pub fn with_semantic_router(mut self, router: Arc<crate::routing::Router>) -> Self {
+        self.semantic_router = Some(router);
+        self
     }
 
     /// Override the maximum tool rounds for a single user turn.
@@ -2016,6 +3568,22 @@ impl AgentLoop {
         self
     }
 
+    /// Cancel all in-flight work for `session_id`.
+    ///
+    /// Safe to call from any thread/task.  If no turn is active for the session
+    /// this is a no-op.
+    pub fn cancel_session(&self, session_id: &str) {
+        if let Some(token) = self.active_cancels.get(session_id) {
+            token.cancel();
+        }
+    }
+
+    /// Returns a clone of the per-session cancel map so that the Tauri command
+    /// layer can cancel sessions without holding a reference to `AgentLoop`.
+    pub fn active_cancels(&self) -> Arc<dashmap::DashMap<String, CancellationToken>> {
+        Arc::clone(&self.active_cancels)
+    }
+
     /// Run the agent loop for a single user turn.
     /// Returns a channel of StreamEvents.
     pub async fn run(
@@ -2024,13 +3592,97 @@ impl AgentLoop {
         messages: &mut Vec<ChatMessage>,
         event_tx: mpsc::UnboundedSender<StreamEvent>,
     ) {
+        self.run_with_profile(session_id, messages, event_tx, None)
+            .await;
+    }
+
+    /// Run the agent loop for a single user turn with an optional execution profile.
+    pub async fn run_with_profile(
+        &self,
+        session_id: &str,
+        messages: &mut Vec<ChatMessage>,
+        event_tx: mpsc::UnboundedSender<StreamEvent>,
+        execution_profile: Option<TurnExecutionProfile>,
+    ) {
+        let execution_profile = execution_profile.unwrap_or_default();
+
+        // ── Per-turn cancellation token ────────────────────────────────────────
+        let turn_cancel = CancellationToken::new();
+        self.active_cancels
+            .insert(session_id.to_string(), turn_cancel.clone());
+        // Guard: remove the token from the map when this function returns,
+        // regardless of exit path.
+        struct CancelGuard {
+            map: Arc<dashmap::DashMap<String, CancellationToken>>,
+            key: String,
+        }
+        impl Drop for CancelGuard {
+            fn drop(&mut self) {
+                self.map.remove(&self.key);
+            }
+        }
+        let _cancel_guard = CancelGuard {
+            map: Arc::clone(&self.active_cancels),
+            key: session_id.to_string(),
+        };
+
+        // ── Per-turn error-loop guards ─────────────────────────────────────────
+        // Maps call_dedup_hash(tool, args) -> (failure_count, last_error_msg).
+        let mut failed_calls: HashMap<u64, (u8, String)> = HashMap::new();
+        // Count of *consecutive* tool failures this turn (reset on any success).
+        let mut consecutive_failures: u8 = 0;
+        const MAX_CONSECUTIVE_FAILURES: u8 = 3;
+
+        // ── Per-turn token budget tracker ─────────────────────────────────────
+        // Approximate cumulative tokens consumed by all tool outputs this turn.
+        let mut turn_tool_tokens: usize = 0;
+
         // Check if the user message contains images and route accordingly
         let has_images = messages.last().is_some_and(|m| m.has_images());
+        let last_user_text = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+        let mut routing_focus_text = routing_focus_text_from_user_content(&last_user_text);
+        if execution_profile.uses_direct_strategy() {
+            if let Some(tool_lock) = execution_profile.tool_lock.as_deref() {
+                if extract_forced_tool_directive(&routing_focus_text).is_none() {
+                    routing_focus_text = format!("#tool:{} {}", tool_lock, routing_focus_text);
+                }
+            }
+        }
+        let routing_focus_lower = routing_focus_text.to_lowercase();
+        let pure_image_analysis_turn =
+            has_images && looks_like_pure_image_analysis_request(&routing_focus_lower);
+
+        log_pipeline_step(
+            session_id,
+            "prompt_entered",
+            "Agent loop received prompt",
+            Some(serde_json::json!({
+                "has_images": has_images,
+                "pure_image_analysis_turn": pure_image_analysis_turn,
+                "prompt_lab_mode": execution_profile.is_prompt_lab(),
+                "prompt_lab_strategy": format!("{:?}", execution_profile.prompt_lab_strategy),
+                "app_lock": execution_profile.app_lock.clone(),
+                "tool_lock": execution_profile.tool_lock.clone(),
+                "message_count": messages.len(),
+                "prompt_preview": sanitize_text_for_logs(&routing_focus_text, 260),
+            })),
+        );
 
         let backend = if has_images {
             match self.model_router.route_vision().await {
                 Some(b) => b,
                 None => {
+                    log_pipeline_step(
+                        session_id,
+                        "backend_unavailable",
+                        "No vision backend available",
+                        Some(serde_json::json!({ "requested": "vision" })),
+                    );
                     let _ = event_tx.send(StreamEvent::Error("no vision backend available".into()));
                     return;
                 }
@@ -2039,21 +3691,58 @@ impl AgentLoop {
             match self.model_router.route("chat").await {
                 Some(b) => b,
                 None => {
+                    log_pipeline_step(
+                        session_id,
+                        "backend_unavailable",
+                        "No chat backend available",
+                        Some(serde_json::json!({ "requested": "chat" })),
+                    );
                     let _ = event_tx.send(StreamEvent::Error("no LLM backend available".into()));
                     return;
                 }
             }
         };
 
+        log_pipeline_step(
+            session_id,
+            "backend_selected",
+            "Model backend selected",
+            Some(serde_json::json!({
+                "model_label": backend.model_label(),
+                "capabilities": backend.capabilities(),
+            })),
+        );
+
         // Auto-mount tool groups based on user message keywords
         let mut meet_fallback_metadata: Option<serde_json::Value> = None;
-        if let Some(last_msg) = messages.last() {
+        if pure_image_analysis_turn {
+            log_pipeline_step(
+                session_id,
+                "preprocessing_skipped",
+                "Skipped keyword auto-mount for pure image analysis turn",
+                None,
+            );
+        } else if let Some(last_msg) = messages.last() {
             if last_msg.role == "user" {
-                meet_fallback_metadata = google_meet_fallback_metadata(&last_msg.content);
+                let mount_probe_text = routing_focus_text_from_user_content(&last_msg.content);
+                meet_fallback_metadata = google_meet_fallback_metadata(&mount_probe_text);
                 let mut mm = self.mount_manager.write().await;
-                let newly = mm.auto_mount_from_message(&last_msg.content);
+                let newly = mm.auto_mount_from_message(&mount_probe_text);
                 if !newly.is_empty() {
                     tracing::info!(groups = ?newly, "auto-mounted tool groups from user message");
+                    log_pipeline_step(
+                        session_id,
+                        "preprocessing_applied",
+                        "Tool auto-mount preprocessing applied",
+                        Some(serde_json::json!({ "mounted_groups": newly })),
+                    );
+                } else {
+                    log_pipeline_step(
+                        session_id,
+                        "preprocessing_skipped",
+                        "No tool auto-mount preprocessing needed",
+                        None,
+                    );
                 }
             }
         }
@@ -2074,16 +3763,43 @@ impl AgentLoop {
             let _ = event_tx.send(StreamEvent::Plan(
                 "Applying Google Meet fallback via Calendar conference-link mode metadata".into(),
             ));
-        }
 
-        let last_user_text = messages
-            .iter()
-            .rev()
-            .find(|m| m.role == "user")
-            .map(|m| m.content.clone())
-            .unwrap_or_default();
+            log_pipeline_step(
+                session_id,
+                "preprocessing_applied",
+                "Google Meet fallback metadata injected",
+                Some(serde_json::json!({
+                    "metadata": sanitize_json_for_logs(&metadata, 220, 8),
+                })),
+            );
+        }
         let google_workspace_intent =
-            looks_like_google_workspace_request(&last_user_text.to_lowercase());
+            !pure_image_analysis_turn && looks_like_google_workspace_request(&routing_focus_lower);
+
+        // ── Colab workflow: inject tool-routing guidance into context ──────────
+        // This tells the LLM exactly which tools map to each Colab sub-task so
+        // it never hallucinates a "colab create" verb.
+        if !pure_image_analysis_turn && looks_like_colab_request(&routing_focus_lower) {
+            let colab_guidance = concat!(
+                "TOOL ROUTING RULES for Google Colab requests:\n",
+                "1. CREATE a new Colab notebook → call `gw_drive_create` with mime_type=\"application/vnd.google.colab\", then call `mcp_colab-mcp_open_colab_browser_connection`.\n",
+                "2. OPEN an existing Colab notebook / set active → call `mcp_colab-mcp_open_colab_browser_connection` (this opens the Colab tab in the browser).\n",
+                "3. RUN / EXECUTE code in Colab → first ensure browser is connected via `mcp_colab-mcp_open_colab_browser_connection`, then call `mcp_colab-mcp_execute_cell` with the code.\n",
+                "NEVER output plain text like 'colab create ...' — always emit a structured tool call JSON.",
+            );
+            messages.push(ChatMessage {
+                role: "system".into(),
+                content: colab_guidance.to_string(),
+                name: None,
+                images: None,
+            });
+            log_pipeline_step(
+                session_id,
+                "preprocessing_applied",
+                "Colab tool-routing guidance injected",
+                None,
+            );
+        }
 
         // Build tool schemas for the LLM (filtered by mount manager)
         let mount_mgr = self.mount_manager.read().await;
@@ -2092,12 +3808,20 @@ impl AgentLoop {
             .iter()
             .filter(|d| mount_mgr.is_mounted(&d.name))
             .filter(|d| {
+                if pure_image_analysis_turn {
+                    is_tool_allowed_for_image_focus(d)
+                } else {
+                    true
+                }
+            })
+            .filter(|d| {
                 if d.name.starts_with("mcp_gworkspace_") {
                     google_workspace_intent
                 } else {
                     true
                 }
             })
+            .filter(|d| tool_allowed_by_execution_profile(&execution_profile, &d.name))
             .map(|d| ToolSchema {
                 name: d.name.clone(),
                 description: d.description.clone(),
@@ -2108,30 +3832,127 @@ impl AgentLoop {
             tool_schemas.iter().map(|s| s.name.clone()).collect();
         drop(mount_mgr);
 
+        let prompt_lab_direct_mode = execution_profile.uses_direct_strategy();
+
+        log_pipeline_step(
+            session_id,
+            "tool_schemas_built",
+            "Prepared mounted tool schemas for LLM",
+            Some(serde_json::json!({
+                "google_workspace_intent": google_workspace_intent,
+                "pure_image_analysis_turn": pure_image_analysis_turn,
+                "prompt_lab_mode": execution_profile.is_prompt_lab(),
+                "prompt_lab_direct_mode": prompt_lab_direct_mode,
+                "tool_count": tool_schemas.len(),
+                "tool_names": tool_schemas
+                    .iter()
+                    .map(|schema| schema.name.clone())
+                    .collect::<Vec<_>>(),
+            })),
+        );
+
+        let llm_tool_schemas: Option<&[ToolSchema]> = if pure_image_analysis_turn {
+            None
+        } else {
+            Some(&tool_schemas)
+        };
+
         // Track tools already approved in this user-turn to avoid re-asking.
         // Key: "tool_name|args_json"
         let mut approved_this_turn: HashSet<String> = HashSet::new();
-        let mut package_flow = PackageFlowState::from_user_text(&last_user_text);
+        let mut package_flow = PackageFlowState::from_user_text(&routing_focus_text);
+        let mut colab_flow = ColabFlowState::from_user_text(&routing_focus_text);
         let mut intent_fallback_used = false;
         let mut had_successful_gmail_tool = false;
         let mut had_failed_gmail_tool = false;
         let mut last_successful_gmail_result: Option<serde_json::Value> = None;
-        let intent_result = IntentRouter::classify(&last_user_text);
-        let forced_tool_requested = extract_forced_tool_directive(&last_user_text).is_some();
+        let intent_result = IntentRouter::classify(&routing_focus_text);
+        let forced_tool_requested = extract_forced_tool_directive(&routing_focus_text).is_some();
 
-        for _round in 0..self.max_tool_rounds {
+        // Semantic routing: run async router when available, capturing per-turn modality.
+        let turn_modality = if let Some(router) = &self.semantic_router {
+            let (_, modality, _trace) = router.route(&routing_focus_text).await;
+            modality
+        } else {
+            crate::routing::verbs::classify_modality(&routing_focus_text)
+        };
+
+        log_pipeline_step(
+            session_id,
+            "intent_classified",
+            "Intent classification complete",
+            Some(serde_json::json!({
+                "intent": format!("{:?}", &intent_result.intent),
+                "category": intent_result.category.clone(),
+                "tool_hint": intent_result.tool_hint.clone(),
+                "confidence": intent_result.confidence,
+                "forced_tool_requested": forced_tool_requested,
+                "package_flow_detected": package_flow.is_some(),
+                "colab_flow_detected": colab_flow.is_some(),
+            })),
+        );
+
+        for round in 0..self.max_tool_rounds {
+            log_pipeline_step(
+                session_id,
+                "llm_input_prepared",
+                "Prepared LLM request payload",
+                Some(serde_json::json!({
+                    "round": round,
+                    "tool_schema_count": llm_tool_schemas.map(|schemas| schemas.len()).unwrap_or(0),
+                    "history_message_count": messages.len(),
+                    "messages_preview": build_message_preview(messages, 6),
+                })),
+            );
+
             // Call LLM
-            let response = match backend.chat(messages, Some(&tool_schemas), 0.7, 4096).await {
+            let response = match backend.chat(messages, llm_tool_schemas, 0.7, 4096).await {
                 Ok(r) => r,
                 Err(e) => {
+                    log_pipeline_step(
+                        session_id,
+                        "llm_error",
+                        "LLM call failed",
+                        Some(serde_json::json!({
+                            "round": round,
+                            "error": sanitize_text_for_logs(&e.to_string(), 260),
+                        })),
+                    );
                     let _ = event_tx.send(StreamEvent::Error(format!("LLM error: {e}")));
                     return;
                 }
             };
 
+            log_pipeline_step(
+                session_id,
+                "llm_response_received",
+                "LLM response received",
+                Some(serde_json::json!({
+                    "round": round,
+                    "model": response.model.clone(),
+                    "usage": response.usage.as_ref().map(|u| serde_json::json!({
+                        "prompt_tokens": u.prompt_tokens,
+                        "completion_tokens": u.completion_tokens,
+                        "total_tokens": u.total_tokens,
+                    })),
+                    "native_tool_calls": response
+                        .tool_calls
+                        .as_ref()
+                        .map(|v| v.len())
+                        .unwrap_or(0),
+                    "content_preview": sanitize_text_for_logs(&response.content, 320),
+                })),
+            );
+
             // Parse tool calls from response — prefer native function-calling format
             // (returned by llama.cpp / OpenAI), fall back to text-embedded format.
             // Pattern 7 (Python-style fallback) fires last, only for single-required-param tools.
+            let parse_mode = if response.tool_calls.is_some() {
+                "native_function_call"
+            } else {
+                "text_pattern_fallback"
+            };
+
             let mut tool_calls: Vec<ParsedToolCall> = if let Some(native) = &response.tool_calls {
                 native
                     .iter()
@@ -2168,7 +3989,21 @@ impl AgentLoop {
             let text_response_raw = extract_text_response(&response.content);
             let text_response = sanitize_assistant_text_response(&text_response_raw);
 
+            log_pipeline_step(
+                session_id,
+                "tool_calls_parsed",
+                "Parsed tool calls from LLM response",
+                Some(serde_json::json!({
+                    "round": round,
+                    "parse_mode": parse_mode,
+                    "tool_call_count": tool_calls.len(),
+                    "tool_calls": build_tool_calls_preview(&tool_calls),
+                    "text_response_preview": sanitize_text_for_logs(&text_response, 320),
+                })),
+            );
+
             let mut synthetic_package_calls = false;
+            let mut synthetic_colab_calls = false;
             let mut synthetic_intent_calls = false;
             if tool_calls.is_empty() {
                 if let Some(flow) = package_flow.as_ref() {
@@ -2176,6 +4011,15 @@ impl AgentLoop {
                     if !fallback_calls.is_empty() {
                         synthetic_package_calls = true;
                         tool_calls = fallback_calls;
+                        log_pipeline_step(
+                            session_id,
+                            "synthetic_package_calls",
+                            "Injected package workflow tool calls",
+                            Some(serde_json::json!({
+                                "round": round,
+                                "tool_calls": build_tool_calls_preview(&tool_calls),
+                            })),
+                        );
                         let _ = event_tx.send(StreamEvent::Plan(
                             "Enforcing package workflow with pre/post verification".into(),
                         ));
@@ -2183,31 +4027,87 @@ impl AgentLoop {
                 }
             }
 
+            // Colab workflow: inject next required Colab step if LLM produced no calls.
+            if tool_calls.is_empty() {
+                if let Some(flow) = colab_flow.as_ref() {
+                    let colab_calls = flow.next_required_calls(&allowed_tool_names);
+                    if !colab_calls.is_empty() {
+                        synthetic_colab_calls = true;
+                        let status = flow.status_summary();
+                        tool_calls = colab_calls;
+                        log_pipeline_step(
+                            session_id,
+                            "synthetic_colab_calls",
+                            "Injected Colab workflow tool calls",
+                            Some(serde_json::json!({
+                                "round": round,
+                                "tool_calls": build_tool_calls_preview(&tool_calls),
+                            })),
+                        );
+                        let _ = event_tx.send(StreamEvent::Plan(status));
+                    }
+                }
+            }
+
             if tool_calls.is_empty() && !intent_fallback_used {
+                let intent_fallback_query =
+                    resolve_intent_fallback_query(&routing_focus_text, &messages);
+                let fallback_intent_result = IntentRouter::classify(&intent_fallback_query);
+                let fallback_confidence = fallback_intent_result.confidence.max(intent_result.confidence);
+
                 if let Some(fallback_call) =
-                    build_intent_fallback_tool_call(&last_user_text, &allowed_tool_names)
+                    build_intent_fallback_tool_call(&intent_fallback_query, &allowed_tool_names)
                 {
-                    if forced_tool_requested || intent_result.confidence >= self.min_confidence_to_act
-                    {
+                    if forced_tool_requested || fallback_confidence >= self.min_confidence_to_act {
                         intent_fallback_used = true;
                         synthetic_intent_calls = true;
-                        let _ = event_tx.send(StreamEvent::Plan(format!(
-                            "No tool call returned; applying intent fallback via {}",
-                            fallback_call.name
-                        )));
+                        let plan_message = if intent_fallback_query == routing_focus_text {
+                            format!(
+                                "No tool call returned; applying intent fallback via {}",
+                                fallback_call.name
+                            )
+                        } else {
+                            format!(
+                                "No tool call returned; applying context-aware intent fallback via {}",
+                                fallback_call.name
+                            )
+                        };
+                        let _ = event_tx.send(StreamEvent::Plan(plan_message));
                         tool_calls = vec![fallback_call];
-                    } else if intent_result.confidence >= self.clarify_threshold {
+                        log_pipeline_step(
+                            session_id,
+                            "synthetic_intent_call",
+                            "Injected intent fallback tool call",
+                            Some(serde_json::json!({
+                                "round": round,
+                                "fallback_query": sanitize_text_for_logs(&intent_fallback_query, 220),
+                                "confidence": fallback_confidence,
+                                "tool_calls": build_tool_calls_preview(&tool_calls),
+                            })),
+                        );
+                    } else if fallback_confidence >= self.clarify_threshold {
                         let candidates = build_tool_choice_candidates(
-                            &last_user_text,
+                            &intent_fallback_query,
                             &allowed_tool_names,
-                            intent_result.tool_hint.as_deref(),
-                            intent_result.confidence,
+                            fallback_intent_result.tool_hint.as_deref(),
+                            fallback_confidence,
                         );
 
                         if !candidates.is_empty() {
+                            log_pipeline_step(
+                                session_id,
+                                "tool_choice_required",
+                                "Low-confidence route needs user tool choice",
+                                Some(serde_json::json!({
+                                    "round": round,
+                                    "fallback_query": sanitize_text_for_logs(&intent_fallback_query, 220),
+                                    "confidence": fallback_confidence,
+                                    "candidate_count": candidates.len(),
+                                })),
+                            );
                             let _ = event_tx.send(StreamEvent::ToolChoiceRequired {
-                                query: last_user_text.clone(),
-                                confidence: intent_result.confidence,
+                                query: intent_fallback_query.clone(),
+                                confidence: fallback_confidence,
                                 min_confidence: self.min_confidence_to_act,
                                 candidates,
                             });
@@ -2222,8 +4122,29 @@ impl AgentLoop {
 
             // If no tool calls, we're done
             if tool_calls.is_empty() {
+                log_pipeline_step(
+                    session_id,
+                    "no_tool_calls",
+                    "No tool calls returned for this round",
+                    Some(serde_json::json!({
+                        "round": round,
+                        "synthetic_package_calls": synthetic_package_calls,
+                        "synthetic_colab_calls": synthetic_colab_calls,
+                        "synthetic_intent_calls": synthetic_intent_calls,
+                    })),
+                );
+
                 if let Some(flow) = package_flow.as_ref() {
                     if let Some(summary) = flow.verified_summary() {
+                        log_pipeline_step(
+                            session_id,
+                            "final_output_ready",
+                            "Using package-flow verification summary",
+                            Some(serde_json::json!({
+                                "round": round,
+                                "final_preview": sanitize_text_for_logs(&summary, 260),
+                            })),
+                        );
                         let _ = event_tx.send(StreamEvent::Token(summary.clone()));
                         let _ = event_tx.send(StreamEvent::Done(summary));
                         return;
@@ -2234,6 +4155,18 @@ impl AgentLoop {
                 } else {
                     text_response.clone()
                 };
+
+                log_pipeline_step(
+                    session_id,
+                    "final_formatting_started",
+                    "Preparing final assistant output",
+                    Some(serde_json::json!({
+                        "round": round,
+                        "had_successful_gmail_tool": had_successful_gmail_tool,
+                        "had_failed_gmail_tool": had_failed_gmail_tool,
+                        "text_preview": sanitize_text_for_logs(&final_text, 280),
+                    })),
+                );
 
                 if had_successful_gmail_tool && !had_failed_gmail_tool && !final_text.is_empty() {
                     let has_placeholder_scaffold = contains_gmail_placeholder_scaffold(&final_text);
@@ -2249,11 +4182,22 @@ impl AgentLoop {
                         {
                             tracing::warn!(
                                 has_images,
-                                round = _round,
+                                round,
                                 has_placeholder_scaffold,
                                 has_raw_payload,
                                 has_duplicate_rows,
                                 "LLM returned non-grounded Gmail response; replacing with grounded summary"
+                            );
+                            log_pipeline_step(
+                                session_id,
+                                "final_formatting_adjusted",
+                                "Replaced non-grounded Gmail output with grounded summary",
+                                Some(serde_json::json!({
+                                    "round": round,
+                                    "has_placeholder_scaffold": has_placeholder_scaffold,
+                                    "has_raw_payload": has_raw_payload,
+                                    "has_duplicate_rows": has_duplicate_rows,
+                                })),
                             );
                             final_text = grounded_summary;
                         }
@@ -2261,6 +4205,16 @@ impl AgentLoop {
                 }
 
                 if !final_text.is_empty() {
+                    log_pipeline_step(
+                        session_id,
+                        "final_output_ready",
+                        "Final assistant response ready",
+                        Some(serde_json::json!({
+                            "round": round,
+                            "final_preview": sanitize_text_for_logs(&final_text, 320),
+                            "final_chars": final_text.chars().count(),
+                        })),
+                    );
                     let _ = event_tx.send(StreamEvent::Token(final_text.clone()));
                     let _ = event_tx.send(StreamEvent::Done(final_text));
                 } else if had_successful_gmail_tool && !had_failed_gmail_tool {
@@ -2270,8 +4224,17 @@ impl AgentLoop {
                     {
                         tracing::info!(
                             has_images,
-                            round = _round,
+                            round,
                             "LLM returned empty response with no tool calls; using grounded Gmail count summary"
+                        );
+                        log_pipeline_step(
+                            session_id,
+                            "final_output_ready",
+                            "Using grounded Gmail count summary fallback",
+                            Some(serde_json::json!({
+                                "round": round,
+                                "final_preview": sanitize_text_for_logs(&summary, 260),
+                            })),
                         );
                         let _ = event_tx.send(StreamEvent::Token(summary.clone()));
                         let _ = event_tx.send(StreamEvent::Done(summary));
@@ -2281,8 +4244,17 @@ impl AgentLoop {
                                 .to_string();
                         tracing::warn!(
                             has_images,
-                            round = _round,
+                            round,
                             "LLM returned empty response with no tool calls and no grounded Gmail summary"
+                        );
+                        log_pipeline_step(
+                            session_id,
+                            "final_output_fallback",
+                            "Generated generic fallback due empty grounded response",
+                            Some(serde_json::json!({
+                                "round": round,
+                                "final_preview": sanitize_text_for_logs(&fallback, 200),
+                            })),
                         );
                         let _ = event_tx.send(StreamEvent::Token(fallback.clone()));
                         let _ = event_tx.send(StreamEvent::Done(fallback));
@@ -2293,8 +4265,17 @@ impl AgentLoop {
                             .to_string();
                     tracing::warn!(
                         has_images,
-                        round = _round,
+                        round,
                         "LLM returned empty response with no tool calls"
+                    );
+                    log_pipeline_step(
+                        session_id,
+                        "final_output_fallback",
+                        "Generated generic fallback due empty response",
+                        Some(serde_json::json!({
+                            "round": round,
+                            "final_preview": sanitize_text_for_logs(&fallback, 200),
+                        })),
                     );
                     let _ = event_tx.send(StreamEvent::Token(fallback.clone()));
                     let _ = event_tx.send(StreamEvent::Done(fallback));
@@ -2310,16 +4291,49 @@ impl AgentLoop {
                     name: None,
                     images: None,
                 });
+
+                log_pipeline_step(
+                    session_id,
+                    "assistant_tool_history_added",
+                    "Added assistant tool-call turn to history",
+                    Some(serde_json::json!({
+                        "round": round,
+                        "tool_calls": build_tool_calls_preview(&tool_calls),
+                    })),
+                );
             }
 
             // Execute each tool call
             for call in &tool_calls {
+                log_pipeline_step(
+                    session_id,
+                    "tool_call_started",
+                    "Beginning tool execution",
+                    Some(serde_json::json!({
+                        "round": round,
+                        "tool": call.name.clone(),
+                        "arguments": sanitize_json_for_logs(&call.arguments, 220, 8),
+                    })),
+                );
+
                 // Never execute tools outside the current mounted+tier visible set.
                 if !allowed_tool_names.contains(&call.name) {
                     let unavailable_msg = format!(
                         "tool '{}' is not available for current hardware tier '{}' or mounted tool groups",
                         call.name, self.hardware_tier
                     );
+
+                    log_pipeline_step(
+                        session_id,
+                        "tool_call_rejected",
+                        "Tool blocked by tier/mount gating",
+                        Some(serde_json::json!({
+                            "round": round,
+                            "tool": call.name.clone(),
+                            "reason": sanitize_text_for_logs(&unavailable_msg, 220),
+                        })),
+                    );
+
                     let _ = event_tx.send(StreamEvent::ToolEnd {
                         name: call.name.clone(),
                         result: serde_json::json!({ "error": unavailable_msg }),
@@ -2345,8 +4359,96 @@ impl AgentLoop {
                     params: call.arguments.clone(),
                 });
 
-                // Policy check
-                let decision = self.policy_engine.evaluate(&call.name, &call.arguments);
+                // ── Colab browser-connection gate ────────────────────────────
+                // If the LLM emits an execute_cell call but the browser connection
+                // has not been established yet, transparently prepend the bootstrap
+                // call so code never fires into a disconnected session.
+                if call.name.contains("execute_cell") && call.name.contains("colab") {
+                    let already_connected = colab_flow
+                        .as_ref()
+                        .map(|f| f.browser_connected)
+                        .unwrap_or(false);
+                    if !already_connected
+                        && allowed_tool_names
+                            .contains("mcp_colab-mcp_open_colab_browser_connection")
+                    {
+                        let _ = event_tx.send(StreamEvent::Plan(
+                            "Colab browser not connected — establishing connection first.".into(),
+                        ));
+                        let bootstrap = ColabFlowState::browser_open_call();
+                        // Inject bootstrap ahead of execute — push current call back.
+                        // We handle this by bumping execute_cell to the next round
+                        // after the browser is confirmed via observe_tool_result.
+                        // Replace current call slice with [bootstrap_call, original_call].
+                        // The simplest way: execute bootstrap now via recursive inject.
+                        // We'll just replace the current `call` reference by mutating
+                        // the iteration — instead, mark as gate-injected and continue.
+                        let _ = event_tx.send(StreamEvent::ToolStart {
+                            name: bootstrap.name.clone(),
+                            params: bootstrap.arguments.clone(),
+                        });
+                        let gate_result = if let Some(gate_handler) =
+                            self.tool_registry.get_handler(&bootstrap.name)
+                        {
+                            let gate_handler = gate_handler.clone();
+                            gate_handler.execute(bootstrap.arguments.clone()).await
+                        } else {
+                            crate::infra::isolation::ToolResult::err(
+                                "open_colab_browser_connection handler not found".to_string(),
+                            )
+                        };
+                        if let Some(flow) = colab_flow.as_mut() {
+                            flow.observe_tool_result(
+                                &bootstrap,
+                                gate_result.success,
+                                &gate_result.data,
+                            );
+                        }
+                        let _ = event_tx.send(StreamEvent::ToolEnd {
+                            name: bootstrap.name.clone(),
+                            result: gate_result.data.clone(),
+                            success: gate_result.success,
+                        });
+                        messages.push(ChatMessage {
+                            role: "tool".into(),
+                            content: serde_json::to_string(&gate_result.data)
+                                .unwrap_or_default(),
+                            name: Some(bootstrap.name.clone()),
+                            images: None,
+                        });
+                        if !gate_result.success {
+                            messages.push(ChatMessage {
+                                role: "system".into(),
+                                content: "Colab browser connection failed. Cannot execute cell."
+                                    .into(),
+                                name: None,
+                                images: None,
+                            });
+                            continue;
+                        }
+                    }
+                }
+
+                // Policy check — pass destructive hint from semantic router modality
+                let decision = self.policy_engine.evaluate_with_modality_hint(
+                    &call.name,
+                    &call.arguments,
+                    turn_modality.destructive,
+                );
+
+                log_pipeline_step(
+                    session_id,
+                    "policy_evaluated",
+                    "Policy evaluation completed for tool call",
+                    Some(serde_json::json!({
+                        "round": round,
+                        "tool": call.name.clone(),
+                        "risk_level": decision.risk_level.as_str(),
+                        "requires_approval": decision.requires_approval,
+                        "blocked": decision.blocked,
+                        "reason": sanitize_text_for_logs(&decision.reason, 220),
+                    })),
+                );
 
                 if decision.blocked {
                     // BLACK tier — always denied
@@ -2372,6 +4474,18 @@ impl AgentLoop {
                         name: Some(call.name.clone()),
                         images: None,
                     });
+
+                    log_pipeline_step(
+                        session_id,
+                        "tool_call_blocked",
+                        "Tool call blocked by safety policy",
+                        Some(serde_json::json!({
+                            "round": round,
+                            "tool": call.name.clone(),
+                            "reason": sanitize_text_for_logs(&decision.reason, 220),
+                        })),
+                    );
+
                     continue;
                 }
 
@@ -2390,6 +4504,16 @@ impl AgentLoop {
                             Decision::Approved,
                             DecidedBy::Policy,
                         );
+
+                        log_pipeline_step(
+                            session_id,
+                            "approval_reused",
+                            "Reused earlier approval for identical tool call",
+                            Some(serde_json::json!({
+                                "round": round,
+                                "tool": call.name.clone(),
+                            })),
+                        );
                     } else {
                         // Generate the request ID up front so the frontend receives the
                         // same ID that the HITL gateway stores in its pending map.
@@ -2401,6 +4525,18 @@ impl AgentLoop {
                             risk_level: decision.risk_level.as_str().into(),
                             parameters: call.arguments.clone(),
                         });
+
+                        log_pipeline_step(
+                            session_id,
+                            "approval_requested",
+                            "Approval requested for RED-tier tool call",
+                            Some(serde_json::json!({
+                                "round": round,
+                                "tool": call.name.clone(),
+                                "request_id": request_id.clone(),
+                                "risk_level": decision.risk_level.as_str(),
+                            })),
+                        );
 
                         let approval = self
                             .hitl_gateway
@@ -2446,6 +4582,17 @@ impl AgentLoop {
                             approved,
                         });
 
+                        log_pipeline_step(
+                            session_id,
+                            "approval_result",
+                            "Approval decision received",
+                            Some(serde_json::json!({
+                                "round": round,
+                                "tool": call.name.clone(),
+                                "approved": approved,
+                            })),
+                        );
+
                         if !approved {
                             // Emit ToolEnd so the UI shows the tool as failed (not just pending).
                             let _ = event_tx.send(StreamEvent::ToolEnd {
@@ -2464,6 +4611,18 @@ impl AgentLoop {
                                 name: Some(call.name.clone()),
                                 images: None,
                             });
+
+                            log_pipeline_step(
+                                session_id,
+                                "tool_call_denied",
+                                "Tool call not executed due denied/timeout approval",
+                                Some(serde_json::json!({
+                                    "round": round,
+                                    "tool": call.name.clone(),
+                                    "reason": denial_reason,
+                                })),
+                            );
+
                             continue;
                         }
 
@@ -2474,6 +4633,82 @@ impl AgentLoop {
                         // (actual file backup happens inside specific tool handlers)
                     }
                 }
+
+                // ── Dedup guard: abort on repeated identical failure ───────────
+                let call_hash = call_dedup_hash(&call.name, &call.arguments);
+                if let Some((fail_count, cached_err)) = failed_calls.get(&call_hash) {
+                    if *fail_count >= 1 {
+                        let abort_msg = format!(
+                            "repeated_identical_failure: '{}' with the same arguments already \
+                             failed in this turn: {}. Aborting to prevent an infinite loop.",
+                            call.name, cached_err
+                        );
+                        tracing::warn!(
+                            session = session_id,
+                            tool = %call.name,
+                            "dedup guard: aborting duplicate failed call"
+                        );
+                        log_pipeline_step(
+                            session_id,
+                            "tool_retry_blocked",
+                            "Blocked duplicate failed tool call",
+                            Some(serde_json::json!({
+                                "round": round,
+                                "tool": call.name.clone(),
+                                "fail_count": fail_count,
+                                "cached_error": cached_err,
+                            })),
+                        );
+                        let _ = event_tx.send(StreamEvent::Error(abort_msg.clone()));
+                        return;
+                    }
+                }
+
+                // ── Turn budget guard: skip tool if cumulative tokens exhausted ─
+                if turn_tool_tokens >= LLM_TURN_TOOL_BUDGET {
+                    let budget_msg = format!(
+                        "TOOL_BUDGET_EXHAUSTED: turn tool-output token budget ({LLM_TURN_TOOL_BUDGET}) \
+                         reached; skipping '{}'. Summarise what you have and answer the user.",
+                        call.name
+                    );
+                    tracing::warn!(
+                        session = session_id,
+                        turn_tool_tokens,
+                        tool = %call.name,
+                        "turn tool-output budget exhausted; skipping tool"
+                    );
+                    messages.push(ChatMessage {
+                        role: "tool".into(),
+                        content: budget_msg,
+                        name: Some(call.name.clone()),
+                        images: None,
+                    });
+                    continue;
+                }
+
+                // ── Heartbeat: emit ToolProgress every 2 s while tool runs ─────
+                let hb_cancel = CancellationToken::new();
+                let hb_cancel_clone = hb_cancel.clone();
+                let hb_tx = event_tx.clone();
+                let hb_tool = call.name.clone();
+                tokio::spawn(async move {
+                    let mut interval =
+                        tokio::time::interval(std::time::Duration::from_secs(2));
+                    interval.tick().await; // skip the immediate first tick
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = hb_cancel_clone.cancelled() => break,
+                            _ = interval.tick() => {
+                                let _ = hb_tx.send(StreamEvent::ToolProgress {
+                                    call_id: hb_tool.clone(),
+                                    message: format!("⏳ {} is still running…", hb_tool),
+                                    percent: None,
+                                });
+                            }
+                        }
+                    }
+                });
 
                 // Execute the tool
                 let tool_result = if let Some(handler) = self.tool_registry.get_handler(&call.name)
@@ -2492,17 +4727,80 @@ impl AgentLoop {
                         "download_file" => 120,
                         _ => 30,
                     };
-                    run_isolated(
-                        &format!("tool:{}", call.name),
+                    let isolation_name = format!("tool:{}", call.name);
+                    let exec_future = run_isolated(
+                        &isolation_name,
                         std::time::Duration::from_secs(timeout_secs),
                         move || async move { handler.execute(args).await },
-                    )
-                    .await
+                    );
+                    // Wrap execution in a cancellation select so "KRIA stop now"
+                    // can abort the entire turn immediately.
+                    let turn_cancel_ref = &turn_cancel;
+                    tokio::select! {
+                        biased;
+                        _ = turn_cancel_ref.cancelled() => {
+                            crate::infra::isolation::ToolResult::err(
+                                "turn cancelled by user".to_string(),
+                            )
+                        }
+                        result = exec_future => result,
+                    }
                 } else {
                     crate::infra::isolation::ToolResult::err(format!("unknown tool: {}", call.name))
                 };
 
+                // Stop the heartbeat task.
+                hb_cancel.cancel();
+
+                // ── Update error-loop counters ─────────────────────────────────
+                if tool_result.success {
+                    consecutive_failures = 0;
+                } else {
+                    let err_text = tool_result
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "unknown error".to_string());
+                    let entry = failed_calls
+                        .entry(call_hash)
+                        .or_insert((0, err_text.clone()));
+                    entry.0 += 1;
+                    entry.1 = err_text;
+                    consecutive_failures += 1;
+
+                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                        tracing::warn!(
+                            session = session_id,
+                            consecutive_failures,
+                            "3 consecutive tool failures — injecting corrective prompt"
+                        );
+                        log_pipeline_step(
+                            session_id,
+                            "consecutive_failures_threshold",
+                            "3 consecutive tool failures; injecting corrective system message",
+                            Some(serde_json::json!({ "round": round })),
+                        );
+                        // Inject a corrective system message so the LLM knows to
+                        // stop using tools and answer with what it has.
+                        messages.push(ChatMessage {
+                            role: "system".into(),
+                            content: "SYSTEM: 3 consecutive tool executions have failed. \
+                                      Stop issuing tool calls. Respond to the user using \
+                                      whatever information you have, or ask the user for \
+                                      guidance to resolve the problem."
+                                .to_string(),
+                            name: None,
+                            images: None,
+                        });
+                        // Reset so we don't inject repeatedly.
+                        consecutive_failures = 0;
+                    }
+                }
+
                 if let Some(flow) = package_flow.as_mut() {
+                    flow.observe_tool_result(call, tool_result.success, &tool_result.data);
+                }
+
+                if let Some(flow) = colab_flow.as_mut() {
                     flow.observe_tool_result(call, tool_result.success, &tool_result.data);
                 }
 
@@ -2530,6 +4828,14 @@ impl AgentLoop {
                 // Build the string the LLM will see.
                 // IMPORTANT: if the tool failed, send the error — not "null" —
                 // so the LLM knows to report the failure instead of hallucinating.
+                //
+                // For successful results we apply a two-stage budget strategy:
+                //   1. Shape the raw payload (drop bodies/base64, truncate strings)
+                //      using the domain-aware shaper.  Gmail payloads first go
+                //      through the existing compact_tool_result_for_llm() path.
+                //   2. Count tokens via llama.cpp /tokenize; if still over the
+                //      per-tool budget, re-shape with a tighter char budget.
+                //   3. Hard char-cap as a final safety net.
                 let llm_tool_result = compact_tool_result_for_llm(&call.name, &tool_result.data);
                 let result_str = if !tool_result.success {
                     let err_msg = tool_result
@@ -2538,19 +4844,80 @@ impl AgentLoop {
                         .unwrap_or("tool execution failed with no details");
                     format!("TOOL_ERROR: {err_msg}")
                 } else {
-                    llm_tool_result.to_string()
+                    // ── Context Bomb mitigation ────────────────────────────
+                    // Per-tool char budget derived from token budget.
+                    let char_budget =
+                        LLM_TOOL_RESULT_TOKEN_BUDGET * 4; // ~4 chars/token heuristic
+
+                    // Stream the full payload to the UI via ToolPayloadChunk so
+                    // the user always sees complete data while the LLM only gets
+                    // the compact summary.
+                    let full_payload_str = llm_tool_result.to_string();
+                    if full_payload_str.len() > char_budget {
+                        // Emit a single final chunk with full data for UI rendering.
+                        let _ = event_tx.send(StreamEvent::ToolPayloadChunk {
+                            call_id: call.name.clone(),
+                            seq: 0,
+                            is_final: true,
+                            data: llm_tool_result.clone(),
+                        });
+                    }
+
+                    // Stage 1: structural shaping.
+                    let shaped = shape_for_llm(&call.name, &llm_tool_result, char_budget);
+                    let mut shaped_str = shaped.value.to_string();
+
+                    // Stage 2: token counting — tighten budget if needed.
+                    let tokenizer_url = backend.tokenizer_base_url();
+                    let token_count = count_tokens(&shaped_str, &tokenizer_url).await;
+                    if token_count > LLM_TOOL_RESULT_TOKEN_BUDGET {
+                        // Re-shape with a char budget proportional to how much
+                        // we need to shrink.
+                        let tighter = (char_budget * LLM_TOOL_RESULT_TOKEN_BUDGET / token_count)
+                            .max(512);
+                        let reshaped = shape_for_llm(&call.name, &llm_tool_result, tighter);
+                        shaped_str = reshaped.value.to_string();
+                    }
+
+                    // Stage 3: hard char cap as final safety net.
+                    if shaped_str.len() > TOOL_RESULT_MAX_CHARS {
+                        format!(
+                            "{}...<truncated>",
+                            &shaped_str[..TOOL_RESULT_MAX_CHARS]
+                        )
+                    } else {
+                        shaped_str
+                    }
                 };
-                let truncated = if result_str.len() > TOOL_RESULT_MAX_CHARS {
-                    format!("{}...<truncated>", &result_str[..TOOL_RESULT_MAX_CHARS])
-                } else {
-                    result_str
-                };
+
+                // Update the cumulative turn token counter.
+                let result_tokens = count_tokens(&result_str, &backend.tokenizer_base_url()).await;
+                turn_tool_tokens = turn_tool_tokens.saturating_add(result_tokens);
 
                 // Auto-route: if tool result contains a file path, check if a
                 // precognitive tool should process it automatically
                 let auto_enrichment = self
                     .auto_route_file_result(&call.name, &tool_result.data)
                     .await;
+
+                log_pipeline_step(
+                    session_id,
+                    "tool_result_ready",
+                    "Tool execution completed",
+                    Some(serde_json::json!({
+                        "round": round,
+                        "tool": call.name.clone(),
+                        "success": tool_result.success,
+                        "error": tool_result
+                            .error
+                            .as_ref()
+                            .map(|e| sanitize_text_for_logs(e, 220)),
+                        "result_preview": sanitize_json_for_logs(&tool_result.data, 220, 8),
+                        "result_tokens": result_tokens,
+                        "turn_tool_tokens_total": turn_tool_tokens,
+                        "auto_enriched": auto_enrichment.is_some(),
+                    })),
+                );
 
                 let _ = event_tx.send(StreamEvent::ToolEnd {
                     name: call.name.clone(),
@@ -2561,10 +4928,10 @@ impl AgentLoop {
                 let tool_msg = if let Some(enrichment) = auto_enrichment {
                     format!(
                         "{}\n\n[Auto-enriched via sidecar]\n{}",
-                        truncated, enrichment
+                        result_str, enrichment
                     )
                 } else {
-                    truncated
+                    result_str
                 };
 
                 let tool_msg = if let Some(note) = build_grounding_count_note(&call.name, &llm_tool_result) {
@@ -2580,7 +4947,26 @@ impl AgentLoop {
                     images: None,
                 });
             }
+
+            log_pipeline_step(
+                session_id,
+                "round_completed",
+                "Round completed with tool outputs appended; continuing loop",
+                Some(serde_json::json!({
+                    "round": round,
+                    "history_message_count": messages.len(),
+                })),
+            );
         }
+
+        log_pipeline_step(
+            session_id,
+            "max_rounds_reached",
+            "Agent loop reached max tool rounds",
+            Some(serde_json::json!({
+                "max_tool_rounds": self.max_tool_rounds,
+            })),
+        );
 
         let _ = event_tx.send(StreamEvent::Error(format!(
             "max tool rounds ({}) reached",
@@ -3289,6 +5675,209 @@ print("hello")
     }
 
     #[test]
+    fn intent_fallback_uses_gmail_send_for_send_mail_prompt() {
+        let mut allowed = HashSet::new();
+        allowed.insert("gw_gmail_send".to_string());
+
+        let call = build_intent_fallback_tool_call(
+            "Send a Hye mail to \"zeeshanobaid335@gmail.com\"",
+            &allowed,
+        )
+        .expect("expected gmail send fallback call");
+
+        assert_eq!(call.name, "gw_gmail_send");
+        assert_eq!(call.arguments["to"], "zeeshanobaid335@gmail.com");
+        assert_eq!(call.arguments["body"], "Hye");
+        assert_eq!(call.arguments["subject"], "Hye");
+    }
+
+    #[test]
+    fn intent_fallback_does_not_send_email_without_message_body() {
+        let mut allowed = HashSet::new();
+        allowed.insert("gw_gmail_send".to_string());
+
+        let call = build_intent_fallback_tool_call(
+            "Send mail to zeeshanobaid335@gmail.com",
+            &allowed,
+        );
+
+        assert!(call.is_none());
+    }
+
+    #[test]
+    fn contextual_send_confirmation_uses_prior_turn_details() {
+        let messages = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: "Send a Hye mail to \"zeeshanobaid335@gmail.com\"".into(),
+                name: None,
+                images: None,
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: "Sure, what should I write?".into(),
+                name: None,
+                images: None,
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "content be \"Hello Zeeshan how are you.\"".into(),
+                name: None,
+                images: None,
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "send immediately".into(),
+                name: None,
+                images: None,
+            },
+        ];
+
+        let contextual_query = resolve_intent_fallback_query("send immediately", &messages);
+        assert!(contextual_query.contains("zeeshanobaid335@gmail.com"));
+        assert!(contextual_query.contains("Hello Zeeshan how are you."));
+
+        let mut allowed = HashSet::new();
+        allowed.insert("gw_gmail_send".to_string());
+
+        let call = build_intent_fallback_tool_call(&contextual_query, &allowed)
+            .expect("expected contextual gmail send fallback call");
+
+        assert_eq!(call.name, "gw_gmail_send");
+        assert_eq!(call.arguments["to"], "zeeshanobaid335@gmail.com");
+        assert_eq!(call.arguments["body"], "Hello Zeeshan how are you.");
+    }
+
+    #[test]
+    fn intent_fallback_reads_google_doc_from_url() {
+        let mut allowed = HashSet::new();
+        allowed.insert("gw_docs_read".to_string());
+
+        let call = build_intent_fallback_tool_call(
+            "Read this Google Doc https://docs.google.com/document/d/1AbCdEfGhIJKLmNoPqRsTuVwXyZ1234567890/edit",
+            &allowed,
+        )
+        .expect("expected docs read fallback call");
+
+        assert_eq!(call.name, "gw_docs_read");
+        assert_eq!(
+            call.arguments["document_id"],
+            "1AbCdEfGhIJKLmNoPqRsTuVwXyZ1234567890"
+        );
+    }
+
+    #[test]
+    fn intent_fallback_edits_google_doc_from_url_and_text() {
+        let mut allowed = HashSet::new();
+        allowed.insert("gw_docs_edit".to_string());
+
+        let call = build_intent_fallback_tool_call(
+            "Append \"Follow up tomorrow\" to this Google Doc https://docs.google.com/document/d/1AbCdEfGhIJKLmNoPqRsTuVwXyZ1234567890/edit",
+            &allowed,
+        )
+        .expect("expected docs edit fallback call");
+
+        assert_eq!(call.name, "gw_docs_edit");
+        assert_eq!(
+            call.arguments["document_id"],
+            "1AbCdEfGhIJKLmNoPqRsTuVwXyZ1234567890"
+        );
+        assert_eq!(call.arguments["text"], "Follow up tomorrow");
+    }
+
+    #[test]
+    fn intent_fallback_reads_google_sheet_from_url() {
+        let mut allowed = HashSet::new();
+        allowed.insert("gw_sheets_read".to_string());
+
+        let call = build_intent_fallback_tool_call(
+            "Read this spreadsheet https://docs.google.com/spreadsheets/d/1ZyXwVuTsRqPoNmLkJiHgFeDcBa9876543210/edit",
+            &allowed,
+        )
+        .expect("expected sheets read fallback call");
+
+        assert_eq!(call.name, "gw_sheets_read");
+        assert_eq!(
+            call.arguments["spreadsheet_id"],
+            "1ZyXwVuTsRqPoNmLkJiHgFeDcBa9876543210"
+        );
+    }
+
+    #[test]
+    fn intent_fallback_edits_google_sheet_cell_from_prompt() {
+        let mut allowed = HashSet::new();
+        allowed.insert("gw_sheets_edit".to_string());
+
+        let call = build_intent_fallback_tool_call(
+            "Update spreadsheet https://docs.google.com/spreadsheets/d/1ZyXwVuTsRqPoNmLkJiHgFeDcBa9876543210/edit set A1 to \"Done\"",
+            &allowed,
+        )
+        .expect("expected sheets edit fallback call");
+
+        assert_eq!(call.name, "gw_sheets_edit");
+        assert_eq!(
+            call.arguments["spreadsheet_id"],
+            "1ZyXwVuTsRqPoNmLkJiHgFeDcBa9876543210"
+        );
+        assert_eq!(call.arguments["range"], "A1");
+
+        let values = call
+            .arguments
+            .get("values")
+            .and_then(|v| v.as_str())
+            .expect("expected values to be encoded string");
+        assert_eq!(values, "[[\"Done\"]]");
+    }
+
+    #[test]
+    fn intent_fallback_deletes_drive_file_from_url() {
+        let mut allowed = HashSet::new();
+        allowed.insert("gw_drive_delete".to_string());
+
+        let call = build_intent_fallback_tool_call(
+            "Delete this Google Drive file https://drive.google.com/file/d/1n2B3c4D5e6F7g8H9i0JkLmNoPq/view",
+            &allowed,
+        )
+        .expect("expected drive delete fallback call");
+
+        assert_eq!(call.name, "gw_drive_delete");
+        assert_eq!(
+            call.arguments["file_id"],
+            "1n2B3c4D5e6F7g8H9i0JkLmNoPq"
+        );
+    }
+
+    #[test]
+    fn intent_fallback_deletes_gmail_from_message_id() {
+        let mut allowed = HashSet::new();
+        allowed.insert("gw_gmail_delete".to_string());
+
+        let call = build_intent_fallback_tool_call(
+            "Delete this Gmail with message_id 18af9f0a8bcdef12",
+            &allowed,
+        )
+        .expect("expected gmail delete fallback call");
+
+        assert_eq!(call.name, "gw_gmail_delete");
+        assert_eq!(call.arguments["message_id"], "18af9f0a8bcdef12");
+    }
+
+    #[test]
+    fn intent_fallback_deletes_calendar_event_with_event_id() {
+        let mut allowed = HashSet::new();
+        allowed.insert("gw_calendar_delete".to_string());
+
+        let call = build_intent_fallback_tool_call(
+            "Cancel this meeting event_id abc123def456ghi789",
+            &allowed,
+        )
+        .expect("expected calendar delete fallback call");
+
+        assert_eq!(call.name, "gw_calendar_delete");
+        assert_eq!(call.arguments["event_id"], "abc123def456ghi789");
+    }
+
+    #[test]
     fn intent_fallback_respects_requested_gmail_result_limit() {
         let mut allowed = HashSet::new();
         allowed.insert("gw_gmail_inbox".to_string());
@@ -3454,6 +6043,34 @@ print("hello")
 
         assert_eq!(call.name, "gw_gmail_inbox");
         assert_eq!(call.arguments["query"], "in:inbox is:unread");
+    }
+
+    #[test]
+    fn forced_tool_directive_supports_hyphenated_mcp_tool_names() {
+        let mut allowed = HashSet::new();
+        allowed.insert("mcp_colab-mcp_execute_cell".to_string());
+
+        let call = build_intent_fallback_tool_call(
+            r#"#tool:mcp_colab-mcp_execute_cell {"code":"print('hello')"}"#,
+            &allowed,
+        )
+        .expect("expected forced tool fallback call");
+
+        assert_eq!(call.name, "mcp_colab-mcp_execute_cell");
+        assert_eq!(call.arguments["code"], "print('hello')");
+    }
+
+    #[test]
+    fn prompt_lab_colab_app_lock_matches_colab_mcp_tools() {
+        assert!(tool_matches_lab_app_lock(
+            "mcp_colab-mcp_execute_cell",
+            "colab"
+        ));
+        assert!(tool_matches_lab_app_lock(
+            "mcp_mycolabserver_list_notebooks",
+            "colab"
+        ));
+        assert!(!tool_matches_lab_app_lock("gw_gmail_inbox", "colab"));
     }
 
     #[test]

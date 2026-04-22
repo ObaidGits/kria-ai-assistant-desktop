@@ -49,6 +49,8 @@ pub enum KriaEvent {
     LlmDegradationChanged { level: String },
     /// An in-flight LLM stream was interrupted by a swap.
     LlmStreamInterrupted,
+    /// LLM server swap failed during spawn; `reason` describes the cause.
+    LlmSwapFailed { reason: String },
 }
 
 /// Central event bus using tokio broadcast channels.

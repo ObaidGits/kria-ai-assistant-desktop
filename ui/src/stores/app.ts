@@ -1,18 +1,55 @@
-import { createSignal } from "solid-js";
+import { createMemo, createSignal } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import hljsDarkThemeUrl from "highlight.js/styles/github-dark.css?url";
 import hljsLightThemeUrl from "highlight.js/styles/github.css?url";
 
+const STORAGE_KEYS = {
+  theme: "kria_theme",
+  environment: "kria_environment",
+  assistantSession: "kria_assistant_session_id",
+  promptLabSession: "kria_prompt_lab_session_id",
+} as const;
+
+function readStorageValue(key: string): string | null {
+  if (typeof window === "undefined") return null;
+  const value = window.localStorage.getItem(key);
+  return value && value.trim() ? value : null;
+}
+
+function writeStorageValue(key: string, value: string | null) {
+  if (typeof window === "undefined") return;
+  if (value && value.trim()) {
+    window.localStorage.setItem(key, value);
+  } else {
+    window.localStorage.removeItem(key);
+  }
+}
+
+const resolveInitialEnvironment = (): "assistant" | "prompt_lab" => {
+  const saved = readStorageValue(STORAGE_KEYS.environment);
+  return saved === "prompt_lab" ? "prompt_lab" : "assistant";
+};
+
 // --- Signals ---
-const [messages, setMessages] = createSignal<Message[]>([]);
+const [assistantMessages, setAssistantMessages] = createSignal<Message[]>([]);
+const [promptLabMessages, setPromptLabMessages] = createSignal<Message[]>([]);
 const [sessions, setSessions] = createSignal<Session[]>([]);
-const [currentSession, setCurrentSession] = createSignal<string | null>(null);
-const [isThinking, setIsThinking] = createSignal(false);
+const [assistantCurrentSession, setAssistantCurrentSession] = createSignal<string | null>(
+  readStorageValue(STORAGE_KEYS.assistantSession)
+);
+const [promptLabCurrentSession, setPromptLabCurrentSession] = createSignal<string | null>(
+  readStorageValue(STORAGE_KEYS.promptLabSession)
+);
+const [assistantIsThinking, setAssistantIsThinking] = createSignal(false);
+const [promptLabIsThinking, setPromptLabIsThinking] = createSignal(false);
 const [showSettings, setShowSettings] = createSignal(false);
-const [showHitl, setShowHitl] = createSignal(false);
-const [hitlRequest, setHitlRequest] = createSignal<HitlRequest | null>(null);
-const [toolChoiceRequest, setToolChoiceRequest] = createSignal<ToolChoiceRequest | null>(null);
+const [assistantShowHitl, setAssistantShowHitl] = createSignal(false);
+const [promptLabShowHitl, setPromptLabShowHitl] = createSignal(false);
+const [assistantHitlRequest, setAssistantHitlRequest] = createSignal<HitlRequest | null>(null);
+const [promptLabHitlRequest, setPromptLabHitlRequest] = createSignal<HitlRequest | null>(null);
+const [assistantToolChoiceRequest, setAssistantToolChoiceRequest] = createSignal<ToolChoiceRequest | null>(null);
+const [promptLabToolChoiceRequest, setPromptLabToolChoiceRequest] = createSignal<ToolChoiceRequest | null>(null);
 const [voiceActive, setVoiceActive] = createSignal(false);
 const [voiceState, setVoiceState] = createSignal<"idle" | "listening" | "processing" | "speaking">("idle");
 const [voiceLiveTranscript, setVoiceLiveTranscript] = createSignal("");
@@ -25,7 +62,7 @@ const [models, setModels] = createSignal<any[]>([]);
 const [audioDevices, setAudioDevices] = createSignal<AudioDevicesData | null>(null);
 const resolveInitialTheme = (): "dark" | "light" => {
   if (typeof window === "undefined") return "dark";
-  const saved = window.localStorage.getItem("kria_theme");
+  const saved = readStorageValue(STORAGE_KEYS.theme);
   return saved === "light" ? "light" : "dark";
 };
 
@@ -42,6 +79,38 @@ const [alerts, setAlerts] = createSignal<ProactiveAlert[]>([]);
 // Orchestrator swap state
 const [isSwapping, setIsSwapping] = createSignal(false);
 const [degradationLevel, setDegradationLevel] = createSignal<string | null>(null);
+const [currentEnvironment, setCurrentEnvironmentSignal] = createSignal<"assistant" | "prompt_lab">(
+  resolveInitialEnvironment()
+);
+const [lastPromptLabProfile, setLastPromptLabProfile] = createSignal<PromptLabProfile | undefined>(undefined);
+const [latestAgentStage, setLatestAgentStage] = createSignal<AgentStageEvent | null>(null);
+const [colabDispatchWarning, setColabDispatchWarning] = createSignal<string | null>(null);
+
+const currentSession = createMemo<string | null>(() =>
+  currentEnvironment() === "prompt_lab" ? promptLabCurrentSession() : assistantCurrentSession()
+);
+
+const messages = createMemo<Message[]>(() =>
+  currentEnvironment() === "prompt_lab" ? promptLabMessages() : assistantMessages()
+);
+
+const isThinking = createMemo<boolean>(() =>
+  currentEnvironment() === "prompt_lab" ? promptLabIsThinking() : assistantIsThinking()
+);
+
+const showHitl = createMemo<boolean>(() =>
+  currentEnvironment() === "prompt_lab" ? promptLabShowHitl() : assistantShowHitl()
+);
+
+const hitlRequest = createMemo<HitlRequest | null>(() =>
+  currentEnvironment() === "prompt_lab" ? promptLabHitlRequest() : assistantHitlRequest()
+);
+
+const toolChoiceRequest = createMemo<ToolChoiceRequest | null>(() =>
+  currentEnvironment() === "prompt_lab"
+    ? promptLabToolChoiceRequest()
+    : assistantToolChoiceRequest()
+);
 
 let healthLoadInFlight = false;
 let healthLoadQueued = false;
@@ -116,6 +185,12 @@ export interface ToolChoiceRequest {
   confidence: number;
   minConfidence: number;
   candidates: ToolChoiceCandidate[];
+}
+
+export interface PromptLabProfile {
+  appLock?: string | null;
+  toolLock?: string | null;
+  strategy?: "direct" | "routed_within_lock";
 }
 
 export interface McpServer {
@@ -198,11 +273,129 @@ export interface AssistantStatus {
   detail: string;
 }
 
+export interface AgentStageEvent {
+  step: string;
+  message: string;
+  detail?: Record<string, unknown> | null;
+  ts?: string;
+}
+
+type StreamScope = "assistant" | "prompt_lab";
+
+function scopeFromEnvironment(): StreamScope {
+  return currentEnvironment() === "prompt_lab" ? "prompt_lab" : "assistant";
+}
+
+function getScopedCurrentSession(scope: StreamScope): string | null {
+  return scope === "prompt_lab" ? promptLabCurrentSession() : assistantCurrentSession();
+}
+
+function setScopedCurrentSession(scope: StreamScope, sessionId: string | null) {
+  if (scope === "prompt_lab") {
+    setPromptLabCurrentSession(sessionId);
+    writeStorageValue(STORAGE_KEYS.promptLabSession, sessionId);
+  } else {
+    setAssistantCurrentSession(sessionId);
+    writeStorageValue(STORAGE_KEYS.assistantSession, sessionId);
+  }
+}
+
+async function ensureScopedSessionActive(scope: StreamScope): Promise<string> {
+  let sessionId = getScopedCurrentSession(scope);
+  if (!sessionId) {
+    const created = await invoke<{ session_id: string }>("create_session");
+    sessionId = created.session_id;
+    setScopedCurrentSession(scope, sessionId);
+    await loadSessions();
+  }
+
+  await invoke("switch_session", { sessionId });
+  return sessionId;
+}
+
+async function syncEnvironmentSession(environment: "assistant" | "prompt_lab") {
+  const scope: StreamScope = environment === "prompt_lab" ? "prompt_lab" : "assistant";
+  const sessionId = getScopedCurrentSession(scope);
+  if (!sessionId) return;
+
+  try {
+    const hasMessages = scope === "prompt_lab" ? promptLabMessages().length > 0 : assistantMessages().length > 0;
+    await invoke("switch_session", { sessionId });
+    if (!hasMessages) {
+      const mapped = await loadMappedSessionHistory(sessionId);
+      updateScopedMessages(scope, () => mapped);
+    }
+  } catch (e) {
+    console.error("Failed to sync environment session:", e);
+  }
+}
+
+function setCurrentEnvironment(environment: "assistant" | "prompt_lab") {
+  if (currentEnvironment() === environment) return;
+  setCurrentEnvironmentSignal(environment);
+  writeStorageValue(STORAGE_KEYS.environment, environment);
+  void syncEnvironmentSession(environment);
+}
+
+function appendScopedMessage(scope: StreamScope, msg: Message) {
+  if (scope === "prompt_lab") {
+    setPromptLabMessages((prev) => [...prev, msg]);
+  } else {
+    setAssistantMessages((prev) => [...prev, msg]);
+  }
+}
+
+function updateScopedMessages(scope: StreamScope, updater: (prev: Message[]) => Message[]) {
+  if (scope === "prompt_lab") {
+    setPromptLabMessages(updater);
+  } else {
+    setAssistantMessages(updater);
+  }
+}
+
+function setScopedThinking(scope: StreamScope, value: boolean) {
+  if (scope === "prompt_lab") {
+    setPromptLabIsThinking(value);
+  } else {
+    setAssistantIsThinking(value);
+  }
+}
+
+function setScopedHitl(scope: StreamScope, request: HitlRequest | null, visible: boolean) {
+  if (scope === "prompt_lab") {
+    setPromptLabHitlRequest(request);
+    setPromptLabShowHitl(visible);
+  } else {
+    setAssistantHitlRequest(request);
+    setAssistantShowHitl(visible);
+  }
+}
+
+function setScopedToolChoice(scope: StreamScope, req: ToolChoiceRequest | null) {
+  if (scope === "prompt_lab") {
+    setPromptLabToolChoiceRequest(req);
+  } else {
+    setAssistantToolChoiceRequest(req);
+  }
+}
+
+function formatColabDispatchWarning(stage: AgentStageEvent): string {
+  const detail = stage.detail && typeof stage.detail === "object" ? stage.detail : null;
+  const requestedMode = typeof detail?.requested_mode === "string" ? detail.requested_mode : "colab";
+  const effectiveMode = typeof detail?.effective_mode === "string" ? detail.effective_mode : requestedMode;
+  const reason = typeof detail?.reason === "string" ? detail.reason : stage.message;
+  const runtimeState = typeof detail?.runtime_state === "string" ? detail.runtime_state : null;
+
+  return runtimeState
+    ? `Colab routing fallback (${requestedMode} -> ${effectiveMode}): ${reason} [state=${runtimeState}]`
+    : `Colab routing fallback (${requestedMode} -> ${effectiveMode}): ${reason}`;
+}
+
 // --- Actions ---
 async function sendMessage(text: string) {
   if (!text.trim()) return;
 
-  setToolChoiceRequest(null);
+  setScopedToolChoice("assistant", null);
 
   const userMsg: Message = {
     id: crypto.randomUUID(),
@@ -210,11 +403,12 @@ async function sendMessage(text: string) {
     content: text,
     timestamp: Date.now(),
   };
-  setMessages((prev) => [...prev, userMsg]);
+  appendScopedMessage("assistant", userMsg);
   setInputText("");
-  setIsThinking(true);
+  setScopedThinking("assistant", true);
 
   try {
+    await ensureScopedSessionActive("assistant");
     await invoke<{ status: string }>(
       "send_message",
       { message: text }
@@ -227,8 +421,48 @@ async function sendMessage(text: string) {
       content: `Error: ${e}`,
       timestamp: Date.now(),
     };
-    setMessages((prev) => [...prev, errMsg]);
-    setIsThinking(false);
+    appendScopedMessage("assistant", errMsg);
+    setScopedThinking("assistant", false);
+  }
+}
+
+async function sendLabMessage(text: string, profile?: PromptLabProfile) {
+  if (!text.trim()) return;
+
+  setScopedToolChoice("prompt_lab", null);
+
+  const userMsg: Message = {
+    id: crypto.randomUUID(),
+    role: "user",
+    content: text,
+    timestamp: Date.now(),
+  };
+  appendScopedMessage("prompt_lab", userMsg);
+  setInputText("");
+  setScopedThinking("prompt_lab", true);
+  setLastPromptLabProfile(profile);
+
+  const payload = {
+    message: text,
+    profile: {
+      app_lock: profile?.appLock ?? null,
+      tool_lock: profile?.toolLock ?? null,
+      strategy: profile?.strategy ?? "routed_within_lock",
+    },
+  };
+
+  try {
+    await ensureScopedSessionActive("prompt_lab");
+    await invoke<{ status: string }>("send_lab_message", payload);
+  } catch (e) {
+    const errMsg: Message = {
+      id: crypto.randomUUID(),
+      role: "system",
+      content: `Error: ${e}`,
+      timestamp: Date.now(),
+    };
+    appendScopedMessage("prompt_lab", errMsg);
+    setScopedThinking("prompt_lab", false);
   }
 }
 
@@ -253,9 +487,9 @@ async function sendImageMessage(imageData: Uint8Array, mimeType: string, text?: 
     timestamp: Date.now(),
     imageUrl: dataUrl,
   };
-  setMessages((prev) => [...prev, userMsg]);
+  appendScopedMessage("assistant", userMsg);
   setInputText("");
-  setIsThinking(true);
+  setScopedThinking("assistant", true);
 
   try {
     await invoke<{ status: string; attachment: string }>(
@@ -269,21 +503,21 @@ async function sendImageMessage(imageData: Uint8Array, mimeType: string, text?: 
       content: `Error: ${e}`,
       timestamp: Date.now(),
     };
-    setMessages((prev) => [...prev, errMsg]);
-    setIsThinking(false);
+    appendScopedMessage("assistant", errMsg);
+    setScopedThinking("assistant", false);
   }
 }
 
 async function approveAction(requestId: string) {
   await invoke("approve_action", { requestId });
-  setShowHitl(false);
-  setHitlRequest(null);
+  setScopedHitl("assistant", null, false);
+  setScopedHitl("prompt_lab", null, false);
 }
 
 async function denyAction(requestId: string, reason?: string) {
   await invoke("deny_action", { requestId, reason: reason ?? null });
-  setShowHitl(false);
-  setHitlRequest(null);
+  setScopedHitl("assistant", null, false);
+  setScopedHitl("prompt_lab", null, false);
 }
 
 async function toggleVoice() {
@@ -309,7 +543,7 @@ async function toggleVoice() {
         timestamp: Date.now(),
         toolCalls: [],
       };
-      setMessages((prev) => [...prev, errMsg]);
+      appendScopedMessage("assistant", errMsg);
       setVoiceActive(false);
       setVoiceState("idle");
     }
@@ -608,6 +842,59 @@ export interface GoogleWorkspaceStatus {
 
 const [googleStatus, setGoogleStatus] = createSignal<GoogleWorkspaceStatus | null>(null);
 
+export interface ColabMcpStatus {
+  state: string;
+  tool_count: number;
+  error: string | null;
+}
+
+export interface ColabDiscoveredTool {
+  name: string;
+  operation: string;
+  description: string;
+  parameter_count: number;
+}
+
+export interface ColabCapabilities {
+  category: string;
+  tool_count: number;
+  discovered_tools: ColabDiscoveredTool[];
+  features: {
+    notebook_discovery: boolean;
+    notebook_selection: boolean;
+    cell_execution: boolean;
+    artifact_io: boolean;
+    runtime_lifecycle: boolean;
+    package_management: boolean;
+    checkpointing: boolean;
+  };
+  ready_requirements: {
+    requires: string[];
+    satisfied: boolean;
+    missing: string[];
+  };
+}
+
+export interface ColabTierStatus {
+  enabled: boolean;
+  connected: boolean;
+  ready_for_cloud_task: boolean;
+  notebook_selection_required: boolean;
+  runtime_state: string;
+  selected_notebook: string | null;
+  mcp_server_name: string;
+  auto_escalate: boolean;
+  fallback_to_local: boolean;
+  connect_timeout_secs: number;
+  keepalive_interval_secs: number;
+  checkpoint_interval_secs: number;
+  mcp: ColabMcpStatus;
+  capabilities: ColabCapabilities;
+  warnings: string[];
+}
+
+const [colabStatus, setColabStatus] = createSignal<ColabTierStatus | null>(null);
+
 async function loadGoogleStatus(account?: string): Promise<GoogleWorkspaceStatus | null> {
   try {
     const result = await invoke<GoogleWorkspaceStatus>("get_google_workspace_status", { account: account ?? null });
@@ -644,15 +931,52 @@ async function disconnectGoogle(account?: string) {
   await loadGoogleStatus(account);
 }
 
+// --- Colab Tier ---
+async function loadColabStatus(): Promise<ColabTierStatus | null> {
+  try {
+    const result = await invoke<ColabTierStatus>("get_colab_tier_status");
+    setColabStatus(result);
+    return result;
+  } catch (e) {
+    console.error("Failed to load Colab status:", e);
+    return null;
+  }
+}
+
+async function connectColab(serverName?: string): Promise<ColabTierStatus | null> {
+  await invoke("connect_colab_tier", { serverName: serverName ?? null });
+  await loadMcpServers();
+  return loadColabStatus();
+}
+
+async function disconnectColab(): Promise<ColabTierStatus | null> {
+  await invoke("disconnect_colab_tier");
+  await loadMcpServers();
+  return loadColabStatus();
+}
+
+async function setColabNotebook(notebookId: string): Promise<ColabTierStatus | null> {
+  const result = await invoke<ColabTierStatus>("set_colab_selected_notebook", { notebookId });
+  setColabStatus(result);
+  return result;
+}
+
 function submitToolChoice(candidateName: string) {
   const req = toolChoiceRequest();
   if (!req) return;
-  setToolChoiceRequest(null);
-  void sendMessage(`#tool:${candidateName} ${req.query}`);
+  const scope = scopeFromEnvironment();
+  setScopedToolChoice(scope, null);
+
+  const forcedText = `#tool:${candidateName} ${req.query}`;
+  if (scope === "prompt_lab") {
+    void sendLabMessage(forcedText, lastPromptLabProfile());
+  } else {
+    void sendMessage(forcedText);
+  }
 }
 
 function dismissToolChoice() {
-  setToolChoiceRequest(null);
+  setScopedToolChoice(scopeFromEnvironment(), null);
 }
 
 // --- Settings management ---
@@ -710,7 +1034,7 @@ async function loadModels() {
 function applyTheme(t: "dark" | "light") {
   setTheme(t);
   if (typeof window !== "undefined") {
-    window.localStorage.setItem("kria_theme", t);
+    window.localStorage.setItem(STORAGE_KEYS.theme, t);
   }
   if (typeof document !== "undefined") {
     document.documentElement.setAttribute("data-theme", t);
@@ -755,8 +1079,12 @@ async function loadSessions() {
 async function createSession() {
   try {
     const result = await invoke<{ session_id: string }>("create_session");
-    setCurrentSession(result.session_id);
-    setMessages([]);
+    const scope = scopeFromEnvironment();
+    setScopedCurrentSession(scope, result.session_id);
+    await invoke("switch_session", { sessionId: result.session_id });
+    updateScopedMessages(scope, () => []);
+    setScopedToolChoice(scope, null);
+    setScopedThinking(scope, false);
     await loadSessions();
   } catch (e) {
     console.error("Failed to create session:", e);
@@ -828,57 +1156,62 @@ function parseStoredToolCall(
   };
 }
 
-async function switchSession(sessionId: string) {
-  try {
-    await invoke("switch_session", { sessionId });
-    setCurrentSession(sessionId);
-    // Load history for this session
-    const history = await invoke<{
-      role: string;
-      content: string;
-      timestamp: string;
-      tool_name?: string | null;
-      tool_result?: string | null;
-    }[]>(
-      "get_session_history",
-      { sessionId }
-    );
+async function loadMappedSessionHistory(sessionId: string): Promise<Message[]> {
+  const history = await invoke<{
+    role: string;
+    content: string;
+    timestamp: string;
+    tool_name?: string | null;
+    tool_result?: string | null;
+  }[]>(
+    "get_session_history",
+    { sessionId }
+  );
 
-    const mapped: Message[] = [];
-    for (const t of history) {
-      const ts = new Date(t.timestamp).getTime() || Date.now();
+  const mapped: Message[] = [];
+  for (const t of history) {
+    const ts = new Date(t.timestamp).getTime() || Date.now();
 
-      if (t.role === "tool" && t.tool_name) {
-        const tc = parseStoredToolCall(t.tool_name, t.tool_result);
-        const last = mapped[mapped.length - 1];
+    if (t.role === "tool" && t.tool_name) {
+      const tc = parseStoredToolCall(t.tool_name, t.tool_result);
+      const last = mapped[mapped.length - 1];
 
-        if (last?.role === "assistant") {
-          mapped[mapped.length - 1] = {
-            ...last,
-            toolCalls: [...(last.toolCalls || []), tc],
-            timestamp: Math.max(last.timestamp, ts),
-          };
-        } else {
-          mapped.push({
-            id: crypto.randomUUID(),
-            role: "assistant",
-            content: "",
-            timestamp: ts,
-            toolCalls: [tc],
-          });
-        }
-        continue;
+      if (last?.role === "assistant") {
+        mapped[mapped.length - 1] = {
+          ...last,
+          toolCalls: [...(last.toolCalls || []), tc],
+          timestamp: Math.max(last.timestamp, ts),
+        };
+      } else {
+        mapped.push({
+          id: crypto.randomUUID(),
+          role: "assistant",
+          content: "",
+          timestamp: ts,
+          toolCalls: [tc],
+        });
       }
-
-      mapped.push({
-        id: crypto.randomUUID(),
-        role: normalizeRole(t.role),
-        content: t.content,
-        timestamp: ts,
-      });
+      continue;
     }
 
-    setMessages(mapped);
+    mapped.push({
+      id: crypto.randomUUID(),
+      role: normalizeRole(t.role),
+      content: t.content,
+      timestamp: ts,
+    });
+  }
+
+  return mapped;
+}
+
+async function switchSession(sessionId: string) {
+  try {
+    const scope = scopeFromEnvironment();
+    await invoke("switch_session", { sessionId });
+    setScopedCurrentSession(scope, sessionId);
+    const mapped = await loadMappedSessionHistory(sessionId);
+    updateScopedMessages(scope, () => mapped);
   } catch (e) {
     console.error("Failed to switch session:", e);
   }
@@ -887,9 +1220,19 @@ async function switchSession(sessionId: string) {
 async function deleteSession(sessionId: string) {
   try {
     await invoke("delete_session", { sessionId });
-    if (currentSession() === sessionId) {
-      setCurrentSession(null);
-      setMessages([]);
+    if (assistantCurrentSession() === sessionId) {
+      setScopedCurrentSession("assistant", null);
+      setAssistantMessages([]);
+      setAssistantIsThinking(false);
+      setScopedToolChoice("assistant", null);
+      setScopedHitl("assistant", null, false);
+    }
+    if (promptLabCurrentSession() === sessionId) {
+      setScopedCurrentSession("prompt_lab", null);
+      setPromptLabMessages([]);
+      setPromptLabIsThinking(false);
+      setScopedToolChoice("prompt_lab", null);
+      setScopedHitl("prompt_lab", null, false);
     }
     await loadSessions();
   } catch (e) {
@@ -908,123 +1251,101 @@ async function renameSession(sessionId: string, title: string) {
 
 // --- Event listeners (set up once) ---
 function initListeners() {
-  listen<{ text: string }>("agent:token", (event) => {
-    // Append streaming token to last assistant message
-    setMessages((prev) => {
-      const last = prev[prev.length - 1];
-      if (last?.role === "assistant") {
+  const registerStreamListeners = (eventPrefix: "agent" | "prompt_lab", scope: StreamScope) => {
+    listen<{ text: string }>(`${eventPrefix}:token`, (event) => {
+      updateScopedMessages(scope, (prev) => {
+        const last = prev[prev.length - 1];
+        if (last?.role === "assistant") {
+          return [
+            ...prev.slice(0, -1),
+            { ...last, content: last.content + event.payload.text },
+          ];
+        }
         return [
-          ...prev.slice(0, -1),
-          { ...last, content: last.content + event.payload.text },
+          ...prev,
+          {
+            id: crypto.randomUUID(),
+            role: "assistant",
+            content: event.payload.text,
+            timestamp: Date.now(),
+          },
         ];
-      }
-      return [
-        ...prev,
-        {
-          id: crypto.randomUUID(),
-          role: "assistant",
-          content: event.payload.text,
-          timestamp: Date.now(),
-        },
-      ];
+      });
     });
-  });
 
-  listen<{ status?: string; plan?: string }>("agent:thinking", (event) => {
-    setIsThinking(true);
-  });
+    listen<{ status?: string; plan?: string }>(`${eventPrefix}:thinking`, () => {
+      setScopedThinking(scope, true);
+    });
 
-  listen("agent:done", () => {
-    setIsThinking(false);
-    loadSessions(); // Refresh sidebar after response completes
-    loadHealth();
-  });
+    listen(`${eventPrefix}:done`, () => {
+      setScopedThinking(scope, false);
+      loadSessions();
+      loadHealth();
+    });
 
-  listen<HitlRequest>("agent:approval_required", (event) => {
-    setHitlRequest(event.payload);
-    setShowHitl(true);
-  });
+    listen<HitlRequest>(`${eventPrefix}:approval_required`, (event) => {
+      setScopedHitl(scope, event.payload, true);
+    });
 
-  listen<ToolChoiceRequest>("agent:tool_choice_required", (event) => {
-    setToolChoiceRequest(event.payload);
-    setIsThinking(false);
-  });
+    listen<ToolChoiceRequest>(`${eventPrefix}:tool_choice_required`, (event) => {
+      setScopedToolChoice(scope, event.payload);
+      setScopedThinking(scope, false);
+    });
 
-  // Tool call started — add to last assistant message's toolCalls
-  listen<{ name: string; params: Record<string, unknown> }>("agent:tool_call", (event) => {
-    const { name, params } = event.payload;
-    setMessages((prev) => {
-      const last = prev[prev.length - 1];
-      if (last?.role === "assistant") {
-        const tc: ToolCall = { name, args: params, status: "running" };
+    listen<{ name: string; params: Record<string, unknown> }>(`${eventPrefix}:tool_call`, (event) => {
+      const { name, params } = event.payload;
+      updateScopedMessages(scope, (prev) => {
+        const last = prev[prev.length - 1];
+        if (last?.role === "assistant") {
+          const tc: ToolCall = { name, args: params, status: "running" };
+          return [
+            ...prev.slice(0, -1),
+            { ...last, toolCalls: [...(last.toolCalls || []), tc] },
+          ];
+        }
         return [
-          ...prev.slice(0, -1),
-          { ...last, toolCalls: [...(last.toolCalls || []), tc] },
+          ...prev,
+          {
+            id: crypto.randomUUID(),
+            role: "assistant",
+            content: "",
+            timestamp: Date.now(),
+            toolCalls: [{ name, args: params, status: "running" }],
+          },
         ];
-      }
-      // If no assistant message yet, create a placeholder
-      return [
-        ...prev,
-        {
-          id: crypto.randomUUID(),
-          role: "assistant",
-          content: "",
-          timestamp: Date.now(),
-          toolCalls: [{ name, args: params, status: "running" }],
-        },
-      ];
+      });
     });
-  });
 
-  // Tool result — update the matching tool call status and result
-  listen<{
-    name: string;
-    result: unknown;
-    success: boolean;
-    metadata?: {
-      confidence?: number;
-      source_count?: number;
-      freshness_age_hours?: number | null;
-      region_match?: boolean | null;
-    } | null;
-  }>("agent:tool_result", (event) => {
-    const { name, result, success, metadata } = event.payload;
-    setMessages((prev) => {
-      const last = prev[prev.length - 1];
-      if (last?.role === "assistant" && last.toolCalls?.length) {
-        const updated = last.toolCalls.map((tc) => {
-          if (tc.name === name && tc.status === "running") {
-            return {
-              ...tc,
-              status: (success ? "done" : "error") as ToolCall["status"],
-              result,
-              metadata: metadata
-                ? {
-                    confidence: metadata.confidence,
-                    sourceCount: metadata.source_count,
-                    freshnessAgeHours: metadata.freshness_age_hours,
-                    regionMatch: metadata.region_match,
-                  }
-                : tc.metadata,
-            };
-          }
-          return tc;
-        });
-        return [...prev.slice(0, -1), { ...last, toolCalls: updated }];
-      }
-      return prev;
-    });
-  });
-
-  // Approval result — update denied tool calls
-  listen<{ action: string; approved: boolean }>("agent:approval_result", (event) => {
-    if (!event.payload.approved) {
-      setMessages((prev) => {
+    listen<{
+      name: string;
+      result: unknown;
+      success: boolean;
+      metadata?: {
+        confidence?: number;
+        source_count?: number;
+        freshness_age_hours?: number | null;
+        region_match?: boolean | null;
+      } | null;
+    }>(`${eventPrefix}:tool_result`, (event) => {
+      const { name, result, success, metadata } = event.payload;
+      updateScopedMessages(scope, (prev) => {
         const last = prev[prev.length - 1];
         if (last?.role === "assistant" && last.toolCalls?.length) {
           const updated = last.toolCalls.map((tc) => {
-            if (tc.name === event.payload.action && tc.status === "running") {
-              return { ...tc, status: "denied" as ToolCall["status"], result: "User denied" };
+            if (tc.name === name && tc.status === "running") {
+              return {
+                ...tc,
+                status: (success ? "done" : "error") as ToolCall["status"],
+                result,
+                metadata: metadata
+                  ? {
+                      confidence: metadata.confidence,
+                      sourceCount: metadata.source_count,
+                      freshnessAgeHours: metadata.freshness_age_hours,
+                      regionMatch: metadata.region_match,
+                    }
+                  : tc.metadata,
+              };
             }
             return tc;
           });
@@ -1032,6 +1353,43 @@ function initListeners() {
         }
         return prev;
       });
+    });
+
+    listen<{ action: string; approved: boolean }>(`${eventPrefix}:approval_result`, (event) => {
+      if (!event.payload.approved) {
+        updateScopedMessages(scope, (prev) => {
+          const last = prev[prev.length - 1];
+          if (last?.role === "assistant" && last.toolCalls?.length) {
+            const updated = last.toolCalls.map((tc) => {
+              if (tc.name === event.payload.action && tc.status === "running") {
+                return { ...tc, status: "denied" as ToolCall["status"], result: "User denied" };
+              }
+              return tc;
+            });
+            return [...prev.slice(0, -1), { ...last, toolCalls: updated }];
+          }
+          return prev;
+        });
+      }
+    });
+  };
+
+  registerStreamListeners("agent", "assistant");
+  registerStreamListeners("prompt_lab", "prompt_lab");
+
+  listen<AgentStageEvent>("agent:stage", (event) => {
+    const stage = event.payload;
+    setLatestAgentStage(stage);
+
+    if (stage.step === "colab_dispatch_fallback_local" || stage.step === "colab_dispatch_blocked") {
+      setColabDispatchWarning(formatColabDispatchWarning(stage));
+      void loadColabStatus();
+      return;
+    }
+
+    if (stage.step === "colab_dispatch_ready") {
+      setColabDispatchWarning(null);
+      void loadColabStatus();
     }
   });
 
@@ -1057,19 +1415,17 @@ function initListeners() {
   });
 
   listen<{ text: string; confidence?: number; language?: string; stability?: number }>("voice:transcript", (event) => {
-    // Clear partial transcript on final result
     setVoiceLiveTranscript("");
     setVoiceLiveConfidence(event.payload.confidence ?? null);
     setVoiceLiveLanguage(event.payload.language ?? "auto");
     setVoiceLiveStability(event.payload.stability ?? null);
-    // Show the transcript as a user message
     const userMsg: Message = {
       id: crypto.randomUUID(),
       role: "user",
       content: `🎤 ${event.payload.text}`,
       timestamp: Date.now(),
     };
-    setMessages((prev) => [...prev, userMsg]);
+    appendScopedMessage("assistant", userMsg);
   });
 
   listen<{ error: string }>("voice:error", (event) => {
@@ -1080,7 +1436,7 @@ function initListeners() {
       content: `⚠️ Voice Error: ${event.payload.error}`,
       timestamp: Date.now(),
     };
-    setMessages((prev) => [...prev, errMsg]);
+    appendScopedMessage("assistant", errMsg);
   });
 
   // Orchestrator events — track GPU swap state
@@ -1101,6 +1457,24 @@ function initListeners() {
   listen<{ level: string }>("orchestrator:degradation_changed", (event) => {
     setDegradationLevel(event.payload.level);
   });
+
+  listen<ColabTierStatus | null>("colab:status", (event) => {
+    const payload = event.payload;
+    if (payload && typeof payload === "object") {
+      setColabStatus(payload as ColabTierStatus);
+      if ((payload as ColabTierStatus).ready_for_cloud_task) {
+        setColabDispatchWarning(null);
+      }
+      return;
+    }
+
+    void loadColabStatus();
+  });
+}
+
+async function initializeSessionPersistence() {
+  await loadSessions();
+  await syncEnvironmentSession(currentEnvironment());
 }
 
 // Initialize listeners on import
@@ -1108,10 +1482,11 @@ initListeners();
 // Initialize theme before first render to avoid color/theme flash.
 applyTheme(theme());
 // Load existing sessions on startup
-loadSessions();
+void initializeSessionPersistence();
 // Load settings on startup
 loadSettings();
 loadAudioDevices();
+void loadColabStatus();
 // Prime and refresh system health for UI status indicators.
 loadHealth();
 setInterval(() => {
@@ -1137,11 +1512,14 @@ export const appStore = {
   voiceLiveStability,
   inputText,
   setInputText,
+  currentEnvironment,
+  setCurrentEnvironment,
   settings,
   models,
   audioDevices,
   theme,
   sendMessage,
+  sendLabMessage,
   sendImageMessage,
   approveAction,
   denyAction,
@@ -1192,6 +1570,13 @@ export const appStore = {
   setGoogleAccount,
   connectGoogle,
   disconnectGoogle,
+  colabStatus,
+  latestAgentStage,
+  colabDispatchWarning,
+  loadColabStatus,
+  connectColab,
+  disconnectColab,
+  setColabNotebook,
   reconcileMcpRuntime,
   restartMcpServerRuntime,
   submitToolChoice,

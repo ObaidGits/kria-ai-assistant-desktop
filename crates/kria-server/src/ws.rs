@@ -9,6 +9,7 @@ use axum::{
     Router,
 };
 use futures::{SinkExt, StreamExt};
+use kria_core::infra::pipeline_trace::{log_pipeline_step, sanitize_text_for_logs};
 use std::sync::Arc;
 
 pub fn ws_routes() -> Router<Arc<ServerState>> {
@@ -54,6 +55,19 @@ async fn handle_socket(socket: WebSocket, _state: Arc<ServerState>) {
                             "chat" => {
                                 let user_msg =
                                     val.get("message").and_then(|m| m.as_str()).unwrap_or("");
+                                let session_id = val
+                                    .get("session_id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("ws");
+
+                                log_pipeline_step(
+                                    session_id,
+                                    "server_ws_chat_received",
+                                    "WebSocket chat message received",
+                                    Some(serde_json::json!({
+                                        "message_preview": sanitize_text_for_logs(user_msg, 220),
+                                    })),
+                                );
 
                                 // Stream agent response events
                                 let ack = serde_json::json!({
@@ -68,6 +82,18 @@ async fn handle_socket(socket: WebSocket, _state: Arc<ServerState>) {
                                     "text": format!("Received: {user_msg}"),
                                 });
                                 let _ = sender.send(Message::Text(done.to_string().into())).await;
+
+                                log_pipeline_step(
+                                    session_id,
+                                    "server_ws_chat_done",
+                                    "WebSocket chat stub response sent",
+                                    Some(serde_json::json!({
+                                        "reply_preview": sanitize_text_for_logs(
+                                            &format!("Received: {user_msg}"),
+                                            200,
+                                        ),
+                                    })),
+                                );
                             }
                             "approve" | "deny" => {
                                 // HITL approval/denial

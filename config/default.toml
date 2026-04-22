@@ -106,11 +106,27 @@ recover_threshold_mb = 2048                  # Free VRAM (MB) above → recover 
 cooldown_secs = 60
 max_transitions_per_hour = 6
 min_ngl_delta = 3
+min_ngl_delta_up = 6                         # Larger delta required to scale up (anti-thrash)
 safety_margin_mb = 256
+hysteresis_band_mb = 256                     # Deadband above yield threshold before exiting Pressured
+pressure_dwell_secs = 5                      # VRAM must be below yield for this long before swap
+emergency_dwell_ms = 750                     # VRAM must be below emergency for this long (blocks driver spikes)
+recovery_dwell_secs = 30                     # VRAM must be above recover for this long before scale-up
+state_max_dwell_secs = 300                   # Hard cap: any state older than this forces Idle resync
+max_emergency_transitions_per_hour = 3       # Separate rate budget for emergency swaps
 llama_server_binary = "/home/obaid/Downloads/llama.cpp/build/bin/llama-server"
 flash_attention = true
 mlock = true
 batch_size = 256
+graceful_stop_timeout_secs = 5               # Graceful stop wait before kill escalation
+health_check_timeout_secs = 120              # Spawn readiness timeout (/health)
+port_discovery_timeout_secs = 60             # Ephemeral port discovery timeout
+vram_release_timeout_secs = 5                # GPU release confirmation budget (seconds)
+restart_cooldown_secs = 10                   # Min cooldown between auto-restarts
+restart_backoff_ms = 350                     # Retry backoff before fallback spawn
+idle_release_enabled = true                  # Release local llama-server when idle
+idle_release_after_secs = 300                # Idle window before GPU/runtime release
+idle_release_check_interval_secs = 10        # Idle watchdog polling interval
 macos_yield_ram_mb = 2048
 macos_emergency_ram_mb = 1024
 macos_recover_ram_mb = 4096
@@ -124,3 +140,37 @@ min_context = 2048                           # Hard floor — never go below
 max_context = 8192
 has_vision_projector = true
 mmproj_vram_mb = 1300                        # mmproj-F16.gguf ~1291 MiB
+
+# ── Colab Cloud Tier ────────────────────────────────────────────────
+[colab]
+enabled = false
+mcp_server_name = "colab-mcp"               # Official Colab MCP server name (uvx git+https://github.com/googlecolab/colab-mcp)
+connect_timeout_secs = 60
+keepalive_interval_secs = 120
+checkpoint_interval_secs = 300
+auto_escalate = true
+fallback_to_local = true
+
+# ── Semantic Routing ────────────────────────────────────────────────
+[routing]
+# Embedding model used for semantic domain routing.
+# multilingual-e5-small: ~120 MB, strong Hinglish support.
+# bge-small-en-v1.5: ~30 MB, English-only.
+embedding_model = "multilingual-e5-small"
+
+# Cache directory for embeddings (relative to ~/.kria).
+cache_dir = "cache/router"
+
+# Whether to use grammar-constrained decoding (llguidance / json_schema).
+# Requires llama.cpp build with llguidance support (mainline since 2025).
+grammar_enabled = true
+
+# OOD detection: z-score below this → similarity is low relative to OOD baseline.
+# The test is relative — no need to tune per embedding model.
+ood_z_threshold = 0.5
+
+# OOD detection: entropy fraction of H_max above this → too diffuse to be tool-directed.
+ood_entropy_threshold = 0.85
+
+# Multi-intent detection: margin below this triggers soft multi-domain check.
+multi_intent_margin = 0.04

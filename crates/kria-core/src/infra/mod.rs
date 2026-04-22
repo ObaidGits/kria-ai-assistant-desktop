@@ -6,6 +6,7 @@ pub mod hardware_profiler;
 pub mod health;
 pub mod isolation;
 pub mod logging;
+pub mod pipeline_trace;
 pub mod provisioning;
 pub mod supervisor;
 

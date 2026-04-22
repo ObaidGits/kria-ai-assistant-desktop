@@ -1,5 +1,6 @@
 use crate::safety::RiskLevel;
 use rusqlite::{params, Connection};
+use sha2::{Digest, Sha256};
 use std::sync::Mutex;
 
 /// Decision made by the policy/HITL system.
@@ -85,7 +86,9 @@ impl AuditLogger {
                 error_msg   TEXT,
                 rollback_id TEXT,
                 duration_ms INTEGER,
-                network_url TEXT
+                network_url TEXT,
+                prev_hash   TEXT,
+                row_hash    TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp);
             CREATE INDEX IF NOT EXISTS idx_audit_session   ON audit_log(session_id);
@@ -93,12 +96,30 @@ impl AuditLogger {
             CREATE INDEX IF NOT EXISTS idx_audit_action    ON audit_log(action);"
         ).expect("failed to create audit_log table");
 
+        // Hash-chain migration: silently add columns if they don't exist yet
+        // (for databases created before this version). SQLite does NOT support
+        // `ALTER TABLE … ADD COLUMN IF NOT EXISTS`, so we probe pragma_table_info.
+        let has_column = |name: &str| -> bool {
+            conn.prepare("SELECT 1 FROM pragma_table_info('audit_log') WHERE name = ?1")
+                .and_then(|mut stmt| stmt.exists([name]))
+                .unwrap_or(false)
+        };
+        if !has_column("prev_hash") {
+            let _ = conn.execute("ALTER TABLE audit_log ADD COLUMN prev_hash TEXT", []);
+        }
+        if !has_column("row_hash") {
+            let _ = conn.execute("ALTER TABLE audit_log ADD COLUMN row_hash TEXT", []);
+        }
+
         Self {
             conn: Mutex::new(conn),
         }
     }
 
     /// Log a tool action with its policy decision.
+    ///
+    /// Each row is hash-chained: `row_hash = SHA-256(prev_hash || timestamp || session_id || action || parameters || decision)`.
+    /// The first row in the log has `prev_hash = "GENESIS"`.
     pub fn log(
         &self,
         session_id: &str,
@@ -109,16 +130,50 @@ impl AuditLogger {
         decided_by: DecidedBy,
     ) {
         let conn = self.conn.lock().unwrap();
+
+        // Fetch the hash of the previous row to chain to.
+        let prev_hash: String = conn
+            .query_row(
+                "SELECT COALESCE(row_hash, 'GENESIS') FROM audit_log ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| "GENESIS".to_string());
+
+        // Timestamp for this row (use the same value we'll insert).
+        let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+        let params_str = parameters.to_string();
+
+        // Compute row_hash = SHA-256(prev_hash || timestamp || session_id || action || params || decision).
+        let row_hash = {
+            let mut h = Sha256::new();
+            h.update(prev_hash.as_bytes());
+            h.update(b"|");
+            h.update(timestamp.as_bytes());
+            h.update(b"|");
+            h.update(session_id.as_bytes());
+            h.update(b"|");
+            h.update(action.as_bytes());
+            h.update(b"|");
+            h.update(params_str.as_bytes());
+            h.update(b"|");
+            h.update(decision.as_str().as_bytes());
+            hex::encode(h.finalize())
+        };
+
         let _ = conn.execute(
-            "INSERT INTO audit_log (session_id, action, parameters, risk_level, decision, decided_by)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO audit_log (timestamp, session_id, action, parameters, risk_level, decision, decided_by, prev_hash, row_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
+                timestamp,
                 session_id,
                 action,
-                parameters.to_string(),
+                params_str,
                 risk_level.as_str(),
                 decision.as_str(),
                 decided_by.as_str(),
+                prev_hash,
+                row_hash,
             ],
         );
     }
@@ -213,5 +268,76 @@ impl AuditLogger {
             m.insert(level, serde_json::Value::Number(count.into()));
         }
         serde_json::Value::Object(m)
+    }
+
+    /// Verify the hash-chain integrity of the entire audit log.
+    ///
+    /// Walks every row in insertion order and recomputes `row_hash`.
+    /// Returns `Ok(rows_verified)` on success, or `Err(first_broken_id)` on tamper detection.
+    pub fn verify_chain(&self) -> Result<usize, i64> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, timestamp, session_id, action, parameters, decision, prev_hash, row_hash \
+                 FROM audit_log ORDER BY id ASC",
+            )
+            .map_err(|_| -1i64)?;
+
+        struct Row {
+            id: i64,
+            timestamp: String,
+            session_id: String,
+            action: String,
+            parameters: String,
+            decision: String,
+            prev_hash: String,
+            row_hash: String,
+        }
+
+        let rows: Vec<Row> = stmt
+            .query_map([], |r| {
+                Ok(Row {
+                    id: r.get(0)?,
+                    timestamp: r.get(1)?,
+                    session_id: r.get(2)?,
+                    action: r.get(3)?,
+                    parameters: r.get(4)?,
+                    decision: r.get(5)?,
+                    prev_hash: r.get::<_, Option<String>>(6)?.unwrap_or_else(|| "GENESIS".into()),
+                    row_hash: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                })
+            })
+            .map_err(|_| -1i64)?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut count = 0;
+        for row in &rows {
+            // Rows without a hash were logged by the pre-hash-chain version — skip.
+            if row.row_hash.is_empty() {
+                count += 1;
+                continue;
+            }
+
+            let mut h = Sha256::new();
+            h.update(row.prev_hash.as_bytes());
+            h.update(b"|");
+            h.update(row.timestamp.as_bytes());
+            h.update(b"|");
+            h.update(row.session_id.as_bytes());
+            h.update(b"|");
+            h.update(row.action.as_bytes());
+            h.update(b"|");
+            h.update(row.parameters.as_bytes());
+            h.update(b"|");
+            h.update(row.decision.as_bytes());
+            let expected = hex::encode(h.finalize());
+
+            if expected != row.row_hash {
+                return Err(row.id);
+            }
+            count += 1;
+        }
+        Ok(count)
     }
 }

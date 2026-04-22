@@ -2,6 +2,8 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use std::collections::HashSet;
 
+use crate::platform::intent::capability::Capability;
+use crate::platform::intent::scheme::{classify_url, SchemeError};
 use crate::safety::blacklist::BlacklistChecker;
 
 /// Risk classification tier.
@@ -168,6 +170,7 @@ static GREEN_ACTIONS: Lazy<HashSet<&str>> = Lazy::new(|| {
         "audio_preprocess",
         // Misc
         "open_url",
+        "send_message",
         "list_installed_packages",
         // Package queries (read-only)
         "search_package",
@@ -496,6 +499,165 @@ impl PolicyEngine {
         }
         false
     }
+
+    /// Classify a typed `Capability` token and return the policy decision.
+    ///
+    /// This is the primary entry point for the OS-intent dispatcher. Unlike
+    /// `evaluate()` which works on string action names, this function has full
+    /// access to the structured capability payload and can make precise decisions
+    /// without string matching.
+    ///
+    /// # Security notes
+    /// - `file://`, `smb://`, `javascript:` etc. are permanently BLACK here as a
+    ///   defense-in-depth layer — `scheme::classify_url` already blocked them
+    ///   before `Capability::OpenUrl` was constructed, but we double-check.
+    /// - `AxInvoke` is always RED — it requires typed PIN and per-app opt-in.
+    /// - `FileWrite` under system roots is BLACK (caught by `SandboxedPath` constructor,
+    ///   but we enforce it here too for defense-in-depth).
+    pub fn classify_capability(
+        &self,
+        cap: &Capability,
+        registry_schemes: Option<&HashSet<String>>,
+    ) -> PolicyDecision {
+        match cap {
+            // ── OpenUrl ──────────────────────────────────────────────────────
+            Capability::OpenUrl { url } => {
+                match classify_url(url, registry_schemes) {
+                    Err(SchemeError::PermanentlyBlocked(scheme)) => PolicyDecision {
+                        risk_level: RiskLevel::Black,
+                        action: format!("open_url:{scheme}"),
+                        requires_approval: false,
+                        blocked: true,
+                        reason: format!("scheme '{scheme}' is permanently blocked"),
+                        escalated_from: None,
+                    },
+                    Err(SchemeError::UnknownDeepLink(scheme)) => PolicyDecision {
+                        risk_level: RiskLevel::Black,
+                        action: format!("open_url:{scheme}"),
+                        requires_approval: false,
+                        blocked: true,
+                        reason: format!(
+                            "scheme '{scheme}' is not registered by any installed application"
+                        ),
+                        escalated_from: None,
+                    },
+                    Err(e) => PolicyDecision {
+                        risk_level: RiskLevel::Black,
+                        action: "open_url".to_string(),
+                        requires_approval: false,
+                        blocked: true,
+                        reason: format!("URL classification failed: {e}"),
+                        escalated_from: None,
+                    },
+                    Ok(classification) => {
+                        let (requires_approval, reason) = match classification.risk {
+                            RiskLevel::Green => (false, "auto-execute: standard safe URI".into()),
+                            RiskLevel::Yellow => (
+                                false,
+                                "execute + preview: deep-link to registered app".into(),
+                            ),
+                            RiskLevel::Red => (
+                                true,
+                                "requires approval: unusual URI scheme".into(),
+                            ),
+                            RiskLevel::Black => unreachable!("classify_url never returns Black Ok"),
+                        };
+                        PolicyDecision {
+                            risk_level: classification.risk,
+                            action: "open_url".to_string(),
+                            requires_approval,
+                            blocked: false,
+                            reason,
+                            escalated_from: None,
+                        }
+                    }
+                }
+            }
+
+            // ── LaunchApp ────────────────────────────────────────────────────
+            // SafeArg constructor already rejected metacharacters; this is defense-in-depth.
+            Capability::LaunchApp { app_id, .. } => PolicyDecision {
+                risk_level: RiskLevel::Green,
+                action: format!("launch_app:{}", app_id.as_str()),
+                requires_approval: false,
+                blocked: false,
+                reason: "auto-execute: launching a known installed application".into(),
+                escalated_from: None,
+            },
+
+            // ── SendMessage ──────────────────────────────────────────────────
+            // Always YELLOW — user must confirm who they're messaging and what body was pre-filled.
+            // Per user memory: "always preview recipient + message and ask final confirmation".
+            Capability::SendMessage { app, contact, .. } => PolicyDecision {
+                risk_level: RiskLevel::Yellow,
+                action: format!("send_message:{}", app.display_name()),
+                requires_approval: false,
+                blocked: false,
+                reason: format!(
+                    "execute + confirm: will open {} draft to '{}' — user must approve",
+                    app.display_name(),
+                    contact.display_name
+                ),
+                escalated_from: None,
+            },
+
+            // ── FileWrite ────────────────────────────────────────────────────
+            // SandboxedPath already blocked system roots; here we label the risk tier.
+            Capability::FileWrite { path, .. } => {
+                // Defense-in-depth: redundant check on the canonicalized path.
+                if self.is_protected_path(&path.as_path().to_string_lossy()) {
+                    return PolicyDecision {
+                        risk_level: RiskLevel::Black,
+                        action: "file_write".to_string(),
+                        requires_approval: false,
+                        blocked: true,
+                        reason: "path is under a permanently protected system root".into(),
+                        escalated_from: None,
+                    };
+                }
+                PolicyDecision {
+                    risk_level: RiskLevel::Yellow,
+                    action: "file_write".to_string(),
+                    requires_approval: false,
+                    blocked: false,
+                    reason: "execute + notify: modifies user file under allowed root".into(),
+                    escalated_from: None,
+                }
+            }
+
+            // ── AxInvoke ─────────────────────────────────────────────────────
+            // Accessibility API automation is always RED — typed PIN required.
+            Capability::AxInvoke { app_id, .. } => PolicyDecision {
+                risk_level: RiskLevel::Red,
+                action: format!("ax_invoke:{}", app_id.as_str()),
+                requires_approval: true,
+                blocked: false,
+                reason: "accessibility automation requires explicit PIN confirmation".into(),
+                escalated_from: None,
+            },
+        }
+    }
+
+    /// Like `evaluate`, but also accepts an `IntentModality` hint from the routing layer.
+    /// If the modality is destructive (Delete, Send, Execute) and the baseline tier is Green,
+    /// the decision is escalated to at least Yellow so the safety layer is pre-armed.
+    /// This is the intended call-site when routing context is available.
+    pub fn evaluate_with_modality_hint(
+        &self,
+        action: &str,
+        params: &serde_json::Value,
+        destructive_hint: bool,
+    ) -> PolicyDecision {
+        let mut decision = self.evaluate(action, params);
+
+        if destructive_hint && decision.risk_level == RiskLevel::Green {
+            decision.escalated_from = Some(RiskLevel::Green);
+            decision.risk_level = RiskLevel::Yellow;
+            decision.reason = "escalated to YELLOW: router flagged destructive modality verb".into();
+        }
+
+        decision
+    }
 }
 
 impl Default for PolicyEngine {
@@ -546,5 +708,66 @@ mod tests {
 
         assert_eq!(decision.risk_level, RiskLevel::Red);
         assert!(decision.requires_approval);
+    }
+
+    // ── classify_capability tests ─────────────────────────────────────────────
+
+    #[test]
+    fn capability_https_url_is_green() {
+        use crate::platform::intent::capability::Capability;
+        use url::Url;
+
+        let policy = PolicyEngine::new();
+        let cap = Capability::OpenUrl {
+            url: Url::parse("https://google.com/search?q=kittens").unwrap(),
+        };
+        let decision = policy.classify_capability(&cap, None);
+        assert_eq!(decision.risk_level, RiskLevel::Green);
+        assert!(!decision.blocked);
+    }
+
+    #[test]
+    fn capability_file_url_is_black() {
+        use crate::platform::intent::capability::Capability;
+        use url::Url;
+
+        let policy = PolicyEngine::new();
+        let cap = Capability::OpenUrl {
+            url: Url::parse("file:///etc/passwd").unwrap(),
+        };
+        let decision = policy.classify_capability(&cap, None);
+        assert_eq!(decision.risk_level, RiskLevel::Black);
+        assert!(decision.blocked);
+    }
+
+    #[test]
+    fn capability_whatsapp_deep_link_is_yellow() {
+        use crate::platform::intent::capability::Capability;
+        use url::Url;
+
+        let policy = PolicyEngine::new();
+        let cap = Capability::OpenUrl {
+            url: Url::parse("whatsapp://send?phone=919876543210&text=hye").unwrap(),
+        };
+        let decision = policy.classify_capability(&cap, None);
+        assert_eq!(decision.risk_level, RiskLevel::Yellow);
+        assert!(!decision.blocked);
+    }
+
+    #[test]
+    fn capability_ax_invoke_is_red() {
+        use crate::platform::intent::capability::{AxAction, Capability, CanonicalAppId};
+
+        let policy = PolicyEngine::new();
+        let cap = Capability::AxInvoke {
+            app_id: CanonicalAppId::from_registry("chromium".to_string()),
+            action: AxAction::Click {
+                element_id: "search-box".to_string(),
+            },
+        };
+        let decision = policy.classify_capability(&cap, None);
+        assert_eq!(decision.risk_level, RiskLevel::Red);
+        assert!(decision.requires_approval);
+        assert!(!decision.blocked);
     }
 }

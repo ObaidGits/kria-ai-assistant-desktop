@@ -18,6 +18,8 @@ pub struct KriaConfig {
     pub telegram: TelegramConfig,
     pub hardware: HardwareConfig,
     pub orchestrator: OrchestratorConfig,
+    pub colab: ColabConfig,
+    pub routing: RoutingConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +38,25 @@ pub struct LlmConfig {
     pub max_iterations: usize,
     pub gpu_layers: i32,
     pub models: Vec<LocalModelDef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ColabConfig {
+    /// Enable Colab cloud tier controls.
+    pub enabled: bool,
+    /// MCP server name used for the official Colab sidecar.
+    pub mcp_server_name: String,
+    /// Browser/session connect timeout budget.
+    pub connect_timeout_secs: u64,
+    /// Keepalive interval while cloud tasks are active.
+    pub keepalive_interval_secs: u64,
+    /// Periodic checkpoint interval for long-running training.
+    pub checkpoint_interval_secs: u64,
+    /// Whether local insufficiency can auto-escalate to Colab.
+    pub auto_escalate: bool,
+    /// Fallback to local runtime if Colab is unavailable.
+    pub fallback_to_local: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -235,10 +256,29 @@ pub struct OrchestratorConfig {
     pub cooldown_secs: u64,
     /// Maximum swap transitions per hour before locking state.
     pub max_transitions_per_hour: u32,
-    /// Minimum |Δngl| required to trigger a swap (prevents micro-adjustments).
+    /// Minimum |Δngl| required to trigger a swap (prevents micro-adjustments
+    /// on scale-down from Idle/Pressured).
     pub min_ngl_delta: u32,
+    /// Minimum ngl increase required to trigger a scale-up swap from Recovering.
+    /// Asymmetric: higher threshold favours stability over reclaim.
+    pub min_ngl_delta_up: u32,
     /// VRAM safety margin (MB) reserved to prevent OOM.
     pub safety_margin_mb: u64,
+    /// Deadband (MB) above yield_threshold_mb required to leave Pressured state.
+    /// Prevents oscillation when VRAM hovers at the threshold.
+    pub hysteresis_band_mb: u64,
+    /// Minimum seconds VRAM must be below yield_threshold before triggering swap.
+    pub pressure_dwell_secs: u64,
+    /// Milliseconds VRAM must be below emergency_threshold before triggering
+    /// emergency swap. Guards against transient driver spikes.
+    pub emergency_dwell_ms: u64,
+    /// Minimum seconds of stable recovery headroom before scaling back up.
+    pub recovery_dwell_secs: u64,
+    /// Maximum seconds any watchdog state can persist before forcing a resync.
+    pub state_max_dwell_secs: u64,
+    /// Separate rate budget for emergency transitions (per hour). Never zero.
+    /// Keeps the emergency path from thrashing while still self-throttling.
+    pub max_emergency_transitions_per_hour: u32,
     /// Path or name of the llama-server binary.
     pub llama_server_binary: String,
     /// Enable flash attention in llama-server.
@@ -247,6 +287,24 @@ pub struct OrchestratorConfig {
     pub mlock: bool,
     /// Batch size for llama-server.
     pub batch_size: u32,
+    /// Max seconds to wait for graceful server stop before kill escalation.
+    pub graceful_stop_timeout_secs: u64,
+    /// Max seconds to wait for llama-server health endpoint readiness on spawn.
+    pub health_check_timeout_secs: u64,
+    /// Max seconds to wait for ephemeral port discovery from llama-server logs.
+    pub port_discovery_timeout_secs: u64,
+    /// Max seconds to wait for GPU memory release after shutdown/swap.
+    pub vram_release_timeout_secs: u64,
+    /// Minimum cooldown between automatic orchestrator restart attempts.
+    pub restart_cooldown_secs: u64,
+    /// Backoff delay (milliseconds) before fallback spawn after restart failure.
+    pub restart_backoff_ms: u64,
+    /// Enable idle-time llama-server release to free GPU memory when no turns are running.
+    pub idle_release_enabled: bool,
+    /// Idle duration (seconds) after which llama-server is released.
+    pub idle_release_after_secs: u64,
+    /// Poll interval (seconds) for idle-release checks in desktop runtime.
+    pub idle_release_check_interval_secs: u64,
     /// macOS: free RAM (MB) below which a yield triggers.
     pub macos_yield_ram_mb: u64,
     /// macOS: free RAM (MB) below which an emergency triggers.
@@ -275,6 +333,10 @@ pub struct ModelProfile {
     pub max_context: u32,
     /// Whether the model has a vision projector (mmproj).
     pub has_vision_projector: bool,
+    /// Minimum ngl required to enable vision. Config-driven per model
+    /// (replaces the hardcoded `ngl >= 15` magic constant).
+    #[serde(default = "default_vision_min_ngl")]
+    pub vision_min_ngl: u32,
     /// Approximate VRAM used by the vision projector (MB). Only relevant when
     /// `has_vision_projector` is true.
     #[serde(default)]
@@ -292,11 +354,27 @@ impl Default for OrchestratorConfig {
             cooldown_secs: 60,
             max_transitions_per_hour: 6,
             min_ngl_delta: 3,
+            min_ngl_delta_up: 6,
             safety_margin_mb: 256,
+            hysteresis_band_mb: 256,
+            pressure_dwell_secs: 5,
+            emergency_dwell_ms: 750,
+            recovery_dwell_secs: 30,
+            state_max_dwell_secs: 300,
+            max_emergency_transitions_per_hour: 3,
             llama_server_binary: "llama-server".into(),
             flash_attention: true,
             mlock: true,
             batch_size: 256,
+            graceful_stop_timeout_secs: 5,
+            health_check_timeout_secs: 120,
+            port_discovery_timeout_secs: 60,
+            vram_release_timeout_secs: 5,
+            restart_cooldown_secs: 10,
+            restart_backoff_ms: 350,
+            idle_release_enabled: true,
+            idle_release_after_secs: 300,
+            idle_release_check_interval_secs: 10,
             macos_yield_ram_mb: 2048,
             macos_emergency_ram_mb: 1024,
             macos_recover_ram_mb: 4096,
@@ -315,6 +393,7 @@ impl Default for ModelProfile {
             min_context: 2048,
             max_context: 8192,
             has_vision_projector: true,
+            vision_min_ngl: 15,
             mmproj_vram_mb: 1300,
         }
     }
@@ -326,6 +405,18 @@ fn default_true() -> bool {
 
 fn default_trust_level() -> String {
     "YELLOW".into()
+}
+
+fn default_vision_min_ngl() -> u32 {
+    15
+}
+
+fn parse_env_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 // ── Defaults ────────────────────────────────────────────────────────
@@ -346,6 +437,20 @@ impl Default for LlmConfig {
             max_iterations: 10,
             gpu_layers: -1,
             models: Vec::new(),
+        }
+    }
+}
+
+impl Default for ColabConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mcp_server_name: "colab-mcp".into(),
+            connect_timeout_secs: 60,
+            keepalive_interval_secs: 120,
+            checkpoint_interval_secs: 300,
+            auto_escalate: true,
+            fallback_to_local: true,
         }
     }
 }
@@ -470,20 +575,27 @@ impl KriaConfig {
 
         match project_default {
             Some(ref base_path) => {
-                eprintln!("[config] using project default: {}", base_path.display());
+                tracing::debug!(path = %base_path.display(), "config: using project default");
                 // Use project default.toml as base, merge user config on top
                 let user_override = if user_config.exists() {
-                    eprintln!("[config] merging user override: {}", user_config.display());
+                    tracing::debug!(path = %user_config.display(), "config: merging user override");
                     Some(user_config.as_path())
                 } else {
                     None
                 };
                 let cfg = load_config(base_path, override_path.or(user_override))?;
-                eprintln!("[config] loaded {} model(s), orchestrator.enabled={}", cfg.llm.models.len(), cfg.orchestrator.enabled);
+                tracing::debug!(
+                    model_count = cfg.llm.models.len(),
+                    orchestrator_enabled = cfg.orchestrator.enabled,
+                    "config: loaded"
+                );
                 Ok(cfg)
             }
             None => {
-                eprintln!("[config] no project default.toml found, falling back to {}", user_config.display());
+                tracing::debug!(
+                    path = %user_config.display(),
+                    "config: project default.toml not found, using user config"
+                );
                 // No project default found → fall back to user config as sole source
                 load_config(&user_config, override_path)
             }
@@ -590,6 +702,16 @@ pub fn load_config(
             }
         }
     }
+    if let Ok(v) = std::env::var("KRIA_COLAB_ENABLED") {
+        if let Some(parsed) = parse_env_bool(&v) {
+            config.colab.enabled = parsed;
+        }
+    }
+    if let Ok(v) = std::env::var("KRIA_COLAB_MCP_SERVER") {
+        if !v.trim().is_empty() {
+            config.colab.mcp_server_name = v;
+        }
+    }
 
     Ok(config)
 }
@@ -627,6 +749,9 @@ fn merge_config(base: &mut KriaConfig, user: &KriaConfig) {
     }
     if user.hardware.threads > 0 {
         base.hardware.threads = user.hardware.threads;
+    }
+    if user.colab != ColabConfig::default() {
+        base.colab = user.colab.clone();
     }
 }
 
@@ -730,5 +855,36 @@ pub fn auto_select_model(tier: HardwareTier) -> &'static str {
         HardwareTier::Lite => "qwen2.5-3b",
         HardwareTier::Standard => "phi-4-mini",
         HardwareTier::Performance | HardwareTier::High => "qwen2.5-vl-7b",
+    }
+}
+
+/// Semantic routing configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RoutingConfig {
+    /// Embedding model identifier (passed to fastembed-rs).
+    pub embedding_model: String,
+    /// Cache subdirectory under ~/.kria.
+    pub cache_dir: String,
+    /// Enable llguidance / json_schema constrained decoding.
+    pub grammar_enabled: bool,
+    /// OOD z-score threshold (relative, model-agnostic).
+    pub ood_z_threshold: f32,
+    /// OOD entropy fraction of H_max threshold.
+    pub ood_entropy_threshold: f32,
+    /// Margin below which two domains trigger multi-intent check.
+    pub multi_intent_margin: f32,
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            embedding_model: "multilingual-e5-small".into(),
+            cache_dir: "cache/router".into(),
+            grammar_enabled: true,
+            ood_z_threshold: 0.5,
+            ood_entropy_threshold: 0.85,
+            multi_intent_margin: 0.04,
+        }
     }
 }

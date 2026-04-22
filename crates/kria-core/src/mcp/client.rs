@@ -6,7 +6,7 @@
 //! - tools/list, tools/call
 //! - Graceful shutdown
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -181,6 +181,8 @@ impl McpClient {
                 match reader.read_line(&mut line).await {
                     Ok(0) => {
                         tracing::info!("[MCP:{}] stdout EOF — server process exited", reader_name);
+                        // Drop all outstanding response senders so in-flight requests fail fast.
+                        pending.lock().await.clear();
                         break;
                     }
                     Ok(_) => {
@@ -209,6 +211,8 @@ impl McpClient {
                     }
                     Err(e) => {
                         tracing::error!("[MCP:{}] stdout read error: {}", reader_name, e);
+                        // Ensure pending callers do not wait for the full timeout window.
+                        pending.lock().await.clear();
                         break;
                     }
                 }
@@ -270,35 +274,22 @@ impl McpClient {
                 "[MCP:{}] server supports tools — requesting tools/list",
                 self.name
             );
-            let tools_result = self
-                .request_with_timeout(
-                    "tools/list",
-                    None,
-                    Duration::from_secs(STARTUP_REQUEST_TIMEOUT_SECS),
-                )
+            let tools_list = self
+                .list_all_tools_with_timeout(Duration::from_secs(STARTUP_REQUEST_TIMEOUT_SECS))
                 .await
                 .map_err(|e| {
                     tracing::error!("[MCP:{}] tools/list request failed: {}", self.name, e);
                     e
                 })?;
-            let tools_list: ToolsListResult =
-                serde_json::from_value(tools_result).map_err(|e| {
-                    tracing::error!(
-                        "[MCP:{}] failed to parse tools/list response: {}",
-                        self.name,
-                        e
-                    );
-                    e
-                })?;
             tracing::info!(
                 "[MCP:{}] discovered {} tool(s):",
                 self.name,
-                tools_list.tools.len()
+                tools_list.len()
             );
-            for t in &tools_list.tools {
+            for t in &tools_list {
                 tracing::info!("[MCP:{}]   - {}", self.name, t.name);
             }
-            *self.tools.lock().await = tools_list.tools;
+            *self.tools.lock().await = tools_list;
         } else {
             tracing::warn!(
                 "[MCP:{}] server does NOT advertise tools capability",
@@ -310,6 +301,57 @@ impl McpClient {
         self.restart_count.store(0, Ordering::Relaxed);
         tracing::info!("[MCP:{}] state = Running", self.name);
         Ok(())
+    }
+
+    /// Refresh tools by requesting `tools/list` again.
+    ///
+    /// Some MCP servers (for example, proxy-style runtimes) expose additional
+    /// tools after external state changes and expect the client to re-list tools.
+    pub async fn refresh_tools(&self) -> anyhow::Result<Vec<McpToolDef>> {
+        let tools = self
+            .list_all_tools_with_timeout(Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS))
+            .await?;
+        *self.tools.lock().await = tools.clone();
+        Ok(tools)
+    }
+
+    async fn list_all_tools_with_timeout(
+        &self,
+        timeout: Duration,
+    ) -> anyhow::Result<Vec<McpToolDef>> {
+        let mut all_tools: Vec<McpToolDef> = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors: HashSet<String> = HashSet::new();
+
+        loop {
+            let params = cursor
+                .as_ref()
+                .map(|value| serde_json::json!({ "cursor": value }));
+
+            let tools_result = self
+                .request_with_timeout("tools/list", params, timeout)
+                .await?;
+            let tools_page: ToolsListResult = serde_json::from_value(tools_result)?;
+
+            all_tools.extend(tools_page.tools);
+
+            match tools_page.next_cursor {
+                Some(next_cursor) => {
+                    if !seen_cursors.insert(next_cursor.clone()) {
+                        tracing::warn!(
+                            "[MCP:{}] tools/list pagination returned duplicate cursor '{}'; stopping pagination loop",
+                            self.name,
+                            next_cursor
+                        );
+                        break;
+                    }
+                    cursor = Some(next_cursor);
+                }
+                None => break,
+            }
+        }
+
+        Ok(all_tools)
     }
 
     /// Call a tool on the MCP server.
@@ -327,6 +369,40 @@ impl McpClient {
             .await?;
         let call_result: ToolCallResult = serde_json::from_value(result)?;
         Ok(call_result)
+    }
+
+    /// Call a tool on the MCP server, aborting immediately if `cancel` fires.
+    ///
+    /// On cancellation, the pending map entry is cleaned up and
+    /// `Err("MCP tool call '<name>' cancelled")` is returned.  The MCP server
+    /// process is NOT killed — it will finish its own work but the result is
+    /// silently discarded once the timeout for the orphaned request expires.
+    pub async fn call_tool_cancellable(
+        &self,
+        name: &str,
+        arguments: Option<serde_json::Value>,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<ToolCallResult> {
+        let params = ToolCallParams {
+            name: name.into(),
+            arguments,
+        };
+        let json_params = serde_json::to_value(&params)?;
+
+        // Build the request future (which registers the pending entry) but do
+        // NOT await it yet — we need to be able to cancel it.
+        let request_fut = self.request("tools/call", Some(json_params));
+
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                anyhow::bail!("MCP tool call '{}' cancelled", name);
+            }
+            result = request_fut => {
+                let call_result: ToolCallResult = serde_json::from_value(result?)?;
+                Ok(call_result)
+            }
+        }
     }
 
     /// Send a JSON-RPC request and await the response.
@@ -370,16 +446,28 @@ impl McpClient {
             }
         }
 
-        let resp = tokio::time::timeout(timeout, rx)
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
+        let pending_response = match tokio::time::timeout(timeout, rx).await {
+            Ok(resp) => resp,
+            Err(_) => {
+                self.pending.lock().await.remove(&id);
+                anyhow::bail!(
                     "MCP request '{}' timed out after {}s",
                     method,
                     timeout.as_secs()
-                )
-            })?
-            .map_err(|_| anyhow::anyhow!("MCP response channel closed"))?;
+                );
+            }
+        };
+
+        let resp = match pending_response {
+            Ok(resp) => resp,
+            Err(_) => {
+                self.pending.lock().await.remove(&id);
+                anyhow::bail!(
+                    "MCP request '{}' failed because the server exited before replying",
+                    method
+                );
+            }
+        };
 
         resp.into_result().map_err(|e| anyhow::anyhow!(e))
     }

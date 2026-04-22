@@ -6,10 +6,19 @@
 mod commands;
 mod tray;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::Manager;
 
+static RUNTIME_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
 fn main() {
-    tauri::Builder::default()
+    // Ring 4 — install Linux seccomp-BPF filter before anything else.
+    // On non-Linux platforms this is a no-op.
+    if let Err(e) = kria_core::platform::install_seccomp_filter() {
+        eprintln!("[WARN] seccomp filter not installed: {e}");
+    }
+
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -42,6 +51,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::send_message,
+            commands::send_lab_message,
             commands::get_session_history,
             commands::create_session,
             commands::list_sessions,
@@ -50,6 +60,7 @@ fn main() {
             commands::rename_session,
             commands::search_sessions,
             commands::cancel_request,
+            commands::cancel_turn,
             commands::approve_action,
             commands::deny_action,
             commands::get_health,
@@ -86,6 +97,10 @@ fn main() {
             commands::get_alerts,
             commands::save_export_file,
             commands::open_html_for_print,
+            commands::get_colab_tier_status,
+            commands::connect_colab_tier,
+            commands::disconnect_colab_tier,
+            commands::set_colab_selected_notebook,
             commands::get_google_workspace_status,
             commands::set_google_workspace_account,
             commands::connect_google_workspace,
@@ -94,11 +109,22 @@ fn main() {
             // Provisioning (first-boot setup wizard)
             commands::get_provisioning_state,
             commands::start_provisioning,
+            commands::complete_provisioning,
             commands::set_provisioning_backend,
             commands::run_provisioning_step,
             commands::get_provisioning_diagnostics,
             commands::get_hardware_profile,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|app_handle, event| {
+        if let tauri::RunEvent::ExitRequested { .. } = event {
+            if RUNTIME_SHUTDOWN_REQUESTED.swap(true, Ordering::SeqCst) {
+                return;
+            }
+
+            tauri::async_runtime::block_on(commands::shutdown_runtime(app_handle));
+        }
+    });
 }
