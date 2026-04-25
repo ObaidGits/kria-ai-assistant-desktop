@@ -607,6 +607,212 @@ impl Orchestrator {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
+
+    // ─── Tier B drop-and-swap support ────────────────────────────────────────
+    //
+    // The image-generation path needs to free ~4 GB of VRAM occupied by the
+    // local LLM so ComfyUI can fit. Older revisions tried to do this via
+    // `POST /props {"n_gpu_layers": 0}`; modern llama.cpp builds reject that
+    // request with HTTP 501 (the layer split is fixed at process start).
+    //
+    // The supported approach is a hard process restart with the appropriate
+    // `--n-gpu-layers` flag, with conversational context preserved best-effort
+    // through the slot KV-cache save/restore endpoints.
+    //
+    // Slot 0 is used as the canonical "current conversation" slot. When the
+    // server is started with `--parallel 1` (the orchestrator's default for
+    // single-user assistants) this is the only slot that exists.
+
+    /// Filename used inside `--slot-save-path` for Tier B context snapshots.
+    const SWAP_SLOT_FILENAME: &'static str = "kria_tier_b.bin";
+    const SWAP_SLOT_ID: u32 = 0;
+
+    /// Hard-restart llama-server with `--n-gpu-layers 0` so the model lives
+    /// entirely in CPU RAM. Used by the image swap path to free VRAM.
+    ///
+    /// Best-effort persists slot 0's KV cache before the SIGTERM and
+    /// re-imports it after the new process is healthy. Failure to
+    /// save/restore the snapshot is non-fatal — it only forces the next
+    /// turn to re-prefill from scratch.
+    pub async fn evict_to_cpu(&self) -> anyhow::Result<()> {
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
+
+        let (prior_ngl, prior_ctx) = self.server_manager.current_params();
+        if prior_ngl == 0 {
+            tracing::info!("orchestrator: evict_to_cpu no-op (already CPU-resident)");
+            return Ok(());
+        }
+
+        tracing::info!(prior_ngl, prior_ctx, "orchestrator: Tier B eviction starting");
+
+        // Stop the watchdog *first* so it can't re-spawn behind our back when
+        // it sees VRAM pressure during the swap.
+        self.stop_watchdog().await;
+
+        // Best-effort: snapshot conversational context. We tolerate failure
+        // because the server is about to die anyway.
+        let _ = self
+            .server_manager
+            .save_slot_kv(Self::SWAP_SLOT_ID, Self::SWAP_SLOT_FILENAME)
+            .await;
+
+        self.health.update(
+            "llama-server",
+            crate::infra::health::ServiceStatus::Starting,
+            Some("Tier B eviction: restarting on CPU".into()),
+        );
+
+        // SIGTERM → wait → SIGKILL ladder via ChildGuard.
+        self.server_manager
+            .graceful_stop_with_timeout(Duration::from_secs(
+                self.config.graceful_stop_timeout_secs.max(1),
+            ))
+            .await;
+
+        // Wait for NVML to confirm VRAM was actually reclaimed by the
+        // driver. Without this, the next ComfyUI allocation can race the
+        // CUDA cleanup and OOM.
+        if self.backend == GpuBackend::Cuda {
+            self.wait_for_vram_release_bounded(Duration::from_secs(
+                self.config.vram_release_timeout_secs.max(1),
+            ))
+            .await;
+        }
+
+        // Respawn purely on CPU. We keep the same context window so the
+        // restored KV cache is byte-compatible.
+        let cpu_ctx = if prior_ctx > 0 {
+            prior_ctx
+        } else {
+            self.config.model_profile.min_context
+        };
+
+        self.server_manager
+            .spawn(0, cpu_ctx, false, self.event_bus.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("CPU-mode spawn failed: {e}"))?;
+
+        // Best-effort: rehydrate the conversation. The new process owns a
+        // fresh slot 0, so we restore from the snapshot we just took.
+        let _ = self
+            .server_manager
+            .restore_slot_kv(Self::SWAP_SLOT_ID, Self::SWAP_SLOT_FILENAME)
+            .await;
+
+        self.health.update(
+            "llama-server",
+            crate::infra::health::ServiceStatus::Healthy,
+            Some("Tier B: CPU-resident".into()),
+        );
+
+        tracing::info!(prior_ngl, prior_ctx, "orchestrator: Tier B eviction complete");
+        Ok(())
+    }
+
+    /// Inverse of `evict_to_cpu`: hard-restart llama-server back onto the GPU
+    /// using the strategy calculator's freshly-recomputed `(ngl, ctx)` based
+    /// on currently-free VRAM. Best-effort restores the swap slot.
+    pub async fn restore_from_cpu(&self) -> anyhow::Result<()> {
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
+
+        let (current_ngl, current_ctx) = self.server_manager.current_params();
+        if current_ngl > 0 {
+            tracing::debug!(
+                current_ngl,
+                "orchestrator: restore_from_cpu no-op (already on GPU)"
+            );
+            return Ok(());
+        }
+
+        tracing::info!("orchestrator: Tier B restore starting");
+
+        self.stop_watchdog().await;
+
+        let _ = self
+            .server_manager
+            .save_slot_kv(Self::SWAP_SLOT_ID, Self::SWAP_SLOT_FILENAME)
+            .await;
+
+        self.health.update(
+            "llama-server",
+            crate::infra::health::ServiceStatus::Starting,
+            Some("Tier B restore: respawning on GPU".into()),
+        );
+
+        self.server_manager
+            .graceful_stop_with_timeout(Duration::from_secs(
+                self.config.graceful_stop_timeout_secs.max(1),
+            ))
+            .await;
+
+        if self.backend == GpuBackend::Cuda {
+            self.wait_for_vram_release_bounded(Duration::from_secs(
+                self.config.vram_release_timeout_secs.max(1),
+            ))
+            .await;
+        }
+
+        // Recompute target params from the *current* free VRAM so we don't
+        // demand more layers than the freshly-released GPU can hold.
+        let snapshot = self.telemetry.snapshot().await;
+        let target = strategy::calculate_target_params(
+            &self.config.model_profile,
+            snapshot.free_vram_mb,
+            self.config.safety_margin_mb,
+            self.backend,
+        );
+
+        let target_ctx = if current_ctx > 0 {
+            current_ctx
+        } else {
+            target.context
+        };
+
+        self.server_manager
+            .spawn(
+                target.ngl,
+                target_ctx,
+                target.enable_vision,
+                self.event_bus.clone(),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("GPU-mode respawn failed: {e}"))?;
+
+        let _ = self
+            .server_manager
+            .restore_slot_kv(Self::SWAP_SLOT_ID, Self::SWAP_SLOT_FILENAME)
+            .await;
+
+        self.health.update(
+            "llama-server",
+            crate::infra::health::ServiceStatus::Healthy,
+            None,
+        );
+        self.ensure_watchdog_running().await;
+
+        tracing::info!(
+            ngl = target.ngl,
+            ctx = target_ctx,
+            "orchestrator: Tier B restore complete"
+        );
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::image::swap::LlmEvictionController for Orchestrator {
+    fn is_gpu_resident(&self) -> bool {
+        let (ngl, _) = self.server_manager.current_params();
+        ngl > 0 && self.server_manager.is_healthy()
+    }
+
+    async fn evict_to_cpu(&self) -> Result<(), String> {
+        Orchestrator::evict_to_cpu(self).await.map_err(|e| e.to_string())
+    }
+
+    async fn restore_from_cpu(&self) -> Result<(), String> {
+        Orchestrator::restore_from_cpu(self).await.map_err(|e| e.to_string())
+    }
 }
 
 impl Drop for Orchestrator {

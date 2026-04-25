@@ -1,0 +1,85 @@
+{
+  "_comment": "Flux.1-schnell GGUF workflow with optional LoRA. Used by kria-core::image::orchestrator for all styles except TextHeavy. The orchestrator builds this graph programmatically; this file serves as a human-readable reference and can be loaded directly into the ComfyUI web UI for testing.",
+  "1": {
+    "class_type": "UnetLoaderGGUF",
+    "inputs": {
+      "unet_name": "flux1-schnell-Q4_K_S.gguf"
+    }
+  },
+  "2": {
+    "class_type": "DualCLIPLoader",
+    "inputs": {
+      "clip_name1": "clip_l.safetensors",
+      "clip_name2": "t5xxl_fp8_e4m3fn.safetensors",
+      "type": "flux"
+    }
+  },
+  "3": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "ae.safetensors"
+    }
+  },
+  "4": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "POSITIVE_PROMPT",
+      "clip": ["2", 0]
+    }
+  },
+  "5": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "",
+      "clip": ["2", 0]
+    }
+  },
+  "6": {
+    "class_type": "EmptySD3LatentImage",
+    "inputs": {
+      "width": 1024,
+      "height": 1024,
+      "batch_size": 1
+    }
+  },
+  "7": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model": ["1", 0],
+      "positive": ["4", 0],
+      "negative": ["5", 0],
+      "latent_image": ["6", 0],
+      "seed": 0,
+      "steps": 4,
+      "cfg": 1.0,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1.0
+    }
+  },
+  "8": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": ["7", 0],
+      "vae": ["3", 0]
+    }
+  },
+  "9": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": ["8", 0],
+      "filename_prefix": "kria"
+    }
+  },
+  "10": {
+    "_comment": "Optional LoraLoader — wire model: ['10',0] and clip: ['10',1] into nodes 4,5,7 when a LoRA is used.",
+    "class_type": "LoraLoader",
+    "inputs": {
+      "model": ["1", 0],
+      "clip": ["2", 0],
+      "lora_name": "LORA_FILENAME",
+      "strength_model": 0.85,
+      "strength_clip": 0.85
+    }
+  }
+}

@@ -2,6 +2,7 @@ import { Component, For, Show, createEffect, createSignal, createMemo, onCleanup
 import { appStore } from "../stores/app";
 import MessageBubble from "./MessageBubble";
 import ExportDropdown from "./ExportDropdown";
+import ImageProgressChip from "./ImageProgressChip";
 
 interface SlashCmd {
   name: string;
@@ -43,12 +44,6 @@ const ChatView: Component = () => {
   const [isDragOver, setIsDragOver] = createSignal(false);
   const [showSlash, setShowSlash] = createSignal(false);
   const [slashIndex, setSlashIndex] = createSignal(0);
-
-  const starterPrompts = [
-    "Plan my day and prioritize deep work blocks.",
-    "Audit my TODO list and suggest what to ship today.",
-    "Summarize my latest inbox in five bullets.",
-  ];
 
   const clearPendingImage = () => {
     const img = pendingImage();
@@ -224,31 +219,19 @@ const ChatView: Component = () => {
         <ExportDropdown messages={messages} sessionTitle={currentSessionTitle} />
       </div>
 
+      <Show when={isSwapping()}>
+        <div class="gpu-swap-alert" role="status" aria-live="polite">
+          <span class="dot" /><span class="dot" /><span class="dot" />
+          <span class="swap-label">Optimizing GPU layers...</span>
+        </div>
+      </Show>
+
       <div class="chat-messages">
         <Show when={messages().length === 0 && !isThinking()}>
           <div class="assistant-welcome-card">
             <div class="assistant-welcome-eyebrow">Personal Mission Control</div>
-            <h2>What should we accomplish first?</h2>
-            <p>
-              Ask for planning, execution help, tool-driven actions, or attach an image for analysis.
-            </p>
-            <div class="assistant-starter-grid">
-              <For each={starterPrompts}>
-                {(prompt) => (
-                  <button
-                    class="starter-prompt"
-                    type="button"
-                    onClick={() => {
-                      setInputText(prompt);
-                      textareaRef?.focus();
-                      autoGrow();
-                    }}
-                  >
-                    {prompt}
-                  </button>
-                )}
-              </For>
-            </div>
+            <h2>How can I help you today?</h2>
+            <p>Type a message, attach an image, or use the 🎤 button to speak.</p>
           </div>
         </Show>
 
@@ -257,22 +240,18 @@ const ChatView: Component = () => {
         </For>
 
         {isThinking() && (
-          <div class="thinking-indicator">
-            <span class="dot" /><span class="dot" /><span class="dot" />
+          <div class="thinking-row">
+            <div class="thinking-avatar">K</div>
+            <div class="thinking-bubble">
+              <span class="dot" /><span class="dot" /><span class="dot" />
+            </div>
           </div>
         )}
 
+        <ImageProgressChip />
+
         <div ref={messagesEnd} />
       </div>
-
-      <Show when={isSwapping()}>
-        <div class="swap-overlay">
-          <div class="swap-overlay-content">
-            <span class="dot" /><span class="dot" /><span class="dot" />
-            <span class="swap-label">Optimizing GPU layers…</span>
-          </div>
-        </div>
-      </Show>
 
       <Show when={degradationLevel() && degradationLevel() !== "Full"}>
         <div class="degradation-pill">{degradationLevel()}</div>

@@ -207,6 +207,105 @@ async fn run_priv_cmd(priv_esc: PrivEsc, program: &str, args: &[&str]) -> Result
 
 // ─── search_package ───────────────────────────────────────────────────────────
 
+/// List installed packages across all available package managers.
+/// Read-only (Green tier). Routed from prompts like
+/// "list all installed apps", "show installed packages", etc.
+struct ListInstalledPackages;
+
+#[async_trait]
+impl ToolHandler for ListInstalledPackages {
+    async fn execute(&self, params: serde_json::Value) -> ToolResult {
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(500) as usize;
+
+        let mut sources: Vec<serde_json::Value> = Vec::new();
+
+        // dpkg / apt
+        if let Ok(out) = tokio::process::Command::new("dpkg-query")
+            .args(["-W", "-f=${Package}\n"])
+            .output()
+            .await
+        {
+            if out.status.success() {
+                let names: Vec<String> = String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .take(limit)
+                    .map(|l| l.trim().to_string())
+                    .collect();
+                if !names.is_empty() {
+                    sources.push(serde_json::json!({
+                        "manager": "apt",
+                        "count":   names.len(),
+                        "packages": names,
+                    }));
+                }
+            }
+        }
+
+        // flatpak
+        if let Ok(out) = tokio::process::Command::new("flatpak")
+            .args(["list", "--app", "--columns=application"])
+            .output()
+            .await
+        {
+            if out.status.success() {
+                let names: Vec<String> = String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .filter(|l| !l.trim().is_empty() && !l.starts_with("Application"))
+                    .take(limit)
+                    .map(|l| l.trim().to_string())
+                    .collect();
+                if !names.is_empty() {
+                    sources.push(serde_json::json!({
+                        "manager": "flatpak",
+                        "count":   names.len(),
+                        "packages": names,
+                    }));
+                }
+            }
+        }
+
+        // snap
+        if let Ok(out) = tokio::process::Command::new("snap").arg("list").output().await {
+            if out.status.success() {
+                let names: Vec<String> = String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .skip(1) // header
+                    .filter_map(|l| l.split_whitespace().next().map(|s| s.to_string()))
+                    .filter(|n| !n.is_empty())
+                    .take(limit)
+                    .collect();
+                if !names.is_empty() {
+                    sources.push(serde_json::json!({
+                        "manager": "snap",
+                        "count":   names.len(),
+                        "packages": names,
+                    }));
+                }
+            }
+        }
+
+        if sources.is_empty() {
+            return ToolResult::err(
+                "no package managers responded (apt/flatpak/snap unavailable on this system)",
+            );
+        }
+
+        let total: usize = sources
+            .iter()
+            .map(|s| s.get("count").and_then(|c| c.as_u64()).unwrap_or(0) as usize)
+            .sum();
+
+        ToolResult::ok(serde_json::json!({
+            "total":   total,
+            "sources": sources,
+        }))
+    }
+}
+
 struct SearchPackage;
 
 #[async_trait]
@@ -1339,6 +1438,16 @@ async fn run_uninstall(
 pub fn register(reg: &ToolRegistry) {
     let tools: Vec<(ToolDef, Arc<dyn ToolHandler>)> = vec![
         // ── GREEN: query tools (auto-execute, no approval needed) ──
+        (ToolDef {
+            name: "list_installed_packages".into(),
+            description: "List installed packages/apps across apt, flatpak, and snap. Read-only. Use for 'list installed apps', 'show all packages', etc.".into(),
+            category: "packages".into(),
+            default_tier: RiskLevel::Green,
+            min_tier: "lite",
+            parameters: vec![
+                param("limit", "number", "Max packages per manager (default 500)", false),
+            ],
+        }, Arc::new(ListInstalledPackages)),
         (ToolDef {
             name: "search_package".into(),
             description: "Search for a package/application across all available package managers (apt, dnf, snap, flatpak, brew, winget, choco). Returns matching package names, descriptions and sources. Always call this before installing.".into(),

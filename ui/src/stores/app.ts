@@ -9,6 +9,7 @@ const STORAGE_KEYS = {
   environment: "kria_environment",
   assistantSession: "kria_assistant_session_id",
   promptLabSession: "kria_prompt_lab_session_id",
+  telegramBotInfo: "kria_telegram_bot_info",
 } as const;
 
 function readStorageValue(key: string): string | null {
@@ -76,9 +77,45 @@ const [hardwareInfo, setHardwareInfo] = createSignal<HardwareInfoData | null>(nu
 const [knowledgeBase, setKnowledgeBase] = createSignal<KnowledgeDoc[]>([]);
 const [alerts, setAlerts] = createSignal<ProactiveAlert[]>([]);
 
+const resolveInitialTelegramBotInfo = (): TelegramBotInfo | null => {
+  const raw = readStorageValue(STORAGE_KEYS.telegramBotInfo);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as TelegramBotInfo;
+    if (
+      typeof parsed === "object" &&
+      parsed !== null &&
+      typeof parsed.bot_username === "string" &&
+      typeof parsed.bot_name === "string" &&
+      typeof parsed.bot_id === "number"
+    ) {
+      return parsed;
+    }
+  } catch {
+    // Ignore invalid cached telegram bot info.
+  }
+  return null;
+};
+
+function persistTelegramBotInfo(info: TelegramBotInfo | null) {
+  if (typeof window === "undefined") return;
+  if (info) {
+    window.localStorage.setItem(STORAGE_KEYS.telegramBotInfo, JSON.stringify(info));
+  } else {
+    window.localStorage.removeItem(STORAGE_KEYS.telegramBotInfo);
+  }
+}
+
 // Orchestrator swap state
 const [isSwapping, setIsSwapping] = createSignal(false);
 const [degradationLevel, setDegradationLevel] = createSignal<string | null>(null);
+// Image generation progress (null = no active generation)
+const [imageGenProgress, setImageGenProgress] = createSignal<number | null>(null);
+const [imageGenStage, setImageGenStage] = createSignal<string | null>(null);
+// VRAM blackout info during Tier B swap (null = no active swap)
+const [vramBlackoutInfo, setVramBlackoutInfo] = createSignal<{ free_mb: number; required_mb: number; stage: string } | null>(null);
+// True when session has been degraded to cloud-only due to repeated VRAM hangs
+const [imageSessionDegraded, setImageSessionDegraded] = createSignal(false);
 const [currentEnvironment, setCurrentEnvironmentSignal] = createSignal<"assistant" | "prompt_lab">(
   resolveInitialEnvironment()
 );
@@ -131,7 +168,7 @@ export interface TelegramBotInfo {
 }
 
 const [telegramConfig, setTelegramConfig] = createSignal<TelegramConfig | null>(null);
-const [telegramBotInfo, setTelegramBotInfo] = createSignal<TelegramBotInfo | null>(null);
+const [telegramBotInfo, setTelegramBotInfo] = createSignal<TelegramBotInfo | null>(resolveInitialTelegramBotInfo());
 
 // --- Types ---
 export interface Message {
@@ -361,6 +398,20 @@ function setScopedThinking(scope: StreamScope, value: boolean) {
   }
 }
 
+function isScopedThinking(scope: StreamScope): boolean {
+  return scope === "prompt_lab" ? promptLabIsThinking() : assistantIsThinking();
+}
+
+async function cancelScopedTurnIfActive(scope: StreamScope): Promise<void> {
+  const sessionId = getScopedCurrentSession(scope);
+  if (!sessionId || !isScopedThinking(scope)) return;
+  try {
+    await invoke("cancel_turn", { sessionId });
+  } catch (e) {
+    console.warn("Failed to cancel active turn before session change:", e);
+  }
+}
+
 function setScopedHitl(scope: StreamScope, request: HitlRequest | null, visible: boolean) {
   if (scope === "prompt_lab") {
     setPromptLabHitlRequest(request);
@@ -408,7 +459,8 @@ async function sendMessage(text: string) {
   setScopedThinking("assistant", true);
 
   try {
-    await ensureScopedSessionActive("assistant");
+    const sessionId = await ensureScopedSessionActive("assistant");
+    void autoRenameSessionFromPrompt(sessionId, text);
     await invoke<{ status: string }>(
       "send_message",
       { message: text }
@@ -452,7 +504,8 @@ async function sendLabMessage(text: string, profile?: PromptLabProfile) {
   };
 
   try {
-    await ensureScopedSessionActive("prompt_lab");
+    const sessionId = await ensureScopedSessionActive("prompt_lab");
+    void autoRenameSessionFromPrompt(sessionId, text);
     await invoke<{ status: string }>("send_lab_message", payload);
   } catch (e) {
     const errMsg: Message = {
@@ -492,6 +545,11 @@ async function sendImageMessage(imageData: Uint8Array, mimeType: string, text?: 
   setScopedThinking("assistant", true);
 
   try {
+    const sessionId = await ensureScopedSessionActive("assistant");
+    const promptForTitle = (text || "").trim();
+    if (promptForTitle) {
+      void autoRenameSessionFromPrompt(sessionId, promptForTitle);
+    }
     await invoke<{ status: string; attachment: string }>(
       "send_image_message",
       { imageData: Array.from(imageData), mimeType, text: text || null }
@@ -757,6 +815,10 @@ async function loadTelegramConfig() {
   try {
     const result = await invoke<TelegramConfig>("get_telegram_config");
     setTelegramConfig(result);
+    if (!result.bot_token || !result.bot_token.trim()) {
+      setTelegramBotInfo(null);
+      persistTelegramBotInfo(null);
+    }
   } catch (e) {
     console.error("Failed to load telegram config:", e);
   }
@@ -771,6 +833,10 @@ async function saveTelegramConfig(config: TelegramConfig) {
       autoStart: config.auto_start,
     });
     setTelegramConfig(config);
+    if (!config.bot_token || !config.bot_token.trim()) {
+      setTelegramBotInfo(null);
+      persistTelegramBotInfo(null);
+    }
   } catch (e) {
     console.error("Failed to save telegram config:", e);
     throw e;
@@ -780,6 +846,7 @@ async function saveTelegramConfig(config: TelegramConfig) {
 async function testTelegramConnection(botToken: string): Promise<TelegramBotInfo> {
   const result = await invoke<TelegramBotInfo>("test_telegram_connection", { botToken });
   setTelegramBotInfo(result);
+  persistTelegramBotInfo(result);
   return result;
 }
 
@@ -1076,11 +1143,67 @@ async function loadSessions() {
   }
 }
 
+function normalizeSessionTitleFromPrompt(prompt: string): string | null {
+  const collapsed = prompt.replace(/\s+/g, " ").trim();
+  if (!collapsed) return null;
+
+  const trimmed = collapsed.replace(/^["'`\s]+|["'`\s]+$/g, "");
+  if (!trimmed) return null;
+
+  const maxChars = 72;
+  return trimmed.length > maxChars
+    ? `${trimmed.slice(0, maxChars).trimEnd()}…`
+    : trimmed;
+}
+
+function upsertSessionPreview(sessionId: string, title: string) {
+  setSessions((prev) => {
+    const idx = prev.findIndex((session) => session.id === sessionId);
+    const nextItem: Session = {
+      id: sessionId,
+      title,
+      updatedAt: Date.now(),
+    };
+
+    if (idx === -1) {
+      return [nextItem, ...prev];
+    }
+
+    const next = [...prev];
+    next[idx] = {
+      ...next[idx],
+      title,
+      updatedAt: Date.now(),
+    };
+    return next;
+  });
+}
+
+async function autoRenameSessionFromPrompt(sessionId: string, prompt: string) {
+  const normalizedTitle = normalizeSessionTitleFromPrompt(prompt);
+  if (!normalizedTitle) return;
+
+  try {
+    const result = await invoke<{ updated?: boolean; title?: string }>(
+      "auto_rename_session",
+      { sessionId, title: normalizedTitle }
+    );
+
+    if (result?.updated) {
+      upsertSessionPreview(sessionId, result.title || normalizedTitle);
+    }
+  } catch (e) {
+    console.warn("Failed to auto-rename session:", e);
+  }
+}
+
 async function createSession() {
   try {
-    const result = await invoke<{ session_id: string }>("create_session");
     const scope = scopeFromEnvironment();
+    await cancelScopedTurnIfActive(scope);
+    const result = await invoke<{ session_id: string }>("create_session");
     setScopedCurrentSession(scope, result.session_id);
+    upsertSessionPreview(result.session_id, "New chat");
     await invoke("switch_session", { sessionId: result.session_id });
     updateScopedMessages(scope, () => []);
     setScopedToolChoice(scope, null);
@@ -1208,18 +1331,32 @@ async function loadMappedSessionHistory(sessionId: string): Promise<Message[]> {
 async function switchSession(sessionId: string) {
   try {
     const scope = scopeFromEnvironment();
+    const activeSession = getScopedCurrentSession(scope);
+    if (activeSession && activeSession !== sessionId) {
+      await cancelScopedTurnIfActive(scope);
+    }
     await invoke("switch_session", { sessionId });
     setScopedCurrentSession(scope, sessionId);
     const mapped = await loadMappedSessionHistory(sessionId);
     updateScopedMessages(scope, () => mapped);
+    setScopedThinking(scope, false);
   } catch (e) {
     console.error("Failed to switch session:", e);
   }
 }
 
 async function deleteSession(sessionId: string) {
+  const previousSessions = sessions();
+  const previousAssistantSession = assistantCurrentSession();
+  const previousPromptLabSession = promptLabCurrentSession();
+  const previousAssistantMessages = assistantMessages();
+  const previousPromptLabMessages = promptLabMessages();
+  const previousAssistantThinking = assistantIsThinking();
+  const previousPromptLabThinking = promptLabIsThinking();
+
   try {
-    await invoke("delete_session", { sessionId });
+    setSessions((prev) => prev.filter((session) => session.id !== sessionId));
+
     if (assistantCurrentSession() === sessionId) {
       setScopedCurrentSession("assistant", null);
       setAssistantMessages([]);
@@ -1234,18 +1371,49 @@ async function deleteSession(sessionId: string) {
       setScopedToolChoice("prompt_lab", null);
       setScopedHitl("prompt_lab", null, false);
     }
-    await loadSessions();
+
+    const result = await invoke<{ replacement_session_id?: string | null }>(
+      "delete_session",
+      { sessionId }
+    );
+
+    const replacementSessionId = result?.replacement_session_id || null;
+    if (replacementSessionId) {
+      if (!assistantCurrentSession()) {
+        setScopedCurrentSession("assistant", replacementSessionId);
+      }
+      if (!promptLabCurrentSession()) {
+        setScopedCurrentSession("prompt_lab", replacementSessionId);
+      }
+      upsertSessionPreview(replacementSessionId, "New chat");
+    }
+
+    void loadSessions();
   } catch (e) {
     console.error("Failed to delete session:", e);
+    setSessions(previousSessions);
+    setScopedCurrentSession("assistant", previousAssistantSession);
+    setScopedCurrentSession("prompt_lab", previousPromptLabSession);
+    setAssistantMessages(previousAssistantMessages);
+    setPromptLabMessages(previousPromptLabMessages);
+    setAssistantIsThinking(previousAssistantThinking);
+    setPromptLabIsThinking(previousPromptLabThinking);
   }
 }
 
 async function renameSession(sessionId: string, title: string) {
+  const normalizedTitle = normalizeSessionTitleFromPrompt(title);
+  if (!normalizedTitle) return;
+
+  const previousSessions = sessions();
+  upsertSessionPreview(sessionId, normalizedTitle);
+
   try {
-    await invoke("rename_session", { sessionId, title });
-    await loadSessions();
+    await invoke("rename_session", { sessionId, title: normalizedTitle });
+    void loadSessions();
   } catch (e) {
     console.error("Failed to rename session:", e);
+    setSessions(previousSessions);
   }
 }
 
@@ -1396,6 +1564,36 @@ function initListeners() {
   listen("tray:toggle-voice", () => toggleVoice());
   listen("tray:open-settings", () => setShowSettings(true));
 
+  // Image generation events
+  listen<{ value: number; max: number; percent: number }>("image:progress", (event) => {
+    setImageGenProgress(event.payload.percent);
+  });
+  listen<{ node: string }>("image:stage", (event) => {
+    setImageGenStage(`node ${event.payload.node}`);
+  });
+  listen("image:done", () => {
+    setImageGenProgress(null);
+    setImageGenStage(null);
+    setVramBlackoutInfo(null);
+  });
+  listen("image:error", () => {
+    setImageGenProgress(null);
+    setImageGenStage(null);
+    setVramBlackoutInfo(null);
+  });
+
+  // Tier B VRAM blackout events
+  listen<{ free_mb: number; required_mb: number; stage: string }>("image:tier_blackout", (event) => {
+    if (event.payload.stage === "restored") {
+      setVramBlackoutInfo(null);
+    } else {
+      setVramBlackoutInfo(event.payload);
+    }
+  });
+  listen<{ level: string; hang_count?: number }>("image:session_degraded", () => {
+    setImageSessionDegraded(true);
+  });
+
   // Voice pipeline events
   listen<{ state: "idle" | "listening" | "processing" | "speaking" }>("voice:state", (event) => {
     setVoiceState(event.payload.state);
@@ -1437,6 +1635,19 @@ function initListeners() {
       timestamp: Date.now(),
     };
     appendScopedMessage("assistant", errMsg);
+  });
+
+  // v2 raw telemetry — all meaningful variants are already forwarded to
+  // the canonical voice:state / voice:partial_transcript / voice:transcript
+  // events by the backend, but we also listen here for debug and future
+  // extensions (e.g. showing BargeIn indicator, Metrics panel, etc.).
+  listen<{ kind: string; [key: string]: unknown }>("voice:v2_telemetry", (event) => {
+    const { kind } = event.payload;
+    if (kind === "barge_in") {
+      // Visual feedback: briefly flash back to listening state.
+      setVoiceState("listening");
+    }
+    // Metrics / Wake / FirstAudioOut — silently consumed for now.
   });
 
   // Orchestrator events — track GPU swap state
@@ -1485,6 +1696,7 @@ applyTheme(theme());
 void initializeSessionPersistence();
 // Load settings on startup
 loadSettings();
+void loadTelegramConfig();
 loadAudioDevices();
 void loadColabStatus();
 // Prime and refresh system health for UI status indicators.
@@ -1583,4 +1795,8 @@ export const appStore = {
   dismissToolChoice,
   isSwapping,
   degradationLevel,
+  imageGenProgress,
+  imageGenStage,
+  vramBlackoutInfo,
+  imageSessionDegraded,
 };

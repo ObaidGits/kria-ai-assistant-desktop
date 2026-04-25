@@ -30,23 +30,74 @@ vram_estimate_gb = 2.5
 capabilities = ["chat"]
 
 [voice]
-enabled = false
+enabled = true
 mode = "push_to_talk"
-stt_model = "ggml-base.en.bin"
-tts_voice = "en_US-lessac-high"
-vad_silence_ms = 1000
+# v1 (CLI) cold-loads whisper on every utterance, so smaller = lower latency.
+# v2 (in-process, when wired) keeps the model warm and handles larger variants.
+# Multilingual small model (~181 MB) — fast cold-load, supports Hindi/Hinglish.
+# Run: python scripts/download_models.py --tier lite to fetch it.
+stt_model = "ggml-small-q5_1.bin"
+tts_voice = "en_US-ljspeech-high"
+vad_silence_ms = 500
 energy_threshold = 0.02
 mic_device = "auto"
 speaker_device = "auto"
 push_to_talk_key = "ctrl+space"
 language = "auto"
 partial_update_ms = 2000
+# Live partial transcripts spawn extra whisper-cpp subprocesses; with the v1 CLI
+# backend they cold-load the model on every interval and cause STT timeouts.
+# Keep disabled until a persistent STT backend is wired in.
+enable_partial_transcripts = false
 confidence_threshold = 0.30
 noise_suppression_mode = "off"
 follow_system_default_mic = true
 follow_system_default_speaker = true
 persist_transcripts = true
 persist_raw_audio = false
+
+# Voice pipeline engine: "v1" = legacy CLI-subprocess, "v2" = in-process
+# streaming (whisper-rs + piper-rs + barge-in + optional AEC). v1 stays the
+# default until v2 is validated on every tier and platform.
+engine = "v2"
+# Hardware tier override: "auto" | "s" | "a" | "c". `auto` derives from the
+# detected HardwareTier at startup.
+tier = "auto"
+# Engine overrides; "auto" defers to the resolved tier.
+stt_engine = "auto"
+tts_engine = "auto"
+
+[voice.wake_word]
+# Phase 4: openWakeWord-based "Hey Ria" activation. Disabled until the
+# generic model has been downloaded via scripts/download_models.py.
+enabled = false
+model_path = "models/wake/hey_ria.onnx"
+sensitivity = 0.5
+aliases = ["hey ria", "hey riya", "hello ria", "hello riya"]
+
+[voice.aec]
+# Phase 3: WebRTC APM acoustic echo cancellation. Strictly opt-in via the
+# `aec` cargo feature on `kria-voice` (adds clang+cmake build deps). With
+# the feature compiled out, this section is accepted for forward
+# compatibility but ignored.
+enabled = false
+aggressiveness = "medium"   # low | medium | high
+
+[voice.barge_in]
+# Phase 2: hard interrupt of TTS playback when the user starts speaking.
+# `min_speech_ms` debounces AEC residue and single-cough false positives.
+enabled = true
+min_speech_ms = 180
+
+[voice.post_edit]
+# Phase 5: LLM Hinglish fix-pass over the final transcript. Runs
+# concurrently with intent routing so it does not add user-perceived latency
+# when within budget. Per-tier hard timeout: S=250 ms, A=600 ms, C=1000 ms.
+enabled = true
+model = "qwen2.5-3b-instruct"
+mode = "on_low_confidence"   # always | on_low_confidence
+timeout_ms = 0               # 0 = use tier default
+
 
 [memory]
 max_facts = 10000
@@ -114,10 +165,11 @@ emergency_dwell_ms = 750                     # VRAM must be below emergency for 
 recovery_dwell_secs = 30                     # VRAM must be above recover for this long before scale-up
 state_max_dwell_secs = 300                   # Hard cap: any state older than this forces Idle resync
 max_emergency_transitions_per_hour = 3       # Separate rate budget for emergency swaps
-llama_server_binary = "/home/obaid/Downloads/llama.cpp/build/bin/llama-server"
-flash_attention = true
-mlock = true
-batch_size = 256
+llama_server_binary = "llama-server"          # Resolved via PATH; absolute paths still work
+slot_save_path = ""                           # Dir passed to llama-server's --slot-save-path; "" => <tmp>/kria_llama_slots. Required for Tier B KV-cache hand-off across hard restarts.
+flash_attention = false                       # Off by default; tune_for_tier opts in on Performance/High GPUs
+mlock = false                                 # Off by default; tune_for_tier opts in only when free RAM is sufficient (prevents freeze)
+batch_size = 128
 graceful_stop_timeout_secs = 5               # Graceful stop wait before kill escalation
 health_check_timeout_secs = 120              # Spawn readiness timeout (/health)
 port_discovery_timeout_secs = 60             # Ephemeral port discovery timeout
@@ -136,7 +188,7 @@ total_layers = 28                            # Qwen2.5-VL-7B (qwen2vl.block_coun
 per_layer_vram_mb = 165                      # ~4609 MiB / 28 layers
 base_vram_overhead_mb = 200
 kv_per_1k_ctx_mb = 100
-min_context = 2048                           # Hard floor — never go below
+min_context = 4096                           # Hard floor — never go below this (2048 is too small for any useful inference)
 max_context = 8192
 has_vision_projector = true
 mmproj_vram_mb = 1300                        # mmproj-F16.gguf ~1291 MiB
@@ -174,3 +226,42 @@ ood_entropy_threshold = 0.85
 
 # Multi-intent detection: margin below this triggers soft multi-domain check.
 multi_intent_margin = 0.04
+
+# ── Image Generation ─────────────────────────────────────────────────────────
+[image_generation]
+enabled = true                               # Cloud fallback (Pollinations.ai) works with no local GPU
+tier_override = "b"                          # "" = auto-detect | "s" | "a" | "b" | "c"
+                                             # Set "b" on 6 GB GPUs: VRAM snapshot is taken *before* LLM eviction
+                                             # so free_mb appears < 4 GB and auto-detect falls to Tier C (cloud).
+                                             # "b" forces the drop-swap protocol regardless of instantaneous free VRAM.
+comfy_port = 8188                            # ComfyUI headless sidecar port
+comfy_venv_dir = ""                          # "" = ~/.kria/comfyui/.venv
+comfy_models_dir = ""                        # "" = ~/.kria/comfyui/models
+output_dir = ""                              # "" = ~/.kria/cache/images
+conditioning_cache_dir = ""                  # "" = ~/.kria/cache/conditioning
+conditioning_cache_max_mb = 500
+idle_unload_secs = 300                       # Seconds of inactivity before ComfyUI model unload
+prewarm = "auto"                             # "auto" | "always" | "never"
+prewarm_delay_secs = 30                      # Delay after startup before prewarm attempt
+cloud_fallback = "always"                    # "auto_offer" | "always" | "off" — always use cloud when no local GPU
+pollinations_base_url = "https://image.pollinations.ai"
+max_concurrent_jobs = 2
+max_queued_swap_jobs = 4
+health_check_timeout_secs = 180              # ComfyUI cold start: model scan + custom node import + CUDA init can take 90s+; early-exit detection fast-fails real errors
+defrag_every_n_swaps = 15                    # Restart ComfySidecar after this many Tier-B swaps
+default_lora_strength = 0.85
+default_quality = "balanced"
+sdxl_model_high = "juggernautXL_v9Lightning.safetensors"
+enable_sdxl_high_profile = false
+cloud_providers = ["pollinations", "hf_flux"]
+local_timeout_secs = 180
+hf_inference_token = ""
+prompt_enhance_mode = "auto"
+# Routing mode for image generation.
+#   "auto"                       KRIA decides from hardware tier (C→cloud, A/B→local+cloud, S→local)
+#   "local_only"                 ComfyUI sidecar only; hard-fails if no GPU detected
+#   "cloud_only"                 Pollinations.ai/HF only; sidecar never starts
+#   "local_with_cloud_fallback"  Local primary; cloud on any local failure
+#   "cloud_with_local_fallback"  Cloud primary; local on cloud failure
+# Runtime override: KRIA_IMAGE_MODE env var (e.g. KRIA_IMAGE_MODE=cloud_only)
+image_mode = "auto"

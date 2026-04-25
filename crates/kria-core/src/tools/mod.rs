@@ -8,6 +8,7 @@ pub mod file_ops;
 pub mod google_workspace;
 pub mod google_workspace_contract;
 pub mod i18n;
+pub mod image_generation;
 pub mod interaction;
 pub mod internet;
 pub mod knowledge;

@@ -1,7 +1,8 @@
-import { Component, Show, For, createSignal, createMemo } from "solid-js";
+import { Component, Show, For, createSignal, createMemo, createEffect, onCleanup, untrack } from "solid-js";
 import { marked } from "marked";
 import hljs from "highlight.js";
 import DOMPurify from "dompurify";
+import { invoke } from "@tauri-apps/api/core";
 import { appStore, type Message, type ToolCall } from "../stores/app";
 
 // Configure marked with highlight.js
@@ -106,10 +107,90 @@ function pickFirstString(row: Record<string, any>, keys: string[]): string {
   return "";
 }
 
-const ToolCallBlock: Component<{ tc: ToolCall }> = (props) => {
+function extractLocalImagePaths(text: string): string[] {
+  const paths = new Set<string>();
+  const regex = /(\/[^\s"'`]+?\.(?:png|jpe?g|webp|gif))(?=$|[\s"'`),.!?;:\]])/gi;
+
+  for (const match of text.matchAll(regex)) {
+    const candidate = (match[1] || "").trim().replace(/[),.!?;:]+$/g, "");
+    if (candidate.startsWith("/")) {
+      paths.add(candidate);
+    }
+  }
+
+  return Array.from(paths);
+}
+
+function extractStructuredGenerateImagePaths(toolCalls?: ToolCall[]): string[] {
+  const paths = new Set<string>();
+  for (const tc of toolCalls || []) {
+    if (tc.name !== "generate_image") continue;
+    const obj = parseResultObject(tc.result);
+    if (!obj) continue;
+
+    const directImages = Array.isArray(obj.images) ? obj.images : null;
+    const dataImages =
+      obj.data && typeof obj.data === "object" && !Array.isArray(obj.data) && Array.isArray((obj.data as Record<string, unknown>).images)
+        ? ((obj.data as Record<string, unknown>).images as unknown[])
+        : null;
+    const nestedResultImages =
+      obj.result && typeof obj.result === "object" && !Array.isArray(obj.result) && Array.isArray((obj.result as Record<string, unknown>).images)
+        ? ((obj.result as Record<string, unknown>).images as unknown[])
+        : null;
+
+    const images = directImages ?? dataImages ?? nestedResultImages ?? [];
+    images.forEach((img: any) => {
+      const path = typeof img?.path === "string" ? img.path.trim() : "";
+      if (path.startsWith("/")) {
+        paths.add(path);
+      }
+    });
+  }
+  return Array.from(paths);
+}
+
+function extractGenerateImagePathsFromToolText(toolCalls?: ToolCall[]): string[] {
+  const paths = new Set<string>();
+  for (const tc of toolCalls || []) {
+    if (tc.name !== "generate_image") continue;
+    const text = resultToText(tc.result);
+    for (const path of extractLocalImagePaths(text)) {
+      paths.add(path);
+    }
+  }
+  return Array.from(paths);
+}
+
+function imageFileNameFromPath(path: string, fallback = "kria-generated-image.jpg"): string {
+  const name = path.split("/").pop()?.trim() || "";
+  return /\.[a-z0-9]+$/i.test(name) ? name : fallback;
+}
+
+// ── Copy-to-clipboard helper ────────────────────────────────────────────
+function useCopyButton() {
+  const [copied, setCopied] = createSignal(false);
+  const copy = (text: string) => {
+    navigator.clipboard.writeText(text).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    });
+  };
+  return { copied, copy };
+}
+
+const ToolCallBlock: Component<{
+  tc: ToolCall;
+  onOpenImage?: (src: string, options?: { alt?: string; downloadName?: string }) => void;
+}> = (props) => {
   const [expanded, setExpanded] = createSignal(false);
   const resultObj = createMemo(() => parseResultObject(props.tc.result));
   const resultText = createMemo(() => resultToText(props.tc.result));
+
+  // Map from image path → base64 data URL (loaded lazily via Tauri command)
+  const [imageDataUrls, setImageDataUrls] = createSignal<Record<string, string>>({});
+  const [imageLoadAttempts, setImageLoadAttempts] = createSignal<Record<string, number>>({});
+  const inFlightImageLoads = new Set<string>();
+  const retryTimers = new Map<string, number>();
 
   const newsResults = createMemo(() => {
     if (props.tc.name !== "search_news") return [] as Record<string, any>[];
@@ -196,9 +277,93 @@ const ToolCallBlock: Component<{ tc: ToolCall }> = (props) => {
     );
   });
 
+  // Image generation results
+  const imageResults = createMemo<Array<{
+    path: string;
+    width: number;
+    height: number;
+    style: string;
+    provenance: string;
+    seed?: number;
+    quality?: string;
+    steps?: number;
+    sampler?: string;
+    cfg_scale?: number;
+    enhance_mode?: string;
+    final_prompt?: string;
+  }>>(() => {
+    if (props.tc.name !== "generate_image") return [];
+    const obj = resultObj();
+    if (!obj) return [];
+
+    const directImages = Array.isArray(obj.images) ? obj.images : null;
+    const dataImages =
+      obj.data && typeof obj.data === "object" && !Array.isArray(obj.data) && Array.isArray((obj.data as Record<string, unknown>).images)
+        ? ((obj.data as Record<string, unknown>).images as unknown[])
+        : null;
+    const nestedResultImages =
+      obj.result && typeof obj.result === "object" && !Array.isArray(obj.result) && Array.isArray((obj.result as Record<string, unknown>).images)
+        ? ((obj.result as Record<string, unknown>).images as unknown[])
+        : null;
+
+    const imgs = directImages ?? dataImages ?? nestedResultImages ?? [];
+    return imgs.filter((img: any) => img && typeof img.path === "string") as any[];
+  });
+
   const hasStructuredCards = createMemo(() =>
-    newsResults().length > 0 || webResults().length > 0 || !!articleResult() || !!googleResult()
+    newsResults().length > 0 || webResults().length > 0 || !!articleResult() || !!googleResult() || imageResults().length > 0
   );
+
+  const scheduleImageRetry = (path: string) => {
+    if (retryTimers.has(path)) return;
+    const attempts = untrack(() => imageLoadAttempts()[path] ?? 0);
+    if (attempts >= 5) return;
+    const delayMs = Math.min(300 * Math.pow(2, attempts), 3000);
+    const timerId = window.setTimeout(() => {
+      retryTimers.delete(path);
+      setImageLoadAttempts((prev) => ({ ...prev, [path]: (prev[path] ?? 0) + 1 }));
+    }, delayMs);
+    retryTimers.set(path, timerId);
+  };
+
+  const imageLoadFailed = (path: string) => {
+    const attempts = imageLoadAttempts()[path] ?? 0;
+    return attempts >= 5 && !imageDataUrls()[path];
+  };
+
+  onCleanup(() => {
+    for (const timerId of retryTimers.values()) {
+      window.clearTimeout(timerId);
+    }
+    retryTimers.clear();
+    inFlightImageLoads.clear();
+  });
+
+  // Lazily load each image as a base64 data URL via Tauri (avoids broken asset:// URLs)
+  // untrack() the imageDataUrls read so this effect doesn't re-run every time an image loads —
+  // only when imageResults() itself changes (new images added to the tool call).
+  createEffect(() => {
+    imageLoadAttempts();
+    const imgs = imageResults();
+    imgs.forEach((img) => {
+      const path = String(img.path);
+      if (untrack(() => imageDataUrls()[path])) return; // already loaded — skip without dep
+      if (inFlightImageLoads.has(path)) return;
+
+      inFlightImageLoads.add(path);
+      invoke<string>("read_local_image", { path: img.path })
+        .then((dataUrl) => {
+          setImageDataUrls((prev) => ({ ...prev, [path]: dataUrl }));
+        })
+        .catch(() => {
+          // Generated files can appear a moment after tool_result; retry with capped backoff.
+          scheduleImageRetry(path);
+        })
+        .finally(() => {
+          inFlightImageLoads.delete(path);
+        });
+    });
+  });
 
   const statusIcon = () => {
     switch (props.tc.status) {
@@ -455,6 +620,106 @@ const ToolCallBlock: Component<{ tc: ToolCall }> = (props) => {
             </div>
           </Show>
 
+          {/* Image generation failure card */}
+          <Show when={props.tc.name === "generate_image" && props.tc.status === "error"}>
+            {(() => {
+              const rawData = props.tc.result as any;
+              const report = rawData?.failure_report ?? rawData?.data?.failure_report;
+              const stage = report?.stage ?? "Unknown";
+              const message = report?.message ?? (typeof props.tc.result === "string" ? props.tc.result : "Image generation failed");
+              const hint = report?.hint ?? "";
+              return (
+                <div class="tool-image-failure-card">
+                  <div class="tool-image-failure-header">
+                    <span class="tool-image-failure-icon">⚠️</span>
+                    <span class="tool-image-failure-stage">{stage}</span>
+                  </div>
+                  <p class="tool-image-failure-message">{message}</p>
+                  {hint && <p class="tool-image-failure-hint">{hint}</p>}
+                  <button
+                    class="tool-image-btn"
+                    onClick={() => void appStore.sendMessage(`Generate image: ${String((props.tc.args as any)?.prompt ?? "")} (retry)`)}
+                  >
+                    ↺ Retry (new seed)
+                  </button>
+                </div>
+              );
+            })()}
+          </Show>
+
+          {/* Image generation results */}
+          <Show when={imageResults().length > 0}>
+            <div class="tool-image-results">
+              <For each={imageResults()}>
+                {(img) => (
+                  <div class="tool-image-card">
+                    <Show
+                      when={imageDataUrls()[img.path]}
+                      fallback={<div class="tool-image-loading">{imageLoadFailed(img.path) ? "Unable to load image." : "Loading image..."}</div>}
+                    >
+                      <img
+                        src={imageDataUrls()[img.path]}
+                        alt={`Generated ${img.style} image`}
+                        class="tool-image-thumb"
+                        loading="lazy"
+                        onClick={() => {
+                          const src = imageDataUrls()[img.path];
+                          if (!src) return;
+                          props.onOpenImage?.(src, {
+                            alt: `Generated ${img.style} image`,
+                            downloadName: imageFileNameFromPath(img.path, `kria-${img.style || "generated"}-image.jpg`),
+                          });
+                        }}
+                      />
+                    </Show>
+                    <div class="tool-image-meta">
+                      <span class="tool-image-badge">{img.style}</span>
+                      <span class="tool-image-badge">{img.width}×{img.height}</span>
+                      {img.quality && <span class="tool-image-badge">{img.quality}</span>}
+                      {img.seed != null && <span class="tool-image-badge">seed: {img.seed}</span>}
+                      {img.steps != null && <span class="tool-image-badge">{img.steps}s / {img.sampler ?? "euler"}</span>}
+                      <span class="tool-image-badge tool-image-provenance">{img.provenance}</span>
+                    </div>
+                    <div class="tool-image-actions">
+                      <Show when={imageDataUrls()[img.path]}>
+                        <a
+                          href={imageDataUrls()[img.path]}
+                          download={`kria-${img.style || "generated"}-image.jpg`}
+                          class="tool-image-btn"
+                          title="Download image"
+                        >
+                          ↓ Download
+                        </a>
+                        <button
+                          class="tool-image-btn"
+                          title="Open preview"
+                          onClick={() => {
+                            const src = imageDataUrls()[img.path];
+                            if (!src) return;
+                            if (props.onOpenImage) {
+                              props.onOpenImage(src, {
+                                alt: `Generated ${img.style} image`,
+                                downloadName: imageFileNameFromPath(img.path, `kria-${img.style || "generated"}-image.jpg`),
+                              });
+                              return;
+                            }
+
+                            const win = window.open("", "_blank");
+                            if (!win) return;
+                            win.document.write(`<img src="${src}" style="max-width:100%">`);
+                            win.document.title = "KRIA Generated Image";
+                          }}
+                        >
+                          ↗ Open
+                        </button>
+                      </Show>
+                    </div>
+                  </div>
+                )}
+              </For>
+            </div>
+          </Show>
+
           <Show when={props.tc.result && !hasStructuredCards()}>
             <div class={`tool-call-result tool-result-${props.tc.status}`}>
               <strong>Result:</strong>
@@ -473,49 +738,268 @@ const ToolCallBlock: Component<{ tc: ToolCall }> = (props) => {
 };
 
 const MessageBubble: Component<Props> = (props) => {
-  const roleClass = () => `message message-${props.message.role}`;
+  const { copy: copyMsg, copied: msgCopied } = useCopyButton();
+  const isUser = () => props.message.role === "user";
+  const isAssistant = () => props.message.role === "assistant";
+
+  const [inlineImageDataUrls, setInlineImageDataUrls] = createSignal<Record<string, string>>({});
+  const [inlineImageLoadAttempts, setInlineImageLoadAttempts] = createSignal<Record<string, number>>({});
+  const inlineInFlightImageLoads = new Set<string>();
+  const inlineRetryTimers = new Map<string, number>();
+  const [imagePreview, setImagePreview] = createSignal<{
+    src: string;
+    alt: string;
+    downloadName: string;
+  } | null>(null);
+
+  const openImagePreview = (src: string, options?: { alt?: string; downloadName?: string }) => {
+    setImagePreview({
+      src,
+      alt: options?.alt || "Generated image",
+      downloadName: options?.downloadName || "kria-generated-image.jpg",
+    });
+  };
+
+  const closeImagePreview = () => {
+    setImagePreview(null);
+  };
+
+  createEffect(() => {
+    const preview = imagePreview();
+    if (!preview) return;
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        closeImagePreview();
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    onCleanup(() => {
+      window.removeEventListener("keydown", onKeyDown);
+    });
+  });
 
   const htmlContent = createMemo(() => {
-    if (!props.message.content) return "";
-    // Only render markdown for assistant messages
-    if (props.message.role === "assistant") {
-      return renderMarkdown(props.message.content);
+    if (!props.message.content || !isAssistant()) return "";
+    return renderMarkdown(props.message.content);
+  });
+
+  const timeLabel = () =>
+    new Date(props.message.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+  const roleLabel = () => {
+    switch (props.message.role) {
+      case "assistant": return "KRIA";
+      case "user": return "You";
+      case "system": return "System";
+      case "tool": return "Tool";
+      default: return props.message.role;
     }
-    return "";
+  };
+
+  const inlineGeneratedImagePaths = createMemo(() => {
+    if (!isAssistant()) return [] as string[];
+    const contentPaths = props.message.content ? extractLocalImagePaths(props.message.content) : [];
+    const toolTextPaths = extractGenerateImagePathsFromToolText(props.message.toolCalls);
+    const fallbackPaths = new Set<string>([...contentPaths, ...toolTextPaths]);
+
+    // Avoid duplicate cards when structured generate_image payload is already renderable.
+    const structuredPaths = new Set<string>(extractStructuredGenerateImagePaths(props.message.toolCalls));
+    for (const path of structuredPaths) {
+      fallbackPaths.delete(path);
+    }
+
+    return Array.from(fallbackPaths);
+  });
+
+  const scheduleInlineImageRetry = (path: string) => {
+    if (inlineRetryTimers.has(path)) return;
+    const attempts = untrack(() => inlineImageLoadAttempts()[path] ?? 0);
+    if (attempts >= 5) return;
+    const delayMs = Math.min(300 * Math.pow(2, attempts), 3000);
+    const timerId = window.setTimeout(() => {
+      inlineRetryTimers.delete(path);
+      setInlineImageLoadAttempts((prev) => ({
+        ...prev,
+        [path]: (prev[path] ?? 0) + 1,
+      }));
+    }, delayMs);
+    inlineRetryTimers.set(path, timerId);
+  };
+
+  const inlineImageLoadFailed = (path: string) => {
+    const attempts = inlineImageLoadAttempts()[path] ?? 0;
+    return attempts >= 5 && !inlineImageDataUrls()[path];
+  };
+
+  createEffect(() => {
+    inlineImageLoadAttempts();
+    const paths = inlineGeneratedImagePaths();
+
+    paths.forEach((path) => {
+      if (untrack(() => inlineImageDataUrls()[path])) return;
+      if (inlineInFlightImageLoads.has(path)) return;
+
+      inlineInFlightImageLoads.add(path);
+      invoke<string>("read_local_image", { path })
+        .then((dataUrl) => {
+          setInlineImageDataUrls((prev) => ({ ...prev, [path]: dataUrl }));
+        })
+        .catch(() => {
+          scheduleInlineImageRetry(path);
+        })
+        .finally(() => {
+          inlineInFlightImageLoads.delete(path);
+        });
+    });
+  });
+
+  onCleanup(() => {
+    for (const timerId of inlineRetryTimers.values()) {
+      window.clearTimeout(timerId);
+    }
+    inlineRetryTimers.clear();
+    inlineInFlightImageLoads.clear();
   });
 
   return (
-    <div class={roleClass()}>
-      <div class="message-header">
-        <span class="message-role">
-          {props.message.role === "assistant" ? "KRIA" : props.message.role}
-        </span>
-        <span class="message-time">
-          {new Date(props.message.timestamp).toLocaleTimeString()}
-        </span>
+    <div class={`msg-row msg-row-${props.message.role}`}>
+      {/* Avatar — only for assistant */}
+      <Show when={isAssistant()}>
+        <div class="msg-avatar msg-avatar-assistant" aria-hidden="true">K</div>
+      </Show>
+
+      <div class={`msg-bubble msg-bubble-${props.message.role}`}>
+        {/* Bubble header */}
+        <div class="msg-bubble-header">
+          <span class="msg-label">{roleLabel()}</span>
+          <span class="msg-time">{timeLabel()}</span>
+          <Show when={props.message.content}>
+            <button
+              class={`msg-copy-btn ${msgCopied() ? "copied" : ""}`}
+              onClick={() => copyMsg(props.message.content)}
+              title="Copy"
+            >
+              {msgCopied() ? "✓" : "⎘"}
+            </button>
+          </Show>
+        </div>
+
+        {/* Attached image (user upload) */}
+        <Show when={props.message.imageUrl}>
+          <div class="msg-image-wrap">
+            <img
+              src={props.message.imageUrl}
+              alt="Attached image"
+              class="msg-image"
+              onClick={() => window.open(props.message.imageUrl, "_blank")}
+            />
+          </div>
+        </Show>
+
+        <Show when={inlineGeneratedImagePaths().length > 0}>
+          <div class="msg-inline-generated-images">
+            <For each={inlineGeneratedImagePaths()}>
+              {(path) => (
+                <div class="msg-inline-generated-card">
+                  <Show
+                    when={inlineImageDataUrls()[path]}
+                    fallback={
+                      <div class="msg-inline-generated-loading">
+                        {inlineImageLoadFailed(path) ? "Unable to load generated image." : "Loading generated image..."}
+                      </div>
+                    }
+                  >
+                    <img
+                      src={inlineImageDataUrls()[path]}
+                      alt="Generated image"
+                      class="msg-inline-generated-image"
+                      loading="lazy"
+                      onClick={() => openImagePreview(inlineImageDataUrls()[path], {
+                        alt: "Generated image",
+                        downloadName: imageFileNameFromPath(path),
+                      })}
+                    />
+                  </Show>
+                  <Show when={inlineImageDataUrls()[path]}>
+                    <div class="msg-inline-generated-actions">
+                      <button
+                        type="button"
+                        class="msg-inline-generated-btn"
+                        onClick={() => openImagePreview(inlineImageDataUrls()[path], {
+                          alt: "Generated image",
+                          downloadName: imageFileNameFromPath(path),
+                        })}
+                      >
+                        Open
+                      </button>
+                      <a
+                        href={inlineImageDataUrls()[path]}
+                        download={imageFileNameFromPath(path)}
+                        class="msg-inline-generated-download"
+                      >
+                        Download
+                      </a>
+                    </div>
+                  </Show>
+                </div>
+              )}
+            </For>
+          </div>
+        </Show>
+
+        {/* Tool calls */}
+        <Show when={props.message.toolCalls?.length}>
+          <div class="msg-tool-calls">
+            <For each={props.message.toolCalls}>
+              {(tc) => <ToolCallBlock tc={tc} onOpenImage={openImagePreview} />}
+            </For>
+          </div>
+        </Show>
+
+        {/* Message text */}
+        <Show when={props.message.content}>
+          <div class="msg-text">
+            {isAssistant()
+              ? <div innerHTML={htmlContent()} />
+              : <span>{props.message.content}</span>
+            }
+          </div>
+        </Show>
       </div>
 
-      <Show when={props.message.imageUrl}>
-        <div class="message-image">
-          <img src={props.message.imageUrl} alt="Attached image" class="message-image-thumb" />
-        </div>
+      {/* Avatar — only for user */}
+      <Show when={isUser()}>
+        <div class="msg-avatar msg-avatar-user" aria-hidden="true">U</div>
       </Show>
 
-      <Show when={props.message.toolCalls?.length}>
-        <div class="tool-calls">
-          <For each={props.message.toolCalls}>
-            {(tc) => <ToolCallBlock tc={tc} />}
-          </For>
-        </div>
-      </Show>
-
-      <Show when={props.message.content}>
-        <div class="message-content">
-          {props.message.role === "assistant"
-            ? <div innerHTML={htmlContent()} />
-            : props.message.content
-          }
-        </div>
+      <Show when={imagePreview()}>
+        {(preview) => (
+          <div class="msg-image-preview-overlay" onClick={closeImagePreview}>
+            <div class="msg-image-preview-modal" onClick={(e) => e.stopPropagation()}>
+              <div class="msg-image-preview-header">
+                <button type="button" class="msg-image-preview-close" onClick={closeImagePreview}>
+                  ×
+                </button>
+              </div>
+              <img
+                src={preview().src}
+                alt={preview().alt}
+                class="msg-image-preview-image"
+              />
+              <div class="msg-image-preview-actions">
+                <a
+                  href={preview().src}
+                  download={preview().downloadName}
+                  class="tool-image-btn"
+                >
+                  ↓ Download
+                </a>
+              </div>
+            </div>
+          </div>
+        )}
       </Show>
     </div>
   );

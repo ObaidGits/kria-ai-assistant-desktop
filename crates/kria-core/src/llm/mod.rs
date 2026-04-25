@@ -224,13 +224,16 @@ pub fn trim_messages_for_context(messages: &[ChatMessage], attempt: usize) -> Ve
 
     match attempt {
         0 => {
-            // Stage 1: compress large tool results and oversized messages while
-            // preserving full turn history shape.
+            // Stage 1: compress large tool results and oversized non-system messages while
+            // preserving the system prompt and full turn history shape.
             messages
                 .iter()
                 .map(|m| {
                     let mut msg = m.clone();
-                    if msg.role == "tool" {
+                    if msg.role == "system" {
+                        // Never truncate the system prompt in stage 0 — it contains
+                        // the tool-calling schema and critical rules.
+                    } else if msg.role == "tool" {
                         msg.content =
                             truncate_with_suffix(&msg.content, 500, "...<tool-truncated>");
                     } else {
@@ -319,7 +322,13 @@ fn truncate_with_suffix(text: &str, max_chars: usize, suffix: &str) -> String {
 }
 
 fn minimal_system_prompt() -> String {
-    "You are KRIA. Be concise, accurate, and safe. Use available tools when the user asks for live/current information (especially news or web lookup) instead of claiming no real-time access. Avoid repeating unchanged context.".to_string()
+    "You are KRIA, an AI assistant. Be concise, accurate, and safe. \
+ CRITICAL: When the user asks you to perform an action (generate an image, search the web, \
+ send email, run code, etc.), you MUST call the appropriate tool — never refuse or say you cannot. \
+ Always respond with a tool call JSON when a tool is available for the request. \
+ Use available tools for live/current information instead of claiming no real-time access. \
+ Avoid repeating unchanged context."
+        .to_string()
 }
 
 #[cfg(test)]

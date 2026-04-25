@@ -34,6 +34,7 @@ use kria_core::tools::google_workspace as gw;
 use kria_core::tools::google_workspace_contract as gw_contract;
 use kria_core::tools::mount_manager;
 use kria_core::tools::registry::{self, ToolRegistry};
+use kria_core::image::ImageOrchestrator;
 use kria_core::voice::{
     default_input_device_name, default_output_device_name, list_input_devices, list_output_devices,
     SpeechToText, TextToSpeech, VoicePipeline, VoicePipelineEvent, VoicePipelineState,
@@ -377,30 +378,67 @@ fn local_api_base_url(host: &str, port: u16) -> String {
 }
 
 fn build_tool_descriptions_for_prompt(tool_defs: &[registry::ToolDef]) -> String {
-    const MAX_PROMPT_TOOL_LINES: usize = 80;
+    // Categories whose tools are so numerous that listing them individually
+    // would crowd out other categories. They are collapsed into a single
+    // summary line so important tools (image, internet, shell, …) always appear.
+    const COLLAPSED_CATEGORIES: &[&str] = &["google_workspace"];
 
-    let mut sorted_defs = tool_defs.to_vec();
-    sorted_defs.sort_by(|a, b| a.category.cmp(&b.category).then(a.name.cmp(&b.name)));
+    // Minimum number of lines reserved for non-collapsed tools.
+    const MAX_TOOL_LINES: usize = 80;
 
-    let omitted = sorted_defs.len().saturating_sub(MAX_PROMPT_TOOL_LINES);
-    let visible_defs: Vec<registry::ToolDef> = sorted_defs
+    // Separate collapsed from normal tools.
+    let mut collapsed_groups: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    let mut normal_defs: Vec<registry::ToolDef> = Vec::new();
+
+    for def in tool_defs {
+        if COLLAPSED_CATEGORIES.contains(&def.category.as_str()) {
+            collapsed_groups
+                .entry(def.category.clone())
+                .or_default()
+                .push(def.name.clone());
+        } else {
+            normal_defs.push(def.clone());
+        }
+    }
+
+    // Sort non-collapsed tools: category then name.
+    normal_defs.sort_by(|a, b| a.category.cmp(&b.category).then(a.name.cmp(&b.name)));
+
+    let total = tool_defs.len();
+    let visible_defs: Vec<registry::ToolDef> = normal_defs
         .into_iter()
-        .take(MAX_PROMPT_TOOL_LINES)
+        .take(MAX_TOOL_LINES)
         .collect();
+    let omitted = total.saturating_sub(
+        visible_defs.len() + collapsed_groups.values().map(|v| v.len()).sum::<usize>(),
+    );
 
-    let mut lines = Vec::with_capacity(visible_defs.len() + 4);
+    let mut lines = Vec::with_capacity(visible_defs.len() + collapsed_groups.len() + 4);
     lines.push(format!(
         "You can call {} tools via function-calling. Use tool schemas for exact arguments.",
-        tool_defs.len()
+        total
     ));
     lines.push("Tool catalog (name [category]: summary):".to_string());
     if omitted > 0 {
         lines.push(format!(
-            "Only {} representative tools are listed below for brevity; {} additional tools are available via function schemas.",
-            MAX_PROMPT_TOOL_LINES, omitted
+            "{} additional low-priority tools are available via function schemas.",
+            omitted
         ));
     }
 
+    // Emit collapsed category summaries first.
+    for (cat, names) in &collapsed_groups {
+        lines.push(format!(
+            "- [{}]: {} tools ({}) — call any by exact name via tool schema.",
+            cat,
+            names.len(),
+            names.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+                + if names.len() > 5 { ", …" } else { "" }
+        ));
+    }
+
+    // Emit individual tool lines.
     for def in visible_defs {
         let mut line = format!(
             "- {} [{}]: {}",
@@ -591,6 +629,7 @@ struct AgentLoopLocalApiResponder {
     embeddings: Arc<EmbeddingModel>,
     vectors: Arc<VectorIndex>,
     hw_tier: String,
+    orchestrator: Arc<tokio::sync::RwLock<Option<Arc<Orchestrator>>>>,
 }
 
 #[async_trait]
@@ -598,6 +637,7 @@ impl LocalApiResponder for AgentLoopLocalApiResponder {
     async fn respond(&self, request: &LocalApiChatRequest) -> serde_json::Value {
         let chat_id = request.chat_id.unwrap_or(0);
         let from_user = request.from_user.as_deref().unwrap_or("User");
+        let orc_snapshot = self.orchestrator.read().await.clone();
         let reply = kria_core::platform::telegram::process_message(
             &request.message,
             chat_id,
@@ -608,6 +648,10 @@ impl LocalApiResponder for AgentLoopLocalApiResponder {
             &self.embeddings,
             &self.vectors,
             &self.hw_tier,
+            orc_snapshot.as_ref(),
+            // Local API bridge is always the owner — it runs inside the desktop
+            // process and is not accessible to external callers.
+            true,
         )
         .await;
 
@@ -1058,6 +1102,38 @@ fn summarize_tool_turn_for_history(
 
     if let Some(count) = source_count {
         return format!("Tool '{name}' completed with {count} item(s).");
+    }
+
+    // No metadata source_count — try common shapes so the LLM still has data
+    // to ground its reply on (otherwise it falls back to hallucinated bash).
+    if let Some(arr) = payload.as_array() {
+        return format!("Tool '{name}' returned {} item(s).", arr.len());
+    }
+    if let Some(obj) = payload.as_object() {
+        // Look for the first array-valued field — list_installed_packages,
+        // list_languages, etc. follow this shape.
+        for (k, v) in obj.iter() {
+            if let Some(arr) = v.as_array() {
+                if !arr.is_empty() {
+                    return format!(
+                        "Tool '{name}' returned {} {} entry/entries.",
+                        arr.len(),
+                        k
+                    );
+                }
+            }
+        }
+        // Fall back to a compact JSON preview (clipped) so the LLM sees real
+        // values rather than just "completed successfully."
+        let preview = serde_json::to_string(payload).unwrap_or_default();
+        let clipped: String = preview.chars().take(400).collect();
+        if !clipped.is_empty() {
+            return format!("Tool '{name}' completed. Result: {clipped}");
+        }
+    }
+    if let Some(s) = payload.as_str() {
+        let clipped: String = s.chars().take(400).collect();
+        return format!("Tool '{name}' completed: {clipped}");
     }
 
     format!("Tool '{name}' completed successfully.")
@@ -1619,6 +1695,18 @@ pub struct AppState {
     pub current_session_id: Arc<RwLock<String>>,
     pub voice_active: Arc<std::sync::atomic::AtomicBool>,
     pub voice_pipeline: Arc<RwLock<Arc<VoicePipeline>>>,
+    /// Engine-aware voice handle. Holds either the v1 [`VoicePipeline`]
+    /// (default) or the v2 [`kria_core::voice::v2::VoicePipelineV2`] when
+    /// `voice.engine = "v2"`. Existing call-sites keep using
+    /// `voice_pipeline` directly; v2-aware code reads `active_voice`.
+    pub active_voice: Arc<RwLock<kria_core::voice::v2::ActivePipeline>>,
+    /// Telemetry receiver for the v2 pipeline (when active). `None` while
+    /// running v1. Wrapped in a Mutex so the background driver task can
+    /// take it without dropping the AppState lock.
+    pub voice_v2_telemetry:
+        Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<
+            kria_core::voice::v2::VoiceTelemetry,
+        >>>>,
     pub health: Arc<HealthRegistry>,
     pub scheduler: Arc<RwLock<AutomationScheduler>>,
     pub macro_recorder: Arc<RwLock<MacroRecorder>>,
@@ -1643,6 +1731,9 @@ pub struct AppState {
     pub orchestrator_active_turns: Arc<std::sync::atomic::AtomicUsize>,
     /// Last observed local-runtime activity timestamp for idle release decisions.
     pub orchestrator_last_activity_at: Arc<tokio::sync::Mutex<std::time::Instant>>,
+    /// Image generation orchestrator — ComfyUI sidecar + cloud fallback.
+    #[allow(dead_code)]
+    pub image_orchestrator: Arc<ImageOrchestrator>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1691,6 +1782,128 @@ fn build_voice_pipeline(
     config: &KriaConfig,
     paths: &kria_core::platform::paths::KriaPaths,
 ) -> Arc<VoicePipeline> {
+    // Log v2 engine selection — the v2 stack is scaffolded under
+    // `kria_core::voice::v2` (sentence splitter, post-edit, playback sink,
+    // AEC + wake skeletons, FSM). Running v2 end-to-end is gated behind
+    // additional cargo features (`voice-whisper-rs`, `voice-piper-rs`, …)
+    // and is not yet the default runtime path. Until then we always build
+    // the v1 pipeline; v2 is exercised through unit tests + the
+    // `voice_v2_status` command.
+    let engine = config.voice.engine.to_ascii_lowercase();
+    if engine == "v2" {
+        tracing::warn!(
+            "voice.engine = \"v2\" requested; v2 stack is scaffold-only in this build, \
+             falling back to v1. Enable the relevant cargo features and complete the \
+             VoicePipelineV2 runtime loop to switch over."
+        );
+    } else if engine != "v1" && !engine.is_empty() {
+        tracing::warn!(engine = %engine, "unknown voice.engine value; using v1");
+    }
+
+    let stt_model_path = paths.models_dir.join("stt").join(&config.voice.stt_model);
+    let tts_voice_file = format!("{}.onnx", config.voice.tts_voice);
+    let tts_model_path = paths.models_dir.join("piper").join(&tts_voice_file);
+
+    // Resolve + log wake-word model wiring so v2 readiness is visible even
+    // while the runtime path is still v1. Construction is cheap (no model
+    // load when disabled) and any failure falls back silently.
+    if config.voice.wake_word.enabled {
+        let wake_dir = paths.models_dir.join("wake");
+        let wake_path = if config.voice.wake_word.model_path.is_empty() {
+            wake_dir.join("hey_ria.onnx")
+        } else {
+            let p = std::path::PathBuf::from(&config.voice.wake_word.model_path);
+            if p.is_absolute() { p } else { wake_dir.join(p.file_name().unwrap_or_default()) }
+        };
+        let detector = kria_core::voice::v2::WakeWordDetector::try_load(
+            wake_path.clone(),
+            config.voice.wake_word.sensitivity,
+            "hey ria",
+            config.voice.wake_word.aliases.clone(),
+        );
+        tracing::info!(
+            keyword_path = %wake_path.display(),
+            sensitivity = config.voice.wake_word.sensitivity,
+            active = detector.is_active(),
+            "wake-word detector resolved"
+        );
+    }
+
+    let whisper_bin = which_binary("whisper-cpp").or_else(|| which_binary("main"));
+    let piper_bin = which_binary("piper");
+
+    // Surface a clear warning if the configured STT model file is missing,
+    // so the user knows to run `python scripts/download_models.py`.
+    if !stt_model_path.exists() {
+        tracing::warn!(
+            model = %stt_model_path.display(),
+            "configured STT model file not found — run `python scripts/download_models.py --tier lite` to fetch it"
+        );
+    }
+
+    let mut stt = SpeechToText::new(stt_model_path.clone(), whisper_bin.clone());
+    stt.set_language(&config.voice.language);
+    if config.hardware.threads > 0 {
+        stt.set_threads(config.hardware.threads.clamp(1, 12));
+    }
+    stt.set_command_timeout(std::time::Duration::from_secs(45));
+    let tts = TextToSpeech::new(tts_model_path, piper_bin);
+    let vad_model_path = paths.models_dir.join("vad").join("silero_vad.onnx");
+
+    let pipeline = Arc::new(
+        VoicePipeline::new(config.voice.clone(), stt, tts).with_vad_model(vad_model_path),
+    );
+
+    // Pre-warm whisper at startup: page-cache the model file + (on CUDA/metal)
+    // trigger the one-time GPU layer init *before* the first user utterance.
+    // Without this, the first transcription pays the full cold-load cost (the
+    // "optimizing GPU layer…" pause) and often exceeds the STT timeout.
+    // Best-effort — errors are logged and ignored.
+    if stt_model_path.exists() && whisper_bin.is_some() {
+        let warm_model = stt_model_path.clone();
+        let warm_bin = whisper_bin.clone();
+        let warm_lang = config.voice.language.clone();
+        let warm_threads = config.hardware.threads;
+        tokio::spawn(async move {
+            let mut warm_stt = SpeechToText::new(warm_model, warm_bin);
+            warm_stt.set_language(&warm_lang);
+            if warm_threads > 0 {
+                warm_stt.set_threads(warm_threads.clamp(1, 12));
+            }
+            warm_stt.set_command_timeout(std::time::Duration::from_secs(120));
+            // 1 second of silence at 16 kHz — just enough to load the model.
+            let silence = vec![0.0f32; 16_000];
+            let started = std::time::Instant::now();
+            match warm_stt.transcribe_samples(&silence, 16_000).await {
+                Ok(_) => tracing::info!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "whisper warmup complete"
+                ),
+                Err(e) => tracing::warn!(error = %e, "whisper warmup failed (non-fatal)"),
+            }
+        });
+    }
+
+    pipeline
+}
+
+/// Build the v2 in-process streaming pipeline using the v1 CLI engines as
+/// the underlying backends. Adds the streaming sentence playback + hard
+/// barge-in concurrency model on top, without requiring native deps
+/// (whisper-rs, sonata, webrtc-apm). When the user later enables
+/// `voice-whisper-rs` / `voice-piper-rs` features at build time the swap
+/// is local to this builder.
+fn build_v2_pipeline(
+    config: &KriaConfig,
+    paths: &kria_core::platform::paths::KriaPaths,
+    hw_tier: kria_core::platform::detect::HardwareTier,
+) -> anyhow::Result<(
+    Arc<kria_core::voice::v2::VoicePipelineV2>,
+    tokio::sync::watch::Receiver<kria_core::voice::v2::VoiceSessionState>,
+    tokio::sync::mpsc::UnboundedReceiver<kria_core::voice::v2::VoiceTelemetry>,
+)> {
+    use kria_core::voice::v2;
+
     let stt_model_path = paths.models_dir.join("stt").join(&config.voice.stt_model);
     let tts_voice_file = format!("{}.onnx", config.voice.tts_voice);
     let tts_model_path = paths.models_dir.join("piper").join(&tts_voice_file);
@@ -1705,9 +1918,268 @@ fn build_voice_pipeline(
     }
     stt.set_command_timeout(std::time::Duration::from_secs(45));
     let tts = TextToSpeech::new(tts_model_path, piper_bin);
-    let vad_model_path = paths.models_dir.join("vad").join("silero_vad.onnx");
 
-    Arc::new(VoicePipeline::new(config.voice.clone(), stt, tts).with_vad_model(vad_model_path))
+    let wake = if config.voice.wake_word.enabled {
+        let wake_dir = paths.models_dir.join("wake");
+        let wake_path = if config.voice.wake_word.model_path.is_empty() {
+            wake_dir.join("hey_ria.onnx")
+        } else {
+            let p = std::path::PathBuf::from(&config.voice.wake_word.model_path);
+            if p.is_absolute() {
+                p
+            } else {
+                wake_dir.join(p.file_name().unwrap_or_default())
+            }
+        };
+        Some(v2::WakeWordDetector::try_load(
+            wake_path,
+            config.voice.wake_word.sensitivity,
+            "hey ria",
+            config.voice.wake_word.aliases.clone(),
+        ))
+    } else {
+        None
+    };
+
+    let (pipeline, state_rx, telemetry_rx) =
+        v2::build_v2_with_cli_engines(&config.voice, hw_tier, Arc::new(stt), Arc::new(tts), wake);
+    Ok((pipeline, state_rx, telemetry_rx))
+}
+
+// ─── v2 continuous voice loop ─────────────────────────────────────────────
+//
+// Called from `start_voice` when the engine is "v2". Starts an `AudioCapture`
+// thread, broadcasts chunks into the v2 pipeline's `run_turn` loop, and pumps
+// telemetry events to the UI. Runs entirely in a background task; `stop_voice`
+// signals it to exit via `voice_active = false` + `force_abort`.
+
+#[allow(clippy::too_many_arguments)]
+async fn start_voice_v2_loop(
+    v2: Arc<kria_core::voice::v2::VoicePipelineV2>,
+    voice_active: Arc<std::sync::atomic::AtomicBool>,
+    telemetry_slot: Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<kria_core::voice::v2::VoiceTelemetry>>>>,
+    router: Arc<ModelRouter>,
+    session_id_lock: Arc<RwLock<String>>,
+    config: Arc<RwLock<KriaConfig>>,
+    hw_info: Arc<HardwareInfo>,
+    memory_store: Arc<MemoryStore>,
+    tool_registry: Arc<kria_core::tools::registry::ToolRegistry>,
+    app: AppHandle,
+) {
+    use kria_core::voice::v2::VoiceSessionState;
+    use kria_core::voice::capture::AudioCapture;
+
+    // 1. Wire the AudioPlayer to the pipeline.
+    {
+        let cfg = config.read().await;
+        let player = Arc::new(
+            kria_core::voice::AudioPlayer::new()
+                .with_output_device(Some(cfg.voice.speaker_device.clone()))
+                .follow_system_default(cfg.voice.follow_system_default_speaker),
+        );
+        v2.set_audio_player(player).await;
+    }
+
+    // 2. Start AudioCapture and forward to a broadcast channel, gating chunks
+    //    when the pipeline is Speaking so the mic doesn't pick up KRIA's voice.
+    let (broadcast_tx, _) = tokio::sync::broadcast::channel::<kria_core::voice::capture::AudioChunk>(128);
+    let broadcast_tx_arc = Arc::new(broadcast_tx);
+    {
+        let capture_cfg = config.read().await;
+        let mic_device = capture_cfg.voice.mic_device.clone();
+        let follow_mic = capture_cfg.voice.follow_system_default_mic
+            || mic_device.trim().is_empty()
+            || mic_device.eq_ignore_ascii_case("auto");
+        let noise_mode = capture_cfg.voice.noise_suppression_mode.clone();
+        drop(capture_cfg);
+
+        let capture = AudioCapture::new(16_000)
+            .with_input_device(mic_device)
+            .follow_system_default(follow_mic)
+            .with_noise_suppression_mode(noise_mode);
+
+        let (mut capture_rx, _capture_handle) = match capture.start() {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::error!("v2 audio capture failed to start: {e}");
+                let _ = app.emit("voice:error", serde_json::json!({ "error": format!("Mic start failed: {e}") }));
+                voice_active.store(false, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+        };
+
+        let bt = broadcast_tx_arc.clone();
+        let v2_state = v2.subscribe_state();
+        // Forward mpsc → broadcast, gating when Speaking/Thinking/BargeIn to
+        // prevent recording KRIA's own TTS output (echo cancellation gate).
+        tokio::spawn(async move {
+            // Keep capture_handle alive for the duration of this task.
+            // (_capture_handle is moved here to prevent premature drop.)
+            while let Some(chunk) = capture_rx.recv().await {
+                let st = *v2_state.borrow();
+                if matches!(
+                    st,
+                    VoiceSessionState::Speaking | VoiceSessionState::Thinking | VoiceSessionState::BargeIn
+                ) {
+                    // Discard — KRIA is generating/speaking; skip to prevent echo.
+                    continue;
+                }
+                if bt.send(chunk).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    // 3. Pump telemetry events → Tauri UI events.
+    {
+        let mut rx_opt = telemetry_slot.lock().await.take();
+        if let Some(mut rx) = rx_opt.take() {
+            let app_h = app.clone();
+            let va = voice_active.clone();
+            let slot = telemetry_slot.clone();
+            tokio::spawn(async move {
+                while let Some(ev) = rx.recv().await {
+                    let (tauri_event, payload) = v2_telemetry_to_event(&ev);
+                    let _ = app_h.emit(tauri_event, payload);
+                    // Also forward raw telemetry for debug/UI extensions.
+                    if let Ok(raw) = serde_json::to_value(&ev) {
+                        let _ = app_h.emit("voice:v2_telemetry", raw);
+                    }
+                    if !va.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                }
+                *slot.lock().await = None;
+            });
+        }
+    }
+
+    let _ = app.emit("voice:state", serde_json::json!({ "state": "listening" }));
+
+    // 4. Main run_turn loop. Each call to run_turn executes one full
+    //    wake → capture → STT → LLM → TTS cycle.
+    let v2_loop = v2.clone();
+    let voice_active_loop = voice_active.clone();
+    let router_loop = router.clone();
+    let config_loop = config.clone();
+    let session_id_loop = session_id_lock.clone();
+    let memory_store_loop = memory_store.clone();
+    let tool_registry_loop = tool_registry.clone();
+    let hw_info_loop = hw_info.clone();
+    let app_loop = app.clone();
+    let bt_loop = broadcast_tx_arc.clone();
+
+    tauri::async_runtime::spawn(async move {
+        while voice_active_loop.load(std::sync::atomic::Ordering::Relaxed) {
+            // Transition to Listening before each turn.
+            v2_loop.force_wake("auto");
+
+            let audio_rx = bt_loop.subscribe();
+            let router_turn = router_loop.clone();
+            let config_turn = config_loop.clone();
+            let session_id_turn = session_id_loop.clone();
+            let memory_turn = memory_store_loop.clone();
+            let tool_reg_turn = tool_registry_loop.clone();
+            let hw_turn = hw_info_loop.clone();
+
+            let llm = move |user_text: String| async move {
+                let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
+                let backend = match router_turn.route("voice").await {
+                    Some(b) => b,
+                    None => {
+                        let _ = tx.send("(No LLM backend — check model config)".into()).await;
+                        return rx;
+                    }
+                };
+                // Build messages with system prompt + recent context (mirrors v1 flow).
+                let session_id = session_id_turn.read().await.clone();
+                let cfg = config_turn.read().await;
+                let hw_tier = hw_turn.tier.as_str();
+                let tool_defs = tool_reg_turn.list_for_tier(hw_tier);
+                let tool_descriptions = build_tool_descriptions_for_prompt(&tool_defs);
+                let user_name = memory_turn
+                    .get_preference("user_name")
+                    .unwrap_or(None)
+                    .unwrap_or_else(|| "User".to_string());
+                let memory_context = match memory_turn.search_facts(&user_text, 5) {
+                    Ok(facts) if !facts.is_empty() => {
+                        let lines: Vec<String> = facts.iter().map(|f| format!("- {}", f.text)).collect();
+                        format!("Known facts:\n{}", lines.join("\n"))
+                    }
+                    _ => String::new(),
+                };
+                let system_prompt = kria_core::agent::prompts::build_system_prompt(
+                    &tool_descriptions, &user_name, std::env::consts::OS, hw_tier,
+                    "auto", &memory_context,
+                );
+                drop(cfg);
+                let recent_turns = memory_turn.get_recent_turns(&session_id, 20).unwrap_or_default();
+                let mut messages = Vec::with_capacity(recent_turns.len() + 2);
+                messages.push(ChatMessage { role: "system".into(), content: system_prompt, name: None, images: None });
+                for t in &recent_turns {
+                    messages.push(ChatMessage { role: t.role.clone(), content: t.content.clone(), name: None, images: None });
+                }
+                messages.push(ChatMessage { role: "user".into(), content: user_text, name: None, images: None });
+                tokio::spawn(async move {
+                    use futures::StreamExt;
+                    match backend.chat_stream(&messages, None, 0.7, 512).await {
+                        Ok(mut stream) => {
+                            while let Some(tok) = stream.next().await {
+                                if tx.send(tok).await.is_err() { break; }
+                            }
+                        }
+                        Err(e) => { let _ = tx.send(format!("(LLM error: {e})")).await; }
+                    }
+                });
+                rx
+            };
+
+            if let Err(e) = v2_loop.clone().run_turn(audio_rx, llm).await {
+                tracing::warn!("v2 run_turn error: {e}");
+                let _ = app_loop.emit("voice:error", serde_json::json!({ "error": e.to_string() }));
+            }
+
+            // Post-turn silence gap: prevents the next turn's STT from picking
+            // up residual echo from the speaker (≥300 ms is enough for room echo).
+            if voice_active_loop.load(std::sync::atomic::Ordering::Relaxed) {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+        }
+        let _ = app_loop.emit("voice:state", serde_json::json!({ "state": "idle" }));
+        tracing::info!("v2 voice loop exited");
+    });
+}
+
+/// Map a `VoiceTelemetry` variant to the canonical Tauri event name + JSON
+/// payload that the existing UI listeners already handle.
+fn v2_telemetry_to_event(ev: &kria_core::voice::v2::VoiceTelemetry) -> (&'static str, serde_json::Value) {
+    use kria_core::voice::v2::{VoiceTelemetry, VoiceSessionState};
+    match ev {
+        VoiceTelemetry::State { state } => {
+            let s = match state {
+                VoiceSessionState::Sleeping => "idle",
+                VoiceSessionState::Listening => "listening",
+                VoiceSessionState::Transcribing | VoiceSessionState::Thinking => "processing",
+                VoiceSessionState::Speaking => "speaking",
+                VoiceSessionState::BargeIn => "listening",
+            };
+            ("voice:state", serde_json::json!({ "state": s }))
+        }
+        VoiceTelemetry::Partial { text, engine } => (
+            "voice:partial_transcript",
+            serde_json::json!({ "text": text, "confidence": 0.7, "language": "auto", "stability": 0.5, "engine": engine }),
+        ),
+        VoiceTelemetry::Final { text, confidence, engine } => (
+            "voice:transcript",
+            serde_json::json!({ "text": text, "confidence": confidence, "language": "auto", "stability": 1.0, "engine": engine }),
+        ),
+        VoiceTelemetry::Error { message } => (
+            "voice:error",
+            serde_json::json!({ "error": message }),
+        ),
+        _ => ("voice:v2_telemetry", serde_json::to_value(ev).unwrap_or_default()),
+    }
 }
 
 /// Initialize the KRIA runtime (called from setup).
@@ -1951,6 +2423,33 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
                 orch_cfg.model_profile =
                     derive_model_profile(&c.model, &config.orchestrator.model_profile);
 
+                // Hardware-tier safety pass: clamps mlock / flash_attention /
+                // batch_size / safety_margin to values the detected machine
+                // can actually handle. Without this, defaults like
+                // `mlock=true` + a 5GB Qwen2.5-VL on a 16GB laptop will OOM
+                // and freeze the system at startup.
+                let model_size_mb = std::fs::metadata(&model_path)
+                    .map(|m| m.len() / (1024 * 1024))
+                    .unwrap_or((c.model.vram_estimate_gb as u64) * 1024);
+                orch_cfg.tune_for_tier(
+                    hardware_info.tier,
+                    hardware_info.total_ram_mb,
+                    hardware_info.vram_mb,
+                    model_size_mb,
+                );
+
+                tracing::info!(
+                    tier = %hardware_info.tier.as_str(),
+                    ram_mb = hardware_info.total_ram_mb,
+                    vram_mb = ?hardware_info.vram_mb,
+                    model_size_mb,
+                    mlock = orch_cfg.mlock,
+                    flash_attention = orch_cfg.flash_attention,
+                    batch_size = orch_cfg.batch_size,
+                    safety_margin_mb = orch_cfg.safety_margin_mb,
+                    "orchestrator: tuned config for detected hardware tier"
+                );
+
                 tracing::info!(
                     total_layers = orch_cfg.model_profile.total_layers,
                     per_layer_vram_mb = orch_cfg.model_profile.per_layer_vram_mb,
@@ -2015,6 +2514,25 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
     kria_core::tools::news::register(&tool_registry_inner, sidecar.clone());
     // Re-register vision tools with sidecar (overrides the None-sidecar registration from build_registry)
     kria_core::tools::vision::register(&tool_registry_inner, Some(sidecar.clone()));
+
+    // ── Image generation orchestrator ─────────────────────────────────────────
+    let image_cfg = config.image_generation.clone();
+    let image_orchestrator = ImageOrchestrator::new(image_cfg, &paths.data_dir);
+    {
+        // Build an EventEmitter that forwards image/voice events to the Tauri frontend.
+        let handle_img = handle.clone();
+        let img_emit_fn: std::sync::Arc<dyn Fn(&str, serde_json::Value) + Send + Sync + 'static> =
+            std::sync::Arc::new(move |event_name: &str, payload: serde_json::Value| {
+                let _ = handle_img.emit(event_name, payload);
+            });
+        kria_core::tools::image_generation::register(
+            &tool_registry_inner,
+            image_orchestrator.clone(),
+            img_emit_fn,
+            orch_cell.clone(),
+        );
+    }
+    tracing::info!("[INIT] image generation orchestrator ready");
 
     // ── MCP server startup ────────────────────────────────────────────────────
     // Load MCP server configs from mcp_servers.json (supplements TOML config)
@@ -2104,8 +2622,34 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
 
     tracing::info!("KRIA runtime initialized — agent loop active");
 
-    // Build voice pipeline
+    // Build voice pipeline (v1 — always built so the legacy code path keeps
+    // working). When `voice.engine = "v2"` we ALSO build the v2 pipeline
+    // alongside and store it as `ActivePipeline::Streaming`.
     let voice_pipeline = build_voice_pipeline(&config, &paths);
+    let (active_voice_init, voice_v2_telemetry_init) =
+        if config.voice.engine.eq_ignore_ascii_case("v2") {
+            match build_v2_pipeline(&config, &paths, hardware_info.tier) {
+                Ok((v2, _state_rx, telemetry_rx)) => {
+                    tracing::info!(engine = "v2", "voice v2 pipeline constructed");
+                    (
+                        kria_core::voice::v2::ActivePipeline::Streaming(v2),
+                        Some(telemetry_rx),
+                    )
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "v2 pipeline build failed; falling back to v1");
+                    (
+                        kria_core::voice::v2::ActivePipeline::Legacy(voice_pipeline.clone()),
+                        None,
+                    )
+                }
+            }
+        } else {
+            (
+                kria_core::voice::v2::ActivePipeline::Legacy(voice_pipeline.clone()),
+                None,
+            )
+        };
 
     // Health registry — register all subsystems
     health.register("memory_store");
@@ -2234,6 +2778,7 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
                 embeddings.clone(),
                 vectors.clone(),
                 hardware_info.tier.as_str().to_string(),
+                orch_cell.clone(),
             );
             *telegram_bridge.write().await = Some(bridge);
         }
@@ -2250,6 +2795,7 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
         embeddings: embeddings.clone(),
         vectors: vectors.clone(),
         hw_tier: hardware_info.tier.as_str().to_string(),
+        orchestrator: orch_cell.clone(),
     });
 
     let voice_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2302,6 +2848,8 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
         current_session_id: Arc::new(RwLock::new(uuid::Uuid::new_v4().to_string())),
         voice_active: voice_active.clone(),
         voice_pipeline: Arc::new(RwLock::new(voice_pipeline)),
+        active_voice: Arc::new(RwLock::new(active_voice_init)),
+        voice_v2_telemetry: Arc::new(tokio::sync::Mutex::new(voice_v2_telemetry_init)),
         health: health.clone(),
         scheduler: scheduler_arc,
         macro_recorder: macro_recorder_arc,
@@ -2316,6 +2864,7 @@ pub async fn init_runtime(handle: &AppHandle) -> anyhow::Result<()> {
         orchestrator: orch_cell.clone(),
         orchestrator_active_turns: orchestrator_active_turns.clone(),
         orchestrator_last_activity_at: orchestrator_last_activity_at.clone(),
+        image_orchestrator,
     };
 
     if handle.state::<AppStateCell>().set(state).is_err() {
@@ -3540,6 +4089,22 @@ pub async fn get_session_history(
     Ok(messages)
 }
 
+fn normalize_session_title(raw: &str) -> Option<String> {
+    const SESSION_TITLE_MAX_CHARS: usize = 72;
+
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = collapsed.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut title: String = trimmed.chars().take(SESSION_TITLE_MAX_CHARS).collect();
+    if trimmed.chars().count() > SESSION_TITLE_MAX_CHARS {
+        title.push('…');
+    }
+    Some(title)
+}
+
 #[tauri::command]
 pub async fn create_session(
     title: Option<String>,
@@ -3551,11 +4116,24 @@ pub async fn create_session(
     let new_id = uuid::Uuid::new_v4().to_string();
     *state.current_session_id.write().await = new_id.clone();
 
-    // Store a metadata preference for session title
-    if let Some(t) = title {
-        let key = format!("session_title:{}", new_id);
-        let _ = state.memory_store.set_preference(&key, &t);
-    }
+    // Store metadata preferences so empty sessions are still visible in the UI.
+    let provided_title = title
+        .as_deref()
+        .and_then(normalize_session_title);
+    let resolved_title = provided_title
+        .clone()
+        .unwrap_or_else(|| "New chat".to_string());
+    let _ = state
+        .memory_store
+        .set_preference(&format!("session_title:{}", new_id), &resolved_title);
+    let _ = state.memory_store.set_preference(
+        &format!("session_title_manual:{}", new_id),
+        if provided_title.is_some() { "1" } else { "0" },
+    );
+    let _ = state.memory_store.set_preference(
+        &format!("session_created_at:{}", new_id),
+        &Utc::now().to_rfc3339(),
+    );
 
     tracing::info!(session_id = %new_id, "new session created");
     Ok(serde_json::json!({
@@ -3575,7 +4153,7 @@ pub async fn list_sessions(
         .list_sessions()
         .map_err(|e| e.to_string())?;
     let current = state.current_session_id.read().await.clone();
-    let result: Vec<serde_json::Value> = sessions
+    let mut result: Vec<serde_json::Value> = sessions
         .into_iter()
         .map(|(id, count, last_active)| {
             let title = state
@@ -3586,12 +4164,43 @@ pub async fn list_sessions(
             serde_json::json!({
                 "id": id,
                 "title": title,
+                "turn_count": count,
                 "message_count": count,
                 "last_active": last_active,
                 "is_current": id == current,
             })
         })
         .collect();
+
+    // Include the current session even when it has no turns yet.
+    if !current.trim().is_empty()
+        && !result
+            .iter()
+            .any(|row| row.get("id").and_then(|v| v.as_str()) == Some(current.as_str()))
+    {
+        let title = state
+            .memory_store
+            .get_preference(&format!("session_title:{}", current))
+            .unwrap_or(None)
+            .unwrap_or_else(|| "New chat".to_string());
+        let created_at = state
+            .memory_store
+            .get_preference(&format!("session_created_at:{}", current))
+            .unwrap_or(None)
+            .unwrap_or_else(|| Utc::now().to_rfc3339());
+        result.insert(
+            0,
+            serde_json::json!({
+                "id": current,
+                "title": title,
+                "turn_count": 0,
+                "message_count": 0,
+                "last_active": created_at,
+                "is_current": true,
+            }),
+        );
+    }
+
     Ok(result)
 }
 
@@ -3631,20 +4240,46 @@ pub async fn switch_session(
 pub async fn delete_session(
     session_id: String,
     state: State<'_, AppStateCell>,
-) -> Result<(), String> {
+) -> Result<serde_json::Value, String> {
     let state = state
         .get()
         .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    let session_id = session_id.trim().to_string();
+    if session_id.is_empty() {
+        return Err("Session id cannot be empty".into());
+    }
+
     let current = state.current_session_id.read().await.clone();
     state
         .memory_store
         .delete_session(&session_id)
         .map_err(|e| e.to_string())?;
+
+    let mut replacement_session_id: Option<String> = None;
+
     // If we deleted the current session, create a new one
     if session_id == current {
-        *state.current_session_id.write().await = uuid::Uuid::new_v4().to_string();
+        let new_id = uuid::Uuid::new_v4().to_string();
+        *state.current_session_id.write().await = new_id.clone();
+
+        let _ = state
+            .memory_store
+            .set_preference(&format!("session_title:{}", new_id), "New chat");
+        let _ = state
+            .memory_store
+            .set_preference(&format!("session_title_manual:{}", new_id), "0");
+        let _ = state.memory_store.set_preference(
+            &format!("session_created_at:{}", new_id),
+            &Utc::now().to_rfc3339(),
+        );
+
+        replacement_session_id = Some(new_id);
     }
-    Ok(())
+
+    Ok(serde_json::json!({
+        "deleted_session_id": session_id,
+        "replacement_session_id": replacement_session_id,
+    }))
 }
 
 #[tauri::command]
@@ -3656,12 +4291,84 @@ pub async fn rename_session(
     let state = state
         .get()
         .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    let session_id = session_id.trim().to_string();
+    if session_id.is_empty() {
+        return Err("Session id cannot be empty".into());
+    }
+
+    let resolved_title = normalize_session_title(&title)
+        .ok_or_else(|| "Session title cannot be empty".to_string())?;
+
     let key = format!("session_title:{}", session_id);
     state
         .memory_store
-        .set_preference(&key, &title)
+        .set_preference(&key, &resolved_title)
+        .map_err(|e| e.to_string())?;
+    state
+        .memory_store
+        .set_preference(&format!("session_title_manual:{}", session_id), "1")
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[tauri::command]
+pub async fn auto_rename_session(
+    session_id: String,
+    title: String,
+    state: State<'_, AppStateCell>,
+) -> Result<serde_json::Value, String> {
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    let session_id = session_id.trim().to_string();
+    if session_id.is_empty() {
+        return Err("Session id cannot be empty".into());
+    }
+
+    let resolved_title = match normalize_session_title(&title) {
+        Some(t) => t,
+        None => {
+            return Ok(serde_json::json!({
+                "updated": false,
+                "reason": "empty_title",
+            }))
+        }
+    };
+
+    let manual_key = format!("session_title_manual:{}", session_id);
+    let manual_flag = state
+        .memory_store
+        .get_preference(&manual_key)
+        .map_err(|e| e.to_string())?
+        .unwrap_or_else(|| "0".to_string());
+
+    if manual_flag == "1" {
+        let existing_title = state
+            .memory_store
+            .get_preference(&format!("session_title:{}", session_id))
+            .map_err(|e| e.to_string())?
+            .unwrap_or_else(|| "New chat".to_string());
+
+        return Ok(serde_json::json!({
+            "updated": false,
+            "reason": "manual_title",
+            "title": existing_title,
+        }));
+    }
+
+    state
+        .memory_store
+        .set_preference(&format!("session_title:{}", session_id), &resolved_title)
+        .map_err(|e| e.to_string())?;
+    state
+        .memory_store
+        .set_preference(&manual_key, "0")
+        .map_err(|e| e.to_string())?;
+
+    Ok(serde_json::json!({
+        "updated": true,
+        "title": resolved_title,
+    }))
 }
 
 #[tauri::command]
@@ -3997,6 +4704,148 @@ pub async fn open_html_for_print(
     Ok(())
 }
 
+/// Read a local image file and return it as a base64 data URL.
+/// Used by the frontend to display generated/uploaded images stored on disk.
+#[tauri::command]
+pub async fn read_local_image(path: String, state: State<'_, AppStateCell>) -> Result<String, String> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use std::path::PathBuf;
+
+    // Path safety: allow reads only under ~/.kria and configured image output roots.
+    let canonical = std::fs::canonicalize(&path).map_err(|e| format!("Cannot resolve path: {e}"))?;
+    let home = dirs::home_dir().unwrap_or_default();
+
+    let mut allowed_roots: Vec<PathBuf> = vec![home.join(".kria")];
+
+    if let Some(app_state) = state.get() {
+        let config = app_state.config.read().await;
+        if let Ok(paths) = config.resolve_paths() {
+            let configured = if config.image_generation.output_dir.trim().is_empty() {
+                paths.data_dir.join("cache/images")
+            } else {
+                let p = PathBuf::from(config.image_generation.output_dir.trim());
+                if p.is_absolute() {
+                    p
+                } else {
+                    paths.data_dir.join(p)
+                }
+            };
+            allowed_roots.push(configured);
+            allowed_roots.push(paths.data_dir.join("uploads"));
+            allowed_roots.push(paths.data_dir.join("attachments"));
+        }
+    }
+
+    let allowed = allowed_roots.into_iter().any(|root| {
+        let normalized = if root.exists() {
+            std::fs::canonicalize(&root).unwrap_or(root)
+        } else {
+            root
+        };
+        canonical.starts_with(normalized)
+    });
+
+    if !allowed {
+        return Err("Access denied: image path is outside configured KRIA storage roots".into());
+    }
+
+    let bytes = tokio::fs::read(&canonical).await.map_err(|e| format!("Read failed: {e}"))?;
+
+    let ext = canonical
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("jpg")
+        .to_lowercase();
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => "image/jpeg",
+    };
+
+    let encoded = STANDARD.encode(&bytes);
+    Ok(format!("data:{};base64,{}", mime, encoded))
+}
+
+/// Save an uploaded image to ~/.kria/uploads/user/ and return the saved path.
+#[tauri::command]
+pub async fn save_uploaded_image(
+    data: Vec<u8>,
+    mime_type: String,
+    session_id: String,
+    state: State<'_, AppStateCell>,
+) -> Result<serde_json::Value, String> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    let home = dirs::home_dir().ok_or("Cannot find home directory")?;
+    let now = chrono::Utc::now();
+    let month_dir = home.join(".kria").join("uploads").join("user")
+        .join(now.format("%Y-%m").to_string());
+    tokio::fs::create_dir_all(&month_dir).await.map_err(|e| e.to_string())?;
+
+    let ext = match mime_type.as_str() {
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => "jpg",
+    };
+    let ts = now.timestamp_millis();
+    let filename = format!("user_{}.{}", ts, ext);
+    let path = month_dir.join(&filename);
+
+    tokio::fs::write(&path, &data).await.map_err(|e| e.to_string())?;
+
+    let sha = {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(&data);
+        format!("{:x}", hasher.finalize())
+    };
+
+    // Store in SQLite chat_media table
+    if let Some(s) = state.get() {
+        let path_str = path.to_string_lossy().to_string();
+        let _ = s.memory_store.store_chat_media(&kria_core::memory::store::ChatMediaRecord {
+            session_id: session_id.clone(),
+            media_type: "uploaded".into(),
+            file_path: path_str.clone(),
+            sha256: Some(sha.clone()),
+            prompt: None,
+            width: None,
+            height: None,
+            style: None,
+            provenance: Some("user_upload".into()),
+        });
+
+        // Return base64 data URL so the frontend can display immediately
+        let encoded = STANDARD.encode(&data);
+        let data_url = format!("data:{};base64,{}", mime_type, encoded);
+        return Ok(serde_json::json!({
+            "path": path_str,
+            "sha256": sha,
+            "data_url": data_url,
+        }));
+    }
+
+    Ok(serde_json::json!({
+        "path": path.to_string_lossy().to_string(),
+        "sha256": sha,
+    }))
+}
+
+/// Return all chat media (images) for a session.
+#[tauri::command]
+pub async fn get_session_media(
+    session_id: String,
+    state: State<'_, AppStateCell>,
+) -> Result<serde_json::Value, String> {
+    let state = state
+        .get()
+        .ok_or("KRIA is still initializing — please try again in a moment")?;
+    let records = state.memory_store.get_session_media(&session_id).map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "media": records }))
+}
+
 #[tauri::command]
 pub async fn list_models(state: State<'_, AppStateCell>) -> Result<serde_json::Value, String> {
     let state = state
@@ -4082,9 +4931,59 @@ pub async fn start_voice(state: State<'_, AppStateCell>, app: AppHandle) -> Resu
         *vp_guard = voice_pipeline.clone();
     }
 
+    // ── v2 hot-swap ───────────────────────────────────────────────────────
+    // If the (freshly reloaded) config requests v2 but active_voice is still
+    // Legacy (e.g. config changed from v1→v2 after init_runtime ran, or the
+    // v2 build failed at startup and the user fixed the prerequisites), try
+    // to build the v2 pipeline now and swap it in atomically.
+    if effective_config.voice.engine.eq_ignore_ascii_case("v2")
+        && !state.active_voice.read().await.is_streaming()
+    {
+        match effective_config
+            .resolve_paths()
+            .ok()
+            .and_then(|p| {
+                build_v2_pipeline(&effective_config, &p, state.hardware_info.tier).ok()
+            }) {
+            Some((v2_pipeline, _state_rx, telemetry_rx)) => {
+                tracing::info!("voice: hot-swapping active_voice → v2");
+                *state.active_voice.write().await =
+                    kria_core::voice::v2::ActivePipeline::Streaming(v2_pipeline);
+                *state.voice_v2_telemetry.lock().await = Some(telemetry_rx);
+            }
+            None => {
+                tracing::warn!(
+                    "voice: v2 hot-swap failed; continuing with v1 pipeline"
+                );
+            }
+        }
+    }
+
     state
         .voice_active
         .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    // ── v2 continuous mic-capture loop ────────────────────────────────────
+    // When the pipeline is the v2 streaming FSM, bypass the v1 event loop
+    // entirely and spin up a self-contained capture→run_turn loop. All v1
+    // validation above is still performed (binary/model checks) so the
+    // same config requirements apply.
+    if let Some(v2) = state.active_voice.read().await.streaming() {
+        start_voice_v2_loop(
+            v2,
+            state.voice_active.clone(),
+            state.voice_v2_telemetry.clone(),
+            state.model_router.clone(),
+            state.current_session_id.clone(),
+            state.config.clone(),
+            state.hardware_info.clone(),
+            state.memory_store.clone(),
+            state.tool_registry.clone(),
+            app.clone(),
+        )
+        .await;
+        return Ok(());
+    }
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<VoicePipelineEvent>();
 
@@ -4363,6 +5262,27 @@ pub async fn start_voice(state: State<'_, AppStateCell>, app: AppHandle) -> Resu
                                     tokens_used: None,
                                     timestamp: Utc::now(),
                                 });
+
+                                // Persist image metadata in chat_media table when generate_image succeeds
+                                if name == "generate_image" && success {
+                                    if let Some(imgs) = result.get("images").and_then(|v| v.as_array()) {
+                                        for img in imgs {
+                                            let file_path = img.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                            if file_path.is_empty() { continue; }
+                                            let _ = ms2.store_chat_media(&kria_core::memory::store::ChatMediaRecord {
+                                                session_id: sid2.clone(),
+                                                media_type: "generated".into(),
+                                                file_path,
+                                                sha256: img.get("sha256").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                                                prompt: result.get("prompt").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                                                width: img.get("width").and_then(|v| v.as_u64()).map(|v| v as u32),
+                                                height: img.get("height").and_then(|v| v.as_u64()).map(|v| v as u32),
+                                                style: img.get("style").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                                                provenance: img.get("provenance").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                                            });
+                                        }
+                                    }
+                                }
                             }
                             StreamEvent::ToolProgress { call_id, message, percent } => {
                                 let _ = app2.emit(
@@ -4501,6 +5421,10 @@ pub async fn stop_voice(state: State<'_, AppStateCell>, app: AppHandle) -> Resul
     state
         .voice_active
         .store(false, std::sync::atomic::Ordering::Relaxed);
+    // Abort any in-flight v2 turn immediately so barge-in / stop is instant.
+    if let Some(v2) = state.active_voice.read().await.streaming() {
+        v2.force_abort().await;
+    }
     let voice_pipeline = state.voice_pipeline.read().await.clone();
     voice_pipeline.stop().await;
     let _ = app.emit("voice:state", serde_json::json!({ "state": "idle" }));
@@ -4518,6 +5442,120 @@ pub async fn get_voice_status(state: State<'_, AppStateCell>) -> Result<serde_js
         "active": state.voice_active.load(std::sync::atomic::Ordering::Relaxed),
         "state": pipeline_state,
     }))
+}
+
+// ───────────────── voice v2 commands (additive) ──────────────────────────
+//
+// `voice_v2_speak` runs ONE end-to-end v2 turn from a text prompt:
+// LLM token stream → SentenceSplitter → CliPiperTts → PlaybackSink with
+// hard barge-in. Used by the UI when `voice.engine = "v2"` is set; the v1
+// `start_voice` flow is untouched. `voice_v2_abort` cancels the active
+// turn (also exposed for the "KRIA stop now" emergency phrase).
+
+#[tauri::command]
+pub async fn voice_v2_speak(
+    prompt: String,
+    state: State<'_, AppStateCell>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+
+    let v2 = {
+        let active = state.active_voice.read().await;
+        active.streaming().ok_or_else(|| {
+            "voice v2 is not active — set `voice.engine = \"v2\"` in config.toml".to_string()
+        })?
+    };
+
+    // Lazy-wire the AudioPlayer the first time we speak so the playback
+    // sink can open a real session via `begin_session`.
+    let player = {
+        let cfg = state.config.read().await;
+        let speaker = cfg.voice.speaker_device.clone();
+        let follow = cfg.voice.follow_system_default_speaker;
+        Arc::new(
+            kria_core::voice::AudioPlayer::new()
+                .with_output_device(Some(speaker))
+                .follow_system_default(follow),
+        )
+    };
+    v2.set_audio_player(player).await;
+
+    // Drain telemetry into UI events for the duration of this turn.
+    let telemetry_rx = state.voice_v2_telemetry.lock().await.take();
+    if let Some(mut rx) = telemetry_rx {
+        let app_handle = app.clone();
+        let slot = state.voice_v2_telemetry.clone();
+        tokio::spawn(async move {
+            while let Some(ev) = rx.recv().await {
+                let payload = serde_json::to_value(&ev).unwrap_or_default();
+                let _ = app_handle.emit("voice:v2_telemetry", payload);
+            }
+            // Receiver closed — put None back (channel can't be revived
+            // without rebuilding the pipeline).
+            *slot.lock().await = None;
+        });
+    }
+
+    // Build the LLM closure: takes the user prompt, streams tokens off the
+    // routed LlmBackend, returns an mpsc::Receiver<String>. The closure
+    // owns the stream so cancellation simply drops it.
+    let router = state.model_router.clone();
+    let llm = move |prompt: String| async move {
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
+        let backend = match router.route(&prompt).await {
+            Some(b) => b,
+            None => {
+                let _ = tx
+                    .send("(no LLM backend available — check `voice.engine` / model config)".into())
+                    .await;
+                return rx;
+            }
+        };
+        tokio::spawn(async move {
+            let messages = vec![ChatMessage {
+                role: "user".into(),
+                content: prompt,
+                name: None,
+                images: None,
+            }];
+            match backend.chat_stream(&messages, None, 0.7, 512).await {
+                Ok(mut stream) => {
+                    use futures::StreamExt;
+                    while let Some(tok) = stream.next().await {
+                        if tx.send(tok).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(format!("(LLM error: {e})")).await;
+                }
+            }
+        });
+        rx
+    };
+
+    // Drive the turn. Errors surface back to the UI.
+    v2.clone()
+        .run_speak_turn(prompt, llm)
+        .await
+        .map_err(|e| e.to_string())?;
+    let _ = app.emit("voice:state", serde_json::json!({ "state": "idle" }));
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn voice_v2_abort(state: State<'_, AppStateCell>) -> Result<(), String> {
+    let state = state
+        .get()
+        .ok_or_else(|| "KRIA is still initializing — please try again in a moment".to_string())?;
+    if let Some(v2) = state.active_voice.read().await.streaming() {
+        v2.force_abort().await;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -5756,6 +6794,7 @@ pub async fn start_telegram_mcp(
         state.embeddings.clone(),
         state.vectors.clone(),
         hw_tier,
+        state.orchestrator.clone(),
     );
 
     *state.telegram_bridge.write().await = Some(bridge);
@@ -7627,4 +8666,83 @@ pub async fn get_hardware_profile() -> Result<serde_json::Value, String> {
     // Otherwise, run detection
     let profile = kria_core::infra::hardware_profiler::profile_hardware();
     serde_json::to_value(&profile).map_err(|e| e.to_string())
+}
+
+/// Inspect the v2 voice stack: which engines are compiled in (cargo features)
+/// and what the resolved [`VoiceTierProfile`] would look like for the current
+/// config + detected hardware. Used during the v2 rollout to verify that
+/// builds + downloads + tier resolution are all consistent before flipping
+/// `voice.engine` to `"v2"` in production.
+#[tauri::command]
+pub async fn voice_v2_status() -> Result<serde_json::Value, String> {
+    use kria_core::voice::tier::VoiceTierProfile;
+    use kria_core::voice::v2::wake::{WakeWordDetector, WakeWordModels};
+    use kria_core::voice::v2::CompiledFeatures;
+
+    let config = KriaConfig::load(None).map_err(|e| e.to_string())?;
+    let paths = config.resolve_paths().map_err(|e| e.to_string())?;
+    let hw = kria_core::platform::detect::detect_hardware();
+    let profile = VoiceTierProfile::build(&config.voice, hw.tier);
+    let features = CompiledFeatures::current();
+
+    // Resolve the wake-word model path against KriaPaths. Treat the config
+    // value as either an absolute path or a name relative to
+    // `<models>/wake/`. Probe both paths so the UI can tell the user which
+    // file is missing without installing one.
+    let wake_cfg = &config.voice.wake_word;
+    let wake_dir = paths.models_dir.join("wake");
+    let wake_keyword_path = if wake_cfg.model_path.is_empty() {
+        wake_dir.join("hey_ria.onnx")
+    } else {
+        let p = std::path::PathBuf::from(&wake_cfg.model_path);
+        if p.is_absolute() {
+            p
+        } else if p.components().count() > 1 {
+            paths.models_dir.join(p.strip_prefix("models").unwrap_or(&p))
+        } else {
+            wake_dir.join(p)
+        }
+    };
+    let wake_models = WakeWordModels::from_keyword_path(wake_keyword_path.clone());
+
+    // Try to load the detector; falls back to disabled when the feature is
+    // off or model files are missing. Either outcome surfaces in the JSON.
+    let wake_detector = if wake_cfg.enabled {
+        WakeWordDetector::try_load(
+            wake_keyword_path.clone(),
+            wake_cfg.sensitivity,
+            "hey ria",
+            wake_cfg.aliases.clone(),
+        )
+    } else {
+        WakeWordDetector::disabled()
+    };
+
+    Ok(serde_json::json!({
+        "engine_setting": config.voice.engine,
+        "tier": profile.tier.as_str(),
+        "ttfa_budget_ms": profile.ttfa_budget_ms,
+        "post_edit_timeout_ms": profile.post_edit_timeout_ms,
+        "stt_engine": profile.stt_engine,
+        "stt_model": profile.stt_model,
+        "tts_engine": profile.tts_engine,
+        "aec_aggressiveness": profile.aec_aggressiveness,
+        "post_edit_always": profile.post_edit_always,
+        "hardware_tier": hw.tier.as_str(),
+        "compiled_features": features,
+        "any_native_backend": features.any_native(),
+        "wake_word": {
+            "enabled_in_config": wake_cfg.enabled,
+            "feature_compiled": features.voice_wake_oww,
+            "active": wake_detector.is_active(),
+            "sensitivity": wake_cfg.sensitivity,
+            "aliases": wake_cfg.aliases,
+            "models_dir": wake_dir.display().to_string(),
+            "keyword_path": wake_models.keyword.display().to_string(),
+            "embedding_path": wake_models.embedding.display().to_string(),
+            "melspectrogram_path": wake_models.melspectrogram.display().to_string(),
+            "all_models_present": wake_models.all_present(),
+        },
+        "note": "v2 runtime loop pending; engine='v2' currently falls back to v1.",
+    }))
 }

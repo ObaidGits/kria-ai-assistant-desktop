@@ -61,6 +61,11 @@ pub struct VoicePipeline {
     stop_tx: Arc<Mutex<Option<mpsc::Sender<()>>>>,
     /// Whether capture is active (set/cleared on start/stop).
     capture_active: Arc<AtomicBool>,
+    /// Echo prevention gate: when `true`, the capture thread discards audio
+    /// chunks instead of forwarding them to the VAD/STT loop. Set while KRIA
+    /// is speaking (TTS playback) so the microphone does not pick up the
+    /// speaker output and transcribe it as user speech.
+    mic_muted: Arc<AtomicBool>,
     /// Optional path to Silero VAD ONNX model.
     vad_model_path: Option<std::path::PathBuf>,
 }
@@ -90,6 +95,7 @@ impl VoicePipeline {
             state_rx,
             stop_tx: Arc::new(Mutex::new(None)),
             capture_active: Arc::new(AtomicBool::new(false)),
+            mic_muted: Arc::new(AtomicBool::new(false)),
             vad_model_path: None,
         }
     }
@@ -141,6 +147,7 @@ impl VoicePipeline {
         // The audio chunks are sent via an mpsc channel to the async VAD→STT task.
         let (chunk_tx, chunk_rx) = mpsc::unbounded_channel();
         let capture_active = self.capture_active.clone();
+        let mic_muted = self.mic_muted.clone();
         self.capture_active.store(true, Ordering::Relaxed);
         std::thread::spawn(move || {
             while capture_active.load(Ordering::Relaxed) {
@@ -176,6 +183,11 @@ impl VoicePipeline {
 
                     match audio_rx.try_recv() {
                         Ok(chunk) => {
+                            // Echo gate: discard chunks while KRIA is speaking so the
+                            // mic does not pick up TTS speaker output and transcribe it.
+                            if mic_muted.load(Ordering::Relaxed) {
+                                continue;
+                            }
                             if chunk_tx.send(chunk).is_err() {
                                 return;
                             }
@@ -210,12 +222,19 @@ impl VoicePipeline {
         let energy_threshold = self.config.energy_threshold;
         let vad_model_path = self.vad_model_path.clone();
         let partial_update_ms = self.config.partial_update_ms;
+        let enable_partials = self.config.enable_partial_transcripts;
+        let vad_silence_ms = self.config.vad_silence_ms;
 
         // Spawn the VAD→STT processing loop (async, receives chunks from capture thread)
         tokio::spawn(async move {
+            // Audio chunks are ~100 ms each (see AudioCapture). Use the configured
+            // silence timeout so the pipeline responds as quickly as the user expects.
+            const CHUNK_MS: u64 = 100;
             let mut vad = match vad_model_path {
-                Some(ref path) => VoiceActivityDetector::with_silero(energy_threshold, path),
-                None => VoiceActivityDetector::new(energy_threshold),
+                Some(ref path) => VoiceActivityDetector::with_silero(energy_threshold, path)
+                    .with_silence_ms(vad_silence_ms, CHUNK_MS),
+                None => VoiceActivityDetector::new(energy_threshold)
+                    .with_silence_ms(vad_silence_ms, CHUNK_MS),
             };
             let mut speech_buffer: Vec<f32> = Vec::new();
             let mut chunk_rx = chunk_rx;
@@ -290,8 +309,12 @@ impl VoicePipeline {
                                 speech_buffer.extend_from_slice(&chunk.samples);
                                 samples_since_partial += chunk.samples.len();
 
-                                // Emit partial transcription periodically for live feedback
-                                if samples_since_partial >= partial_interval
+                                // Emit partial transcription periodically for live feedback.
+                                // Disabled by default for v1 CLI backend — each partial
+                                // spawns a fresh whisper-cpp subprocess that cold-loads
+                                // the model and starves the final transcription.
+                                if enable_partials
+                                    && samples_since_partial >= partial_interval
                                     && speech_buffer.len() >= (sample_rate as usize * 3 / 10)
                                 {
                                     samples_since_partial = 0;
@@ -410,10 +433,20 @@ impl VoicePipeline {
         if text.is_empty() {
             return Ok(());
         }
+        // Mute the microphone immediately so the mic does not pick up the
+        // TTS speaker output and transcribe it as user speech (echo).
+        self.mic_muted.store(true, Ordering::Relaxed);
         self.set_state(VoicePipelineState::Speaking).await;
         let samples = self.tts.synthesize_samples(text).await?;
         let sr = self.tts.sample_rate();
         self.player.play_samples(samples, sr).await?;
+        // Unmute with a 300 ms delay so residual echo in the room and audio
+        // driver buffers can decay before we start listening again.
+        let muted = self.mic_muted.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            muted.store(false, Ordering::Relaxed);
+        });
         // Return to listening if capture is still active, otherwise idle
         if self.capture_active.load(Ordering::Relaxed) {
             self.set_state(VoicePipelineState::Listening).await;
@@ -451,7 +484,7 @@ async fn process_speech(
     ));
 
     match tokio::time::timeout(
-        Duration::from_secs(20),
+        Duration::from_secs(60),
         stt.transcribe_samples(samples, sample_rate),
     )
     .await

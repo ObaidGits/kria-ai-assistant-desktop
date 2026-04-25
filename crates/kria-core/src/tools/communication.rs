@@ -20,15 +20,36 @@ impl ToolHandler for SendNotification {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
         let title = params["title"].as_str().unwrap_or("K.R.I.A.");
         let body = params["body"].as_str().unwrap_or("");
-        match notify_rust::Notification::new()
+        // Resolve D-Bus session address (notify-send needs this from a background server process)
+        let dbus_addr = std::env::var("DBUS_SESSION_BUS_ADDRESS")
+            .or_else(|_| std::env::var("XDG_RUNTIME_DIR").map(|d| format!("unix:path={}/bus", d)))
+            .unwrap_or_else(|_| "unix:path=/run/user/1000/bus".to_string());
+        let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":1".to_string());
+        // Primary: notify-send CLI — always shows popup banner on GNOME 44+ when D-Bus env is set
+        let cli_ok = tokio::process::Command::new("notify-send")
+            .env("DBUS_SESSION_BUS_ADDRESS", &dbus_addr)
+            .env("DISPLAY", &display)
+            .args(["-a", "KRIA", "-u", "normal", "-t", "8000",
+                   "--icon=dialog-information", title, body])
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if cli_ok {
+            return ToolResult::ok(serde_json::json!({ "sent": true, "title": title, "method": "notify-send" }));
+        }
+        // Fallback: notify_rust (may go to notification bell on GNOME 44+ instead of popup)
+        let rust_result = notify_rust::Notification::new()
             .summary(title)
             .body(body)
             .appname("KRIA")
-            .show()
-        {
-            Ok(_) => ToolResult::ok(serde_json::json!({ "sent": true, "title": title })),
-            Err(e) => ToolResult::err(format!("notification failed: {e}")),
+            .timeout(notify_rust::Timeout::Milliseconds(8000))
+            .urgency(notify_rust::Urgency::Normal)
+            .show();
+        if rust_result.is_ok() {
+            return ToolResult::ok(serde_json::json!({ "sent": true, "title": title, "method": "notify_rust" }));
         }
+        ToolResult::err("notification failed: notify-send CLI and notify_rust both failed")
     }
 }
 
@@ -60,21 +81,57 @@ struct ScheduleReminder;
 impl ToolHandler for ScheduleReminder {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
         let message = params["message"].as_str().unwrap_or("");
-        let delay_minutes = params["delay_minutes"].as_u64().unwrap_or(5);
-        // Schedule a notification after delay (using tokio::spawn)
+        let delay_secs = params["delay_minutes"].as_f64().unwrap_or(5.0) * 60.0;
+        let delay_secs = delay_secs as u64;
         let msg = message.to_string();
+        // Capture D-Bus env NOW (before spawn) so the spawned task can use it
+        let dbus_addr = std::env::var("DBUS_SESSION_BUS_ADDRESS")
+            .or_else(|_| std::env::var("XDG_RUNTIME_DIR").map(|d| format!("unix:path={}/bus", d)))
+            .unwrap_or_else(|_| "unix:path=/run/user/1000/bus".to_string());
+        let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":1".to_string());
+        // Play an immediate sound so user knows the reminder was accepted
+        let _ = tokio::process::Command::new("paplay")
+            .arg("/usr/share/sounds/freedesktop/stereo/complete.oga")
+            .spawn();
+        // Spawn persistent task that fires the reminder after the delay
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(delay_minutes * 60)).await;
-            let _ = notify_rust::Notification::new()
-                .summary("KRIA Reminder")
-                .body(&msg)
-                .appname("KRIA")
-                .show();
+            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+            // Primary: notify-send CLI with explicit D-Bus env and critical urgency
+            let cli_ok = tokio::process::Command::new("notify-send")
+                .env("DBUS_SESSION_BUS_ADDRESS", &dbus_addr)
+                .env("DISPLAY", &display)
+                .args(["-a", "KRIA", "-u", "critical", "-t", "0",
+                       "--icon=alarm", "\u{23f0} KRIA Reminder", &msg])
+                .status()
+                .await
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !cli_ok {
+                // Fallback: notify_rust with Critical urgency + Never timeout
+                let _ = notify_rust::Notification::new()
+                    .summary("\u{23f0} KRIA Reminder")
+                    .body(&msg)
+                    .appname("KRIA")
+                    .urgency(notify_rust::Urgency::Critical)
+                    .timeout(notify_rust::Timeout::Never)
+                    .show();
+            }
+            // Play alert sound when reminder fires
+            let _ = tokio::process::Command::new("paplay")
+                .arg("/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga")
+                .spawn();
         });
+        let display_mins = delay_secs / 60;
+        let display_secs = delay_secs % 60;
+        let time_str = if display_secs == 0 {
+            format!("{display_mins} minute{}", if display_mins == 1 { "" } else { "s" })
+        } else {
+            format!("{display_mins}m {display_secs}s")
+        };
         ToolResult::ok(serde_json::json!({
             "scheduled": true,
             "message": message,
-            "delay_minutes": delay_minutes,
+            "fires_in": time_str,
         }))
     }
 }

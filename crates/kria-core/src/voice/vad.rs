@@ -55,6 +55,30 @@ impl VoiceActivityDetector {
         }
     }
 
+    /// Override the end-of-speech silence timeout.
+    ///
+    /// `silence_ms` is the duration of continuous silence (in ms) after which
+    /// the VAD fires `SpeechEnd`. `chunk_ms` is the duration of each audio
+    /// chunk (default 100 ms).
+    ///
+    /// Call this after `new()` or `with_silero()` to apply the config value:
+    /// ```
+    /// vad = VoiceActivityDetector::new(0.02).with_silence_ms(500, 100);
+    /// ```
+    pub fn with_silence_ms(mut self, silence_ms: u64, chunk_ms: u64) -> Self {
+        let chunk_ms = chunk_ms.max(1);
+        // Round up to ensure we always wait at least `silence_ms`.
+        let chunks = ((silence_ms + chunk_ms - 1) / chunk_ms).max(2) as usize;
+        self.silence_timeout_chunks = chunks;
+        tracing::debug!(
+            silence_ms,
+            chunk_ms,
+            silence_timeout_chunks = chunks,
+            "VAD silence timeout updated"
+        );
+        self
+    }
+
     /// Create a VAD with Silero ONNX model loaded from the given path.
     /// Falls back to energy-based detection if the model cannot be loaded.
     pub fn with_silero(energy_threshold: f32, model_path: &PathBuf) -> Self {

@@ -76,6 +76,13 @@ pub struct HardwareInfo {
     pub gpu_name: Option<String>,
     pub package_manager: Option<PackageManager>,
     pub hostname: String,
+    /// Best-effort free VRAM at detection time (MiB). `0` on CPU-only hosts.
+    #[serde(default)]
+    pub vram_free_mb: u64,
+    /// Image-generation tier derived from `vram_free_mb` at detection time.
+    /// Can be overridden at runtime via `KRIA_IMG_TIER` env or config.
+    #[serde(default)]
+    pub image_tier: super::vram::ImageTier,
 }
 
 impl HardwareTier {
@@ -336,5 +343,7 @@ pub fn detect_hardware() -> HardwareInfo {
         gpu_name,
         package_manager: get_package_manager(),
         hostname,
+        vram_free_mb: 0,  // populated lazily via VramProfiler on demand
+        image_tier: super::vram::ImageTier::default(),  // populated lazily
     }
 }

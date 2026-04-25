@@ -248,6 +248,8 @@ mod tests {
                 cpu_cores: 8,
                 total_ram_mb: 16384,
                 vram_mb: None,
+                vram_free_mb: 0,
+                image_tier: crate::platform::vram::ImageTier::CRejectOrCloud,
                 gpu_name: None,
                 package_manager: None,
                 hostname: "test".into(),

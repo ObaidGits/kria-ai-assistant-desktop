@@ -42,18 +42,94 @@ static CONVERSATION_RE: Lazy<Vec<Regex>> = Lazy::new(|| {
 // ─── Direct tool patterns (trigger specific tools) ───
 static DIRECT_TOOL_RE: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
     let mappings: Vec<(&str, &str)> = vec![
+        // System stats / health (multi-metric — maps to check_system_health as entry point)
+        (
+            r"(?i)\b(system\s+stat(s|us)|my\s+system\s+stat|mera\s+system|system\s+vitals?)\b",
+            "check_system_health",
+        ),
+        (
+            r"(?i)\b(system\s+health|health\s+check)\b",
+            "check_system_health",
+        ),
+        // Alerts
+        (
+            r"(?i)\b(show|list|get|check|current|active)\b.{0,30}\balerts?\b",
+            "get_alerts",
+        ),
+        (
+            r"(?i)\balerts?\b.{0,20}\b(show|list|active|current)\b",
+            "get_alerts",
+        ),
+        (
+            r"(?i)\bdismiss\b.{0,20}\balert\b",
+            "dismiss_alert",
+        ),
+        // Power plan
+        (
+            r"(?i)\bset\b.{0,20}\bpower\s+plan\b",
+            "set_power_plan",
+        ),
+        (
+            r"(?i)\bpower\s+plan\b.{0,20}\b(set|change|switch|to)\b",
+            "set_power_plan",
+        ),
+        (
+            r"(?i)\b(current|get|what|show).{0,20}\bpower\s+plan\b",
+            "get_power_plan",
+        ),
+        (
+            r"(?i)\bpower\s+plan\b",
+            "get_power_plan",
+        ),
+        // WiFi networks list
+        (
+            r"(?i)\b(list|show|available|nearby|scan)\b.{0,20}\b(wifi|wi-fi|wireless)\s*(networks?|ssid|connections?)\b",
+            "get_wifi_networks",
+        ),
+        // Active window / window management
+        (
+            r"(?i)\b(active|current|focused)\b.{0,15}\bwindow\b|\bwindow.{0,15}\b(active|current|focused)\b",
+            "get_active_window",
+        ),
+        (
+            r"(?i)\b(list|show|all)\b.{0,15}\b(open\s+windows?|windows?)\b",
+            "list_windows",
+        ),
+        // Active network connections
+        (
+            r"(?i)\b(active|open|current)\b.{0,20}\b(network\s+connections?|connections?|sockets?)\b",
+            "get_active_connections",
+        ),
+        // Service management
+        (
+            r"(?i)\b(start|stop|restart|status|check)\b.{0,20}\b(service|daemon|systemd)\b",
+            "manage_service",
+        ),
+        // Scheduled tasks
+        (
+            r"(?i)\b(list|show|my)\b.{0,20}\b(scheduled\s+tasks?|cron\s+jobs?|timers?)\b",
+            "list_scheduled_tasks",
+        ),
         // System info
         (
-            r"(?i)\b(cpu|processor)\s*(usage|load|info)\b",
+            r"(?i)\b(cpu|processor)\s*(usage|load|info|stats?|stat)\b",
             "get_cpu_usage",
         ),
         (
-            r"(?i)\b(ram|memory)\s*(usage|info|status)\b",
+            r"(?i)\bmy\s+cpu\b|\bcpu\s+ka\s+(use|usage|haal)\b",
+            "get_cpu_usage",
+        ),
+        (
+            r"(?i)\b(ram|memory)\s*(usage|info|status|stats?|stat)\b",
             "get_memory_info",
         ),
         (
             r"(?i)\b(disk|storage)\s*(space|usage|info)\b",
             "get_disk_space",
+        ),
+        (
+            r"(?i)\bcheck\s+(my\s+)?battery\b|\bbattery\s+(check|level|percent|info|status|kya|hai)\b",
+            "get_battery_status",
         ),
         (
             r"(?i)\b(battery)\s*(status|level|info)\b",
@@ -88,7 +164,14 @@ static DIRECT_TOOL_RE: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
             r"(?i)\b(play|search)\b.{0,40}\b(on|in|via)\s+(youtube|yt)\b",
             "browser_search",
         ),
+        // Embeddings (sidecar) — MUST come before send_message so "make text embeddings"
+        // is not misclassified as "text <recipient>".
+        (
+            r"(?i)\b(generate|create|make|compute|get)\s+(text\s+)?embeddings?\b|\bembedding\s+for\b",
+            "embeddings_generate",
+        ),
         // send_message: "text/message/WhatsApp/signal Anjali", "send a WhatsApp to X"
+        // Excludes "text embeddings" / "text message" via the embeddings rule above.
         (
             r"(?i)\b(text|message|msg)\s+\w+\b",
             "send_message",
@@ -168,6 +251,11 @@ static DIRECT_TOOL_RE: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
             r"(?i)\b(file|folder|directory)\b.*\b(named|called|name)\b",
             "search_files",
         ),
+        // "search for foo.txt" / "find bar.pdf" — filename with extension implies file search
+        (
+            r#"(?i)\b(search|find|locate|look\s*for)\b\s+(for\s+)?["']?[\w\-./]+\.(txt|md|pdf|docx?|xlsx?|csv|json|ya?ml|toml|rs|py|js|ts|tsx|jsx|html|css|png|jpg|jpeg|gif|svg|mp3|mp4|wav|zip|tar|gz)["']?"#,
+            "search_files",
+        ),
         (r"(?i)\b(write|create|save)\s+(a\s+)?file\b", "write_file"),
         (r"(?i)\b(delete|remove|rm)\s+(the\s+)?file\b", "delete_file"),
         // Clipboard
@@ -185,13 +273,30 @@ static DIRECT_TOOL_RE: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
         ),
         (r"(?i)\block\s*(screen|computer)\b", "lock_screen"),
         (r"(?i)\b(sleep|suspend)\s*(mode|computer)?\b", "sleep"),
-        // System config
+        // System config — volume
         (
             r"(?i)\b(volume|sound)\s*(set|to|at)\s*(\d+)\b",
             "set_volume",
         ),
         (
+            r"(?i)\b(set|change|put|increase|decrease|raise|lower|turn\s+up|turn\s+down)\b.{0,20}\b(volume|sound|speaker)\b",
+            "set_volume",
+        ),
+        (
+            r"(?i)\b(volume|sound|speaker|awaaz)\s+(ko|set|badhao|ghataao|ghatao|badha|ghata|barhao|badhaao)\b|\b(volume|sound|speaker|awaaz)\s+\d+",
+            "set_volume",
+        ),
+        // System config — brightness
+        (
             r"(?i)\b(brightness)\s*(set|to|at)\s*(\d+)\b",
+            "set_brightness",
+        ),
+        (
+            r"(?i)\b(set|change|increase|decrease|raise|lower|turn\s+up|turn\s+down)\b.{0,20}\bbrightness\b",
+            "set_brightness",
+        ),
+        (
+            r"(?i)\bbrightness\s+(ko|set|badhao|ghataao|ghatao|badha|ghata|barhao|badhaao)\b|\bbrightness\s+\d+",
             "set_brightness",
         ),
         (
@@ -325,14 +430,34 @@ static DIRECT_TOOL_RE: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
         (r"(?i)\b(download)\s+", "download_file"),
         (r"(?i)\bspeed\s*test\b", "speed_test"),
         (r"(?i)\b(my|public)\s*ip\b", "get_public_ip"),
+        (r"(?i)\bdns\s+(lookup|resolve|query)\b", "dns_lookup"),
+        (r"(?i)\bcheck.{0,20}url\b|\burl.{0,20}(status|reachable|accessible)\b", "check_url_status"),
+        // Internet connectivity check (must come AFTER specific internet patterns)
+        (
+            r"(?i)\b(connected|connection).{0,20}\b(internet|online|network)\b",
+            "ping_host",
+        ),
+        (
+            r"(?i)\b(internet|online)\b.{0,20}\b(connected|working|up|available|check)\b",
+            "ping_host",
+        ),
+        (
+            r"(?i)\bare\s+you\s+connected\b|\bam\s+i\s+online\b|\binternet\s+check\b",
+            "ping_host",
+        ),
         // Knowledge
         (r"(?i)\bremember\s+(that|this)\b", "remember_fact"),
         (
             r"(?i)\b(recall|what\s+did\s+I|do\s+you\s+remember)\b",
             "recall_fact",
         ),
-        // Notifications
-        (r"(?i)\b(notify|notification|alert)\b", "send_notification"),
+        (r"(?i)\bsearch.{0,15}(my\s+)?(memory|knowledge)\b", "search_knowledge"),
+        (r"(?i)\blist.{0,20}(remember|snippets?|knowledge)\b", "list_remembered"),
+        // Notifications — keep general alert after dismiss_alert above
+        (
+            r"(?i)\b(notify|notification)\b|\bsend\s+(me\s+a\s+)?notification\b",
+            "send_notification",
+        ),
         (r"(?i)\b(remind|reminder)\s+me\b", "schedule_reminder"),
         (
             r"(?i)\b(email|compose|draft)\s*(an?\s+)?email\b",
@@ -347,9 +472,96 @@ static DIRECT_TOOL_RE: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
             r"(?i)\b(run|execute)\s+(this\s+)?python\b",
             "execute_python",
         ),
-        // Package
-        (r"(?i)\binstall\s+\w+\b", "install_application"),
-        (r"(?i)\buninstall\s+\w+\b", "uninstall_application"),
+        // Developer / git
+        (r"(?i)\bgit\s+(status|stat)\b", "git_status"),
+        (r"(?i)\bgit\s+(log|history|commits?)\b", "git_log"),
+        (r"(?i)\bgit\s+diff\b", "git_diff"),
+        (r"(?i)\bgit\s+(commit|save)\b", "git_commit"),
+        (r"(?i)\bgit\s+(branch|branches)\b", "git_branch_list"),
+        (r"(?i)\bgit\s+(stash)\b", "git_stash"),
+        (r"(?i)\bgit\s+(push)\b", "git_push"),
+        (r"(?i)\bgit\s+(checkout|switch)\b", "git_checkout"),
+        (r"(?i)\banalyze.{0,20}(project|codebase|repo)\b", "analyze_project"),
+        // File ops extras
+        (r"(?i)\bcount\s+(lines|loc)\b", "count_lines_of_code"),
+        (r"(?i)\bproject\s+(structure|tree|layout)\b", "get_project_structure"),
+        (r"(?i)\b(find|show).{0,20}(todo|fixme)\b", "find_todos"),
+        (r"(?i)\b(dir|folder)\s*(size|how\s+big)\b|\bhow\s+big.{0,20}(dir|folder|directory)\b", "calculate_dir_size"),
+        // Image generation — MUST come before vision "analyze image" rule to avoid shadowing.
+        // Covers: "generate/create/make/draw/paint/design an image/picture/photo/art of ..."
+        // Also handles: "draw me a robot", "make me an image"
+        (
+            r"(?i)\b(generate|create|make|draw|paint|design|render|produce)\s+(me\s+)?(a\s+|an\s+|one\s+)?\b(image|picture|photo|artwork|art|illustration|wallpaper|poster|banner|thumbnail)\b",
+            "generate_image",
+        ),
+        // Handle "generate/draw/paint/create an image/photo/art OF ..."
+        (
+            r"(?i)\b(generate|create|make|draw|paint|design|render|produce)\b.{0,30}\b(image|picture|photo|artwork|art|illustration|wallpaper|poster|banner|thumbnail)\b",
+            "generate_image",
+        ),
+        // Hinglish: "image banao", "photo bana", "tasveer banao"
+        (
+            r"(?i)\b(image|photo|tasveer|pic)\s*(banao?|bana|create|generate|draw)\b|\b(banao?|bana)\s*(ek\s+)?(image|photo|tasveer|pic)\b",
+            "generate_image",
+        ),
+        // Vision extras
+        (r"(?i)\b(ocr|extract\s+text).{0,20}image\b", "ocr_image"),
+        (r"(?i)\banalyze.{0,20}image\b|\bwhat.{0,20}\b(on\s+)?screen\b", "screenshot_analyze"),
+        // Article extraction (sidecar)
+        (
+            r"(?i)\bextract\s+(the\s+)?article\b",
+            "web_extract_article",
+        ),
+        // Embeddings (sidecar)
+        (
+            r"(?i)\b(generate|create|make|compute|get)\s+(text\s+)?embeddings?\b|\bembedding\s+for\b",
+            "embeddings_generate",
+        ),
+        // Accessibility settings
+        (
+            r"(?i)\b(get|show|list|view|check)\b.{0,10}\baccessibility\b|^accessibility\s+settings\b",
+            "get_accessibility_settings",
+        ),
+        // Languages list (must come BEFORE conversation 'what is/are' patterns via DIRECT_TOOL precedence)
+        (
+            r"(?i)\b(what|which)\s+languages?\s+(do\s+)?(you\s+)?(support|speak)\b|\blist\s+(supported\s+)?languages?\b",
+            "list_languages",
+        ),
+        // Installed packages / applications listing
+        (
+            r"(?i)\blist\s+(all\s+)?(installed\s+)?(applications?|apps?|packages?|programs?)\b",
+            "list_installed_packages",
+        ),
+        (
+            r"(?i)\b(installed|all)\s+(applications?|apps?|packages?|programs?)\b",
+            "list_installed_packages",
+        ),
+        // Package — use correct tool name
+        (r"(?i)\binstall\s+\w+\b", "install_package"),
+        (r"(?i)\buninstall\s+\w+\b", "uninstall_package"),
+        (r"(?i)\bremove\s+package\b|\bremove\s+\w+\s+package\b", "uninstall_package"),
+        // Hinglish patterns — fetch_webpage must come BEFORE generic Hinglish so URLs aren't lost
+        // Web — fetch_webpage (placed after all Google Workspace patterns so gdocs/gsheets take priority)
+        (
+            r"(?i)\b(fetch|scrape|get|read|load)\b.{0,40}https?://",
+            "fetch_webpage",
+        ),
+        (
+            r"(?i)\bfetch\s+the\s+content\s+of\b",
+            "fetch_webpage",
+        ),
+        (
+            r"(?i)\b(get|load|scrape|read)\s+the\s+(content|page|text|html)\b",
+            "fetch_webpage",
+        ),
+        // Hinglish patterns
+        (
+            r"(?i)\bvolume\s+(band|zero|mute|off)\s+karo\b|\bband\s+karo\b.{0,15}volume",
+            "set_volume",
+        ),
+        (r"(?i)\b(cpu|processor)\s+kitna\b|\bram\s+(kitna|kya)\b", "get_cpu_usage"),
+        (r"(?i)\binternet\s+(hai|check|nahi|connected)\b", "ping_host"),
+        (r"(?i)\bbattery\s+(kitna|kya|check)\b", "get_battery_status"),
     ];
 
     mappings

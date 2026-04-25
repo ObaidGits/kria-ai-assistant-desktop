@@ -8,12 +8,14 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, RwLock};
 use tracing;
 
 use crate::agent::loop_engine::StreamEvent;
 use crate::agent::AgentLoop;
 use crate::config::TelegramConfig;
+use crate::safety::hitl::ApprovalResponse;
+use crate::llm::orchestrator::Orchestrator;
 use crate::llm::ChatMessage;
 use crate::memory::embeddings::EmbeddingModel;
 use crate::memory::store::MemoryStore;
@@ -42,6 +44,7 @@ impl TelegramBridge {
         embeddings: Arc<EmbeddingModel>,
         vectors: Arc<VectorIndex>,
         hw_tier: String,
+        orchestrator: Arc<RwLock<Option<Arc<Orchestrator>>>>,
     ) -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -54,6 +57,7 @@ impl TelegramBridge {
                 embeddings,
                 vectors,
                 hw_tier,
+                orchestrator,
                 shutdown_rx,
             )
             .await;
@@ -219,6 +223,7 @@ async fn telegram_poll_loop(
     embeddings: Arc<EmbeddingModel>,
     vectors: Arc<VectorIndex>,
     hw_tier: String,
+    orchestrator: Arc<RwLock<Option<Arc<Orchestrator>>>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let token = &config.bot_token;
@@ -398,6 +403,13 @@ async fn telegram_poll_loop(
                 .await;
 
             // Process through agent loop
+            // Read the current orchestrator snapshot — it may not be ready at bridge
+            // spawn time but will be available once the background startup completes.
+            let orc_snapshot = orchestrator.read().await.clone();
+            // Anyone whose chat_id is in allowed_chats is the owner — the allowed_chats
+            // gate above already rejected every other caller.  If allowed_chats is
+            // empty the bot is unconfigured; treat callers as non-owner for safety.
+            let is_owner = allowed_chats.contains(&chat_id);
             let reply = process_message(
                 &text,
                 chat_id,
@@ -408,6 +420,8 @@ async fn telegram_poll_loop(
                 &embeddings,
                 &vectors,
                 &hw_tier,
+                orc_snapshot.as_ref(),
+                is_owner,
             )
             .await;
 
@@ -435,6 +449,12 @@ pub async fn process_message(
     embeddings: &Arc<EmbeddingModel>,
     vectors: &Arc<VectorIndex>,
     hw_tier: &str,
+    orchestrator: Option<&Arc<Orchestrator>>,
+    // Whether the caller is the authenticated owner. Owner callers have their
+    // HITL approval requests auto-approved so that Telegram commands are not
+    // silently denied by a timeout. Non-owner callers receive an immediate
+    // denial for any RED-tier action.
+    is_owner: bool,
 ) -> String {
     // Build system prompt (similar to desktop send_message)
     let tool_descriptions = tool_registry
@@ -541,6 +561,36 @@ pub async fn process_message(
         timestamp: chrono::Utc::now(),
     });
 
+    // Ensure the local LLM runtime is up before entering the agent loop.
+    // Without this, messages arriving while the model server is starting up
+    // produce "local LLM transport error" instead of a real response.
+    if let Some(orc) = orchestrator {
+        const MAX_RETRIES: u32 = 2;
+        let mut last_err = String::new();
+        let mut ok = false;
+        for attempt in 0..=MAX_RETRIES {
+            match orc.ensure_ready("telegram_turn").await {
+                Ok(()) => { ok = true; break; }
+                Err(e) => {
+                    last_err = e.to_string();
+                    if attempt < MAX_RETRIES {
+                        tracing::warn!(
+                            attempt = attempt + 1,
+                            "Telegram: LLM not ready yet ({last_err}); retrying in 3s"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    }
+                }
+            }
+        }
+        if !ok {
+            tracing::error!("Telegram: LLM runtime unavailable after retries: {last_err}");
+            return format!(
+                "⚠️ KRIA's local model is not ready right now. Please try again in a few seconds.\n\nDetails: {last_err}"
+            );
+        }
+    }
+
     // Run agent loop and collect response
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<StreamEvent>();
 
@@ -549,6 +599,12 @@ pub async fn process_message(
     tokio::spawn(async move {
         agent.run(&sid, &mut messages, event_tx).await;
     });
+
+    // Capture the HITL gateway before entering the event drain loop so we
+    // can resolve pending approval requests that arrive while the agent task
+    // is running.  Without this, every RED-tier tool call issued from Telegram
+    // would silently time out and the user would never see an approval prompt.
+    let hitl = agent_loop.hitl_gateway();
 
     let mut full_response = String::new();
     while let Some(event) = event_rx.recv().await {
@@ -569,6 +625,64 @@ pub async fn process_message(
             }
             StreamEvent::ToolEnd { name, success, .. } => {
                 tracing::debug!("Telegram agent: tool {name} done (success={success})");
+            }
+            // ── HITL approval ─────────────────────────────────────────────
+            // The desktop path resolves this via the Tauri frontend modal.
+            // In the Telegram path there is no GUI, so we resolve the oneshot
+            // here before the gateway times it out.
+            //
+            // Owner callers: auto-approve — the user's own command IS the
+            // approval intent (e.g. "run this script", "open chrome").
+            //
+            // Non-owner callers: auto-deny — RED-tier actions require the
+            // account owner to authorise them.
+            StreamEvent::ApprovalRequired {
+                request_id,
+                action,
+                risk_level,
+                ..
+            } => {
+                let decision = if is_owner {
+                    tracing::info!(
+                        request_id = %request_id,
+                        action = %action,
+                        risk_level = %risk_level,
+                        chat_id = %chat_id,
+                        "Telegram: auto-approving RED-tier action for owner"
+                    );
+                    ApprovalResponse::Approved
+                } else {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        action = %action,
+                        risk_level = %risk_level,
+                        chat_id = %chat_id,
+                        "Telegram: auto-denying RED-tier action for non-owner"
+                    );
+                    ApprovalResponse::Denied
+                };
+                // The agent loop sends the StreamEvent just BEFORE calling
+                // request_approval_with_id(), which inserts the entry into the
+                // pending map.  On a multi-threaded Tokio executor this event
+                // drain loop can run on a different thread and call respond()
+                // before the insert completes.  Retry with short back-off so we
+                // don't accidentally let the 30-second gateway timeout fire.
+                let mut resolved = false;
+                for attempt in 0_u8..20 {
+                    if hitl.respond(&request_id, decision.clone()).await {
+                        resolved = true;
+                        break;
+                    }
+                    if attempt < 19 {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                }
+                if !resolved {
+                    tracing::error!(
+                        request_id = %request_id,
+                        "Telegram: HITL request not found after 20 attempts — will time out"
+                    );
+                }
             }
             _ => {}
         }
@@ -603,6 +717,249 @@ pub async fn process_message(
     }
 
     full_response
+}
+
+// ── Universal Inbox adapter shim ──────────────────────────────────────────────
+//
+// These implementations allow TelegramBridge to be used with the new
+// platform/inbox pipeline while keeping backward compatibility with the
+// existing polling loop above.
+
+use crate::platform::inbox::{
+    adapter::{DeliveryReceipt, EgressAdapter, IngressAdapter},
+    AuthContext as InboxAuthContext, ConversationKey, InboundMessage, OutboundMessage, Participant,
+    Platform as InboxPlatform,
+};
+
+/// Thin ingress shim — wraps the existing Telegram polling loop and converts
+/// each incoming text message into a canonical [`InboundMessage`].
+///
+/// Phase-1 implementation: uses `allowed_chat_ids` from config to determine
+/// owner status (first entry = owner).  Full speaker-verification and
+/// contact-book lookup can be wired in later without changing the trait.
+///
+/// The adapter's only job is normalising Telegram updates into [`InboundMessage`]
+/// envelopes and pushing them to the pipeline channel.  Processing dependencies
+/// (agent loop, memory, tools) live downstream in the pipeline — not here.
+pub struct TelegramIngressAdapter {
+    config: crate::config::TelegramConfig,
+    /// The first numeric ID in `allowed_chat_ids` is treated as the owner.
+    owner_chat_id: Option<i64>,
+}
+
+impl TelegramIngressAdapter {
+    pub fn new(config: crate::config::TelegramConfig) -> Self {
+        let owner_chat_id = config
+            .allowed_chat_ids
+            .split(',')
+            .find_map(|s| s.trim().parse::<i64>().ok());
+
+        Self { config, owner_chat_id }
+    }
+
+    fn auth_for_chat(&self, chat_id: i64) -> InboxAuthContext {
+        if Some(chat_id) == self.owner_chat_id {
+            InboxAuthContext::owner()
+        } else {
+            // Any chat in the allowed list is "trusted"; everything else is External.
+            let allowed: std::collections::HashSet<i64> =
+                parse_allowed_chat_ids(&self.config.allowed_chat_ids);
+            if allowed.contains(&chat_id) {
+                InboxAuthContext::trusted()
+            } else {
+                InboxAuthContext::unknown()
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl IngressAdapter for TelegramIngressAdapter {
+    fn platform_id(&self) -> &'static str {
+        "telegram"
+    }
+
+    async fn run(
+        self: Box<Self>,
+        tx: tokio::sync::mpsc::Sender<InboundMessage>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
+        let token = &self.config.bot_token;
+        if token.is_empty() {
+            tracing::error!("TelegramIngressAdapter: bot token empty, not starting");
+            return;
+        }
+
+        let allowed_chats = parse_allowed_chat_ids(&self.config.allowed_chat_ids);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .unwrap();
+
+        let mut last_update_id: i64 = 0;
+
+        loop {
+            if *shutdown.borrow() {
+                break;
+            }
+
+            let url = format!("{}{}/getUpdates", TELEGRAM_API, token);
+            let body = serde_json::json!({
+                "offset": last_update_id + 1,
+                "limit": 10,
+                "timeout": 30,
+            });
+
+            let updates_result = tokio::select! {
+                r = client.post(&url).json(&body).send() => r,
+                _ = shutdown.changed() => break,
+            };
+
+            let resp = match updates_result {
+                Ok(r) => r,
+                Err(e) if e.is_timeout() => continue,
+                Err(e) => {
+                    tracing::warn!("TelegramIngressAdapter: poll error: {e}");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+
+            let val: serde_json::Value = match resp.json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("TelegramIngressAdapter: parse error: {e}");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+
+            if val["ok"].as_bool() != Some(true) {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+
+            let updates = val["result"].as_array().cloned().unwrap_or_default();
+
+            for update in &updates {
+                if let Some(uid) = update["update_id"].as_i64() {
+                    last_update_id = uid;
+                }
+
+                let msg = &update["message"];
+                let text = match msg["text"].as_str() {
+                    Some(t) if !t.is_empty() => t.to_string(),
+                    _ => continue,
+                };
+
+                let chat_id = match msg["chat"]["id"].as_i64() {
+                    Some(id) => id,
+                    None => continue,
+                };
+
+                // Silently drop messages from disallowed chats (existing logic
+                // in the old bridge sends a warning — keep that in the old path).
+                if !allowed_chats.is_empty() && !allowed_chats.contains(&chat_id) {
+                    continue;
+                }
+
+                let from_name = msg["from"]["first_name"]
+                    .as_str()
+                    .unwrap_or("User")
+                    .to_string();
+                let from_id = msg["from"]["id"]
+                    .as_i64()
+                    .map(|i| i.to_string())
+                    .unwrap_or_else(|| chat_id.to_string());
+                let native_id = msg["message_id"]
+                    .as_i64()
+                    .map(|i| i.to_string());
+
+                let auth = self.auth_for_chat(chat_id);
+
+                let mut envelope = InboundMessage::new(
+                    ConversationKey {
+                        platform: InboxPlatform::Telegram,
+                        chat_id: chat_id.to_string(),
+                    },
+                    Participant {
+                        id: from_id,
+                        display_name: Some(from_name),
+                        is_bot: msg["from"]["is_bot"].as_bool().unwrap_or(false),
+                    },
+                    auth,
+                    SystemTime::now(),
+                );
+                envelope.text = Some(text);
+                envelope.native_message_id = native_id;
+
+                if tx.send(envelope).await.is_err() {
+                    tracing::warn!("TelegramIngressAdapter: channel closed");
+                    return;
+                }
+            }
+        }
+
+        tracing::info!("TelegramIngressAdapter: stopped");
+    }
+}
+
+/// Thin egress shim — sends an [`OutboundMessage`] back to the Telegram chat.
+pub struct TelegramEgressAdapter {
+    token: String,
+    client: reqwest::Client,
+}
+
+impl TelegramEgressAdapter {
+    pub fn new(token: impl Into<String>) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap();
+        Self {
+            token: token.into(),
+            client,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl EgressAdapter for TelegramEgressAdapter {
+    fn platform_id(&self) -> &'static str {
+        "telegram"
+    }
+
+    async fn send(&self, msg: OutboundMessage) -> DeliveryReceipt {
+        let chat_id: i64 = match msg.conversation.chat_id.parse() {
+            Ok(id) => id,
+            Err(_) => {
+                return DeliveryReceipt {
+                    outbound_id: msg.id,
+                    native_message_id: None,
+                    delivered: false,
+                    error: Some(format!(
+                        "invalid chat_id '{}'",
+                        msg.conversation.chat_id
+                    )),
+                };
+            }
+        };
+
+        match send_message(&self.client, &self.token, chat_id, &msg.text).await {
+            Ok(()) => DeliveryReceipt {
+                outbound_id: msg.id,
+                native_message_id: None, // Telegram sendMessage response not parsed here
+                delivered: true,
+                error: None,
+            },
+            Err(e) => DeliveryReceipt {
+                outbound_id: msg.id,
+                native_message_id: None,
+                delivered: false,
+                error: Some(e),
+            },
+        }
+    }
 }
 
 #[cfg(test)]

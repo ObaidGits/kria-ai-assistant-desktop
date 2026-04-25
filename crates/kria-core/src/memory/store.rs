@@ -21,6 +21,22 @@ pub struct ConversationTurn {
     pub timestamp: DateTime<Utc>,
 }
 
+/// A persisted image or uploaded file associated with a chat session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMediaRecord {
+    pub session_id: String,
+    /// "generated" | "uploaded"
+    pub media_type: String,
+    pub file_path: String,
+    pub sha256: Option<String>,
+    /// The prompt used to generate this image (generated only).
+    pub prompt: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub style: Option<String>,
+    pub provenance: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryFact {
     pub id: Option<i64>,
@@ -170,6 +186,21 @@ impl MemoryStore {
             CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
                 content, content=document_chunks, content_rowid=id
             );
+
+            CREATE TABLE IF NOT EXISTS chat_media (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id  TEXT NOT NULL,
+                media_type  TEXT NOT NULL DEFAULT 'generated',
+                file_path   TEXT NOT NULL,
+                sha256      TEXT,
+                prompt      TEXT,
+                width       INTEGER,
+                height      INTEGER,
+                style       TEXT,
+                provenance  TEXT,
+                created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_media_session ON chat_media(session_id);
             ",
         )?;
         Ok(())
@@ -230,6 +261,52 @@ impl MemoryStore {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(turns.into_iter().rev().collect())
+    }
+
+    /// Persist a media record (generated or uploaded image) for a session.
+    pub fn store_chat_media(&self, record: &ChatMediaRecord) -> anyhow::Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO chat_media (session_id, media_type, file_path, sha256, prompt, width, height, style, provenance)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                record.session_id,
+                record.media_type,
+                record.file_path,
+                record.sha256,
+                record.prompt,
+                record.width.map(|v| v as i64),
+                record.height.map(|v| v as i64),
+                record.style,
+                record.provenance,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Return all media records for a session, ordered by creation time.
+    pub fn get_session_media(&self, session_id: &str) -> anyhow::Result<Vec<ChatMediaRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT session_id, media_type, file_path, sha256, prompt, width, height, style, provenance
+             FROM chat_media WHERE session_id = ?1 ORDER BY created_at ASC",
+        )?;
+        let records = stmt
+            .query_map(params![session_id], |row| {
+                Ok(ChatMediaRecord {
+                    session_id: row.get(0)?,
+                    media_type: row.get(1)?,
+                    file_path: row.get(2)?,
+                    sha256: row.get(3)?,
+                    prompt: row.get(4)?,
+                    width: row.get::<_, Option<i64>>(5)?.map(|v| v as u32),
+                    height: row.get::<_, Option<i64>>(6)?.map(|v| v as u32),
+                    style: row.get(7)?,
+                    provenance: row.get(8)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
     }
 
     pub fn list_sessions(&self) -> anyhow::Result<Vec<(String, i64, String)>> {

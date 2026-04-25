@@ -108,10 +108,17 @@ impl AudioCapture {
         let ns_state_clone = ns_state.clone();
         let stream_failed = Arc::new(AtomicBool::new(false));
         let stream_failed_cb = stream_failed.clone();
+        let paused = Arc::new(AtomicBool::new(false));
+        let paused_cb = paused.clone();
 
         let stream = device.build_input_stream(
             &config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                // While paused, discard incoming audio silently (wake-word
+                // tap uses a separate stream and is unaffected).
+                if paused_cb.load(Ordering::Relaxed) {
+                    return;
+                }
                 let mut buf = buf_clone.lock().unwrap();
                 let mut ns = ns_state_clone.lock().unwrap();
                 for &sample in data {
@@ -152,6 +159,7 @@ impl AudioCapture {
                 _stream: stream,
                 device_name,
                 stream_failed,
+                paused,
             },
         ))
     }
@@ -283,6 +291,9 @@ pub struct AudioCaptureHandle {
     _stream: cpal::Stream,
     device_name: String,
     stream_failed: Arc<AtomicBool>,
+    /// When `true`, the cpal callback discards audio silently.
+    /// The wake-word tap (separate stream) is NOT paused.
+    paused: Arc<AtomicBool>,
 }
 
 impl AudioCaptureHandle {
@@ -292,6 +303,21 @@ impl AudioCaptureHandle {
 
     pub fn has_failed(&self) -> bool {
         self.stream_failed.load(Ordering::Relaxed)
+    }
+
+    /// Pause the VAD/STT audio path. Audio chunks are discarded until `resume()`.
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::Release);
+    }
+
+    /// Resume the VAD/STT audio path.
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::Release);
+    }
+
+    /// Whether the capture path is currently paused.
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
     }
 }
 

@@ -146,9 +146,13 @@ impl ToolHandler for WriteFile {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
         let path = params["path"].as_str().unwrap_or("");
         let content = params["content"].as_str().unwrap_or("");
+        let overwrite = params["overwrite"].as_bool().unwrap_or(true);
         let max_size = 10 * 1024 * 1024; // 10MB
         if content.len() > max_size {
             return ToolResult::err("content exceeds 10MB limit");
+        }
+        if !overwrite && tokio::fs::metadata(path).await.is_ok() {
+            return ToolResult::err(format!("write_file failed: file already exists and overwrite is false: {path}"));
         }
         if let Some(parent) = PathBuf::from(path).parent() {
             let _ = tokio::fs::create_dir_all(parent).await;

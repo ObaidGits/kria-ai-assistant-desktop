@@ -10,10 +10,33 @@ const SessionSidebar: Component = () => {
     createSession,
     switchSession,
     deleteSession,
+    renameSession,
     currentEnvironment,
     setCurrentEnvironment,
   } = appStore;
   const [collapsed, setCollapsed] = createSignal(false);
+  const [editingSessionId, setEditingSessionId] = createSignal<string | null>(null);
+  const [editingTitle, setEditingTitle] = createSignal("");
+
+  const startRename = (sessionId: string, currentTitle: string) => {
+    setEditingSessionId(sessionId);
+    setEditingTitle(currentTitle);
+  };
+
+  const cancelRename = () => {
+    setEditingSessionId(null);
+    setEditingTitle("");
+  };
+
+  const commitRename = async (sessionId: string) => {
+    const nextTitle = editingTitle().trim();
+    if (!nextTitle) {
+      cancelRename();
+      return;
+    }
+    await renameSession(sessionId, nextTitle);
+    cancelRename();
+  };
 
   return (
     <aside class={`sidebar ${collapsed() ? "collapsed" : ""}`}>
@@ -66,7 +89,7 @@ const SessionSidebar: Component = () => {
 
         <div class="sidebar-quick-actions">
           <button class="settings-btn primary" onClick={() => createSession()}>
-            + New Mission
+            + New Chat
           </button>
           <button class="settings-btn" onClick={() => setShowSettings(true)}>
             Configure Assistant
@@ -80,18 +103,72 @@ const SessionSidebar: Component = () => {
           <For each={sessions()}>
             {(session) => (
               <div
-                class={`session-item ${currentSession() === session.id ? "active" : ""}`}
-                onClick={() => switchSession(session.id)}
+                class={`session-item ${currentSession() === session.id ? "active" : ""} ${editingSessionId() === session.id ? "editing" : ""}`}
+                onClick={() => {
+                  if (editingSessionId() === session.id) return;
+                  void switchSession(session.id);
+                }}
+                onDblClick={() => startRename(session.id, session.title)}
               >
-                <span class="session-title">{session.title}</span>
-                <button
-                  class="session-delete"
-                  title="Delete session"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    deleteSession(session.id);
-                  }}
-                >×</button>
+                <Show
+                  when={editingSessionId() === session.id}
+                  fallback={<span class="session-title" title={session.title}>{session.title}</span>}
+                >
+                  <input
+                    class="session-title-input"
+                    value={editingTitle()}
+                    onInput={(e) => setEditingTitle(e.currentTarget.value)}
+                    onClick={(e) => e.stopPropagation()}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        void commitRename(session.id);
+                      } else if (e.key === "Escape") {
+                        e.preventDefault();
+                        cancelRename();
+                      }
+                    }}
+                  />
+                </Show>
+
+                <div class="session-actions" onClick={(e) => e.stopPropagation()}>
+                  <Show
+                    when={editingSessionId() === session.id}
+                    fallback={(
+                      <>
+                        <button
+                          class="session-action session-rename"
+                          title="Rename session"
+                          onClick={() => startRename(session.id, session.title)}
+                        >
+                          ✎
+                        </button>
+                        <button
+                          class="session-action session-delete"
+                          title="Delete session"
+                          onClick={() => void deleteSession(session.id)}
+                        >
+                          ×
+                        </button>
+                      </>
+                    )}
+                  >
+                    <button
+                      class="session-action session-save"
+                      title="Save title"
+                      onClick={() => void commitRename(session.id)}
+                    >
+                      ✓
+                    </button>
+                    <button
+                      class="session-action session-cancel"
+                      title="Cancel rename"
+                      onClick={cancelRename}
+                    >
+                      ↺
+                    </button>
+                  </Show>
+                </div>
               </div>
             )}
           </For>

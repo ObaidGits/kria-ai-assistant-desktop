@@ -240,6 +240,8 @@ static YELLOW_ACTIONS: Lazy<HashSet<&str>> = Lazy::new(|| {
         "ingest_document_rag",
         // Proactive (monitoring)
         "watch_directory",
+        // Image generation (writes image file to cache — reversible)
+        "generate_image",
         // Desktop (window manipulation)
         "move_window",
         "resize_window",

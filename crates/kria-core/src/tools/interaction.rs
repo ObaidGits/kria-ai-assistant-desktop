@@ -88,30 +88,46 @@ impl ToolHandler for Screenshot {
             .as_str()
             .unwrap_or("/tmp/kria_screenshot.png");
         if cfg!(target_os = "linux") {
-            // Try gnome-screenshot, then scrot, then import (ImageMagick)
-            let tools = ["gnome-screenshot", "scrot", "import"];
+            // Priority order: maim (best on Ubuntu 24.04 X11), scrot, gnome-screenshot, import (ImageMagick)
+            let tools = ["maim", "scrot", "gnome-screenshot", "import"];
+            let mut errors: Vec<String> = Vec::new();
             for tool in &tools {
-                let args = match *tool {
-                    "gnome-screenshot" => vec!["-f", output_path],
+                let args: Vec<&str> = match *tool {
+                    "maim" => vec![output_path],
                     "scrot" => vec![output_path],
+                    "gnome-screenshot" => vec!["-f", output_path],
                     "import" => vec!["-window", "root", output_path],
                     _ => continue,
                 };
-                let output = tokio::process::Command::new(tool)
+                let result = tokio::process::Command::new(tool)
                     .args(&args)
                     .output()
                     .await;
-                if let Ok(o) = output {
-                    if o.status.success() {
-                        return ToolResult::ok(serde_json::json!({
-                            "path": output_path, "tool": tool,
-                        }));
+                match result {
+                    Ok(o) if o.status.success() => {
+                        // Verify the file was actually created on disk
+                        if std::path::Path::new(output_path).exists() {
+                            return ToolResult::ok(serde_json::json!({
+                                "path": output_path, "tool": tool,
+                            }));
+                        }
+                        errors.push(format!("{tool}: exited 0 but file not created"));
+                    }
+                    Ok(o) => {
+                        errors.push(format!("{tool}: exit {}", o.status));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // Tool not installed — try next
+                    }
+                    Err(e) => {
+                        errors.push(format!("{tool}: {e}"));
                     }
                 }
             }
-            ToolResult::err(
-                "no screenshot tool available (install gnome-screenshot, scrot, or imagemagick)",
-            )
+            ToolResult::err(format!(
+                "no screenshot tool succeeded (tried maim, scrot, gnome-screenshot, import). Errors: {}",
+                errors.join("; ")
+            ))
         } else {
             ToolResult::err("screenshot not implemented for this OS yet")
         }

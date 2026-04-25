@@ -49,7 +49,15 @@ once_cell = "1"
 
 # Time & IDs
 chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v7"] }
+
+# Durable embedded queue (inbox pipeline)
+fjall = "2"
+rmp-serde = "1"
+
+# Rate limiting & retry (inbox pipeline)
+governor = "0.6"
+backoff = { version = "0.4", features = ["tokio"] }
 
 # Clipboard
 arboard = "3"
@@ -89,6 +97,9 @@ open = "5"
 # URL parsing and construction
 url = { version = "2", features = ["serde"] }
 
+# Base64 encoding/decoding (used for image data URL responses)
+base64 = "0.22"
+
 # Unicode text normalization (for contact matching)
 unicode-normalization = "0.1"
 
@@ -97,6 +108,9 @@ nvml-wrapper = "0.10"
 
 # Async utilities (CancellationToken)
 tokio-util = "0.7"
+
+# WebSocket client (image-gen WS progress bridge)
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 
 # Hashing
 blake3 = "1"
@@ -113,3 +127,24 @@ llguidance = "0.7"
 
 # POSIX bindings (prctl, setsid, kill — Unix only)
 libc = "0.2"
+
+# URL percent-encoding (image cloud fallback)
+urlencoding = "2"
+
+# ── Build profiles ──────────────────────────────────────────────────────
+# Dev profile is tuned to keep peak compile RAM low so `cargo tauri dev`
+# doesn't OOM-freeze low-RAM machines (the previous default of 256 codegen
+# units + parallel codegen could push linker memory above 8 GiB).
+[profile.dev]
+opt-level = 0
+debug = 1            # line tables only — full debug info doubled link RAM
+codegen-units = 16   # cap parallelism (default is 256 for dev)
+incremental = true
+split-debuginfo = "unpacked"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+strip = "debuginfo"
+panic = "abort"

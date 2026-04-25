@@ -45,14 +45,49 @@ url = { workspace = true }
 unicode-normalization = { workspace = true }
 tokio-util = { workspace = true }
 nvml-wrapper = { workspace = true, optional = true }
+tokio-tungstenite = { workspace = true }
+urlencoding = { workspace = true }
 blake3 = { workspace = true }
 hex = { workspace = true }
 memmap2 = { workspace = true }
 fastembed = { workspace = true }
 llguidance = { workspace = true }
+fjall = { workspace = true }
+rmp-serde = { workspace = true }
+governor = { workspace = true }
+backoff = { workspace = true }
+
+# ─── Voice v2 native backends — STRICTLY OPTIONAL ─────────────────────────
+# Each of these pulls in heavy native build deps (clang, cmake, vendored C).
+# They MUST stay `optional = true` so the default `cargo build` remains
+# pure-Rust. Activate via the per-engine feature flags below, or via the
+# aggregate `native-audio` feature for a full v2 build.
+whisper-rs = { version = "0.13", optional = true, default-features = false }
+webrtc-audio-processing = { version = "0.5", optional = true }
 
 [features]
 nvidia = ["nvml-wrapper"]
+# ── Voice v2 native backends (all default-OFF; v2 falls back to CLI engines) ──
+# Per-backend feature flags. None of these are enabled by default — a fresh
+# `cargo build` produces a working v2 stack that uses the CLI fallbacks
+# (whisper-cpp + piper binaries) and the safe disabled() detector for wake.
+voice-whisper-rs = ["dep:whisper-rs"]
+voice-whisper-cuda = ["voice-whisper-rs", "whisper-rs?/cuda"]
+voice-whisper-vulkan = ["voice-whisper-rs", "whisper-rs?/vulkan"]
+# piper-rs path is served by the existing `ort` dep; no extra crate needed.
+voice-piper-rs = []
+voice-aec = ["dep:webrtc-audio-processing"]
+voice-wake-oww = []
+
+# Aggregate convenience flag: enable every native backend at once.
+# Pulls in clang + cmake at build time. Use only when you want the full
+# in-process v2 stack (no CLI shell-outs).
+native-audio = [
+    "voice-whisper-rs",
+    "voice-piper-rs",
+    "voice-aec",
+    "voice-wake-oww",
+]
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
@@ -63,3 +98,4 @@ seccompiler = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
+serial_test = "3"

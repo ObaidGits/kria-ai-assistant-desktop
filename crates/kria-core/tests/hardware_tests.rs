@@ -14,6 +14,8 @@ fn classify_tier_lite() {
         cpu_cores: 2,
         total_ram_mb: 4096,
         vram_mb: None,
+        vram_free_mb: 0,
+        image_tier: kria_core::platform::vram::ImageTier::CRejectOrCloud,
         gpu_name: None,
         package_manager: Some(PackageManager::Apt),
         hostname: "test".into(),

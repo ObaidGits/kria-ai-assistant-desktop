@@ -146,6 +146,30 @@ impl ToolHandler for GetSystemUptime {
     }
 }
 
+/// Aggregate system-health snapshot used by the router for prompts like
+/// "system stats", "system health", "mera system kaisa hai" etc.
+/// Returns a single JSON blob with CPU, memory, disk, battery, uptime so the
+/// LLM has everything it needs in one tool call (avoids it falling back to
+/// hallucinated bash commands).
+struct CheckSystemHealth;
+#[async_trait]
+impl ToolHandler for CheckSystemHealth {
+    async fn execute(&self, _params: serde_json::Value) -> ToolResult {
+        let cpu = GetCpuUsage.execute(serde_json::Value::Null).await;
+        let mem = GetMemoryInfo.execute(serde_json::Value::Null).await;
+        let disk = GetDiskSpace.execute(serde_json::Value::Null).await;
+        let battery = GetBatteryStatus.execute(serde_json::Value::Null).await;
+        let uptime = GetSystemUptime.execute(serde_json::Value::Null).await;
+        ToolResult::ok(serde_json::json!({
+            "cpu":     cpu.data,
+            "memory":  mem.data,
+            "disk":    disk.data,
+            "battery": battery.data,
+            "uptime":  uptime.data,
+        }))
+    }
+}
+
 // ─── Registration ───
 
 pub fn register(reg: &ToolRegistry) {
@@ -226,6 +250,17 @@ pub fn register(reg: &ToolRegistry) {
                 min_tier: "lite",
             },
             Arc::new(GetSystemUptime),
+        ),
+        (
+            ToolDef {
+                name: "check_system_health".into(),
+                description: "Aggregate system health snapshot: CPU, memory, disk, battery, uptime in one call".into(),
+                category: "system_info".into(),
+                parameters: vec![],
+                default_tier: RiskLevel::Green,
+                min_tier: "lite",
+            },
+            Arc::new(CheckSystemHealth),
         ),
     ];
 

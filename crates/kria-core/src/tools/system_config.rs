@@ -18,18 +18,44 @@ struct SetVolume;
 #[async_trait]
 impl ToolHandler for SetVolume {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
-        let level = params["level"].as_u64().unwrap_or(50);
+        // Accept level as JSON number (50), string ("50"), or percent string ("50%")
+        let level = params["level"]
+            .as_u64()
+            .or_else(|| params["level"].as_f64().map(|f| f as u64))
+            .or_else(|| {
+                params["level"]
+                    .as_str()
+                    .and_then(|s| s.trim_end_matches('%').trim().parse::<u64>().ok())
+            })
+            .unwrap_or(50)
+            .min(100);
         if cfg!(target_os = "linux") {
-            let output = tokio::process::Command::new("pactl")
-                .args(["set-sink-volume", "@DEFAULT_SINK@", &format!("{}%", level)])
+            let vol_str = format!("{}%", level);
+            // 1st: wpctl (PipeWire native — default on Ubuntu 24.04+)
+            let wpctl = tokio::process::Command::new("wpctl")
+                .args(["set-volume", "@DEFAULT_AUDIO_SINK@", &vol_str])
                 .output()
                 .await;
-            match output {
-                Ok(o) if o.status.success() => {
-                    ToolResult::ok(serde_json::json!({ "volume": level }))
-                }
-                _ => ToolResult::err("failed to set volume (pactl)"),
+            if matches!(wpctl, Ok(ref o) if o.status.success()) {
+                return ToolResult::ok(serde_json::json!({ "volume": level, "backend": "wpctl" }));
             }
+            // 2nd: pactl (PulseAudio / PipeWire compat layer)
+            let pactl = tokio::process::Command::new("pactl")
+                .args(["set-sink-volume", "@DEFAULT_SINK@", &vol_str])
+                .output()
+                .await;
+            if matches!(pactl, Ok(ref o) if o.status.success()) {
+                return ToolResult::ok(serde_json::json!({ "volume": level, "backend": "pactl" }));
+            }
+            // 3rd: amixer ALSA fallback
+            let amixer = tokio::process::Command::new("amixer")
+                .args(["set", "Master", &format!("{}% unmute", level)])
+                .output()
+                .await;
+            if matches!(amixer, Ok(ref o) if o.status.success()) {
+                return ToolResult::ok(serde_json::json!({ "volume": level, "backend": "amixer" }));
+            }
+            ToolResult::err("failed to set volume: wpctl, pactl, and amixer all failed")
         } else {
             ToolResult::err("set_volume not implemented for this OS")
         }
@@ -40,18 +66,66 @@ struct SetBrightness;
 #[async_trait]
 impl ToolHandler for SetBrightness {
     async fn execute(&self, params: serde_json::Value) -> ToolResult {
-        let level = params["level"].as_u64().unwrap_or(50);
+        // Accept level as JSON number (80), string ("80"), or percent string ("80%")
+        let level = params["level"]
+            .as_u64()
+            .or_else(|| params["level"].as_f64().map(|f| f as u64))
+            .or_else(|| {
+                params["level"]
+                    .as_str()
+                    .and_then(|s| s.trim_end_matches('%').trim().parse::<u64>().ok())
+            })
+            .unwrap_or(50)
+            .min(100);
         if cfg!(target_os = "linux") {
-            let output = tokio::process::Command::new("brightnessctl")
+            let dbus_addr = std::env::var("DBUS_SESSION_BUS_ADDRESS")
+                .or_else(|_| std::env::var("XDG_RUNTIME_DIR").map(|d| format!("unix:path={}/bus", d)))
+                .unwrap_or_else(|_| "unix:path=/run/user/1000/bus".to_string());
+            // 1st: GNOME SettingsDaemon D-Bus — controls hardware backlight AND updates system tray slider
+            let gdbus_val = format!("<int32 {}>", level);
+            let gnome_ok = tokio::process::Command::new("gdbus")
+                .args([
+                    "call", "--session",
+                    "--dest", "org.gnome.SettingsDaemon.Power",
+                    "--object-path", "/org/gnome/SettingsDaemon/Power",
+                    "--method", "org.freedesktop.DBus.Properties.Set",
+                    "org.gnome.SettingsDaemon.Power.Screen", "Brightness",
+                    &gdbus_val,
+                ])
+                .env("DBUS_SESSION_BUS_ADDRESS", &dbus_addr)
+                .output()
+                .await;
+            if matches!(gnome_ok, Ok(ref o) if o.status.success()) {
+                return ToolResult::ok(serde_json::json!({ "brightness": level, "backend": "gnome-settingsd" }));
+            }
+            // 2nd: brightnessctl (hardware backlight, works without GNOME)
+            let bc = tokio::process::Command::new("brightnessctl")
                 .args(["set", &format!("{}%", level)])
                 .output()
                 .await;
-            match output {
-                Ok(o) if o.status.success() => {
-                    ToolResult::ok(serde_json::json!({ "brightness": level }))
-                }
-                _ => ToolResult::err("failed to set brightness (brightnessctl)"),
+            if matches!(bc, Ok(ref o) if o.status.success()) {
+                return ToolResult::ok(serde_json::json!({ "brightness": level, "backend": "brightnessctl" }));
             }
+            // 3rd: xrandr (gamma/color correction only — does not change hardware backlight)
+            let fraction = format!("{:.2}", level as f64 / 100.0);
+            let xrandr_out = tokio::process::Command::new("xrandr").output().await;
+            if let Ok(xr) = xrandr_out {
+                if let Some(display) = String::from_utf8_lossy(&xr.stdout)
+                    .lines()
+                    .find(|l| l.contains(" connected"))
+                    .and_then(|l| l.split_whitespace().next())
+                    .map(str::to_string)
+                {
+                    let xr2 = tokio::process::Command::new("xrandr")
+                        .args(["--output", &display, "--brightness", &fraction])
+                        .output()
+                        .await;
+                    if matches!(xr2, Ok(ref o) if o.status.success()) {
+                        return ToolResult::ok(serde_json::json!({ "brightness": level, "backend": "xrandr-gamma" }));
+                    }
+                }
+            }
+            ToolResult::err("failed to set brightness: gdbus, brightnessctl, and xrandr all failed")
         } else {
             ToolResult::err("set_brightness not implemented for this OS")
         }

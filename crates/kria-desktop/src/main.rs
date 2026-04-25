@@ -58,6 +58,7 @@ fn main() {
             commands::switch_session,
             commands::delete_session,
             commands::rename_session,
+            commands::auto_rename_session,
             commands::search_sessions,
             commands::cancel_request,
             commands::cancel_turn,
@@ -71,6 +72,8 @@ fn main() {
             commands::start_voice,
             commands::stop_voice,
             commands::get_voice_status,
+            commands::voice_v2_speak,
+            commands::voice_v2_abort,
             commands::send_image_message,
             commands::list_mcp_servers,
             commands::reconcile_mcp_runtime,
@@ -97,6 +100,9 @@ fn main() {
             commands::get_alerts,
             commands::save_export_file,
             commands::open_html_for_print,
+            commands::read_local_image,
+            commands::save_uploaded_image,
+            commands::get_session_media,
             commands::get_colab_tier_status,
             commands::connect_colab_tier,
             commands::disconnect_colab_tier,
@@ -114,6 +120,7 @@ fn main() {
             commands::run_provisioning_step,
             commands::get_provisioning_diagnostics,
             commands::get_hardware_profile,
+            commands::voice_v2_status,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

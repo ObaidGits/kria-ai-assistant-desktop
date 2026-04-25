@@ -30,6 +30,14 @@ impl ToolResult {
             error: Some(msg.into()),
         }
     }
+
+    pub fn err_with_data(msg: impl Into<String>, data: serde_json::Value) -> Self {
+        Self {
+            success: false,
+            data,
+            error: Some(msg.into()),
+        }
+    }
 }
 
 /// Execute a tool function with timeout and panic isolation.

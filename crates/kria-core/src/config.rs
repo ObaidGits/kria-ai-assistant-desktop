@@ -20,6 +20,7 @@ pub struct KriaConfig {
     pub orchestrator: OrchestratorConfig,
     pub colab: ColabConfig,
     pub routing: RoutingConfig,
+    pub image_generation: ImageGenerationConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,12 +87,81 @@ pub struct VoiceConfig {
     pub push_to_talk_key: String,
     pub language: String,
     pub partial_update_ms: u64,
+    /// Whether to emit live (partial) transcripts while the user is still speaking.
+    /// Disabled by default for the v1 CLI backend because each partial spawns a
+    /// fresh `whisper-cpp` subprocess that cold-loads the model — this piles up
+    /// and starves the final transcription, causing STT timeouts. Re-enable
+    /// once a persistent backend (whisper-server / whisper-rs / v2) is in use.
+    pub enable_partial_transcripts: bool,
     pub confidence_threshold: f32,
     pub noise_suppression_mode: String,
     pub follow_system_default_mic: bool,
     pub follow_system_default_speaker: bool,
     pub persist_transcripts: bool,
     pub persist_raw_audio: bool,
+    /// Pipeline engine: `"v1"` (legacy, CLI-subprocess) or `"v2"` (in-process streaming).
+    /// Default `"v1"` until v2 is validated on every tier/platform.
+    pub engine: String,
+    /// Hardware tier override: `"auto" | "s" | "a" | "c"`. `auto` = derive from
+    /// `HardwareTier` at startup.
+    pub tier: String,
+    /// Optional explicit STT engine: `"auto" | "whisper-rs" | "whisper-cuda" | "sidecar"`.
+    pub stt_engine: String,
+    /// Optional explicit TTS engine: `"auto" | "piper-cli" | "piper-rs"`.
+    pub tts_engine: String,
+    pub wake_word: WakeWordConfig,
+    pub aec: AecConfig,
+    pub barge_in: BargeInConfig,
+    pub post_edit: PostEditConfig,
+}
+
+/// Wake-word ("Hey Ria") settings — Phase 4.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct WakeWordConfig {
+    pub enabled: bool,
+    /// Path to the openWakeWord ONNX model for the keyword head.
+    pub model_path: String,
+    /// 0.0..1.0; 0.5 = "balanced".
+    pub sensitivity: f32,
+    /// Aliases that should also wake the assistant (informational; the trained
+    /// model itself covers all aliases — listed here for documentation/UX).
+    pub aliases: Vec<String>,
+}
+
+/// Acoustic Echo Cancellation settings — Phase 3. STRICTLY opt-in via the
+/// `aec` cargo feature on `kria-voice`. When the feature is not compiled,
+/// these fields are accepted for forward compatibility but ignored.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct AecConfig {
+    pub enabled: bool,
+    /// `"low" | "medium" | "high"` — maps to WebRTC APM NS aggressiveness.
+    pub aggressiveness: String,
+}
+
+/// Barge-in (interrupt-while-speaking) settings — Phase 2.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct BargeInConfig {
+    pub enabled: bool,
+    /// Minimum continuous speech (ms) before aborting playback. Debounces
+    /// AEC residue and single-cough false positives.
+    pub min_speech_ms: u64,
+}
+
+/// LLM post-edit / Hinglish fix-pass settings — Phase 5.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct PostEditConfig {
+    pub enabled: bool,
+    /// Model name (must exist in the configured local model set).
+    /// Preferred: `"qwen2.5-3b-instruct"`. Fallback: `"phi-4-mini"`.
+    pub model: String,
+    /// `"always" | "on_low_confidence"`.
+    pub mode: String,
+    /// Hard timeout per tier — overridden by `VoiceTier` when not set explicitly.
+    pub timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -281,6 +351,11 @@ pub struct OrchestratorConfig {
     pub max_emergency_transitions_per_hour: u32,
     /// Path or name of the llama-server binary.
     pub llama_server_binary: String,
+    /// Directory passed to llama-server via `--slot-save-path`. Required for
+    /// `/slots/{id}?action=save|restore` (used by the Tier B drop-and-swap
+    /// path to persist KV cache across hard process restarts).
+    /// Empty string -> resolve at spawn time to `<system_tmp>/kria_llama_slots`.
+    pub slot_save_path: String,
     /// Enable flash attention in llama-server.
     pub flash_attention: bool,
     /// Lock model weights in RAM (mlock).
@@ -355,7 +430,7 @@ impl Default for OrchestratorConfig {
             max_transitions_per_hour: 6,
             min_ngl_delta: 3,
             min_ngl_delta_up: 6,
-            safety_margin_mb: 256,
+            safety_margin_mb: 512,
             hysteresis_band_mb: 256,
             pressure_dwell_secs: 5,
             emergency_dwell_ms: 750,
@@ -363,9 +438,14 @@ impl Default for OrchestratorConfig {
             state_max_dwell_secs: 300,
             max_emergency_transitions_per_hour: 3,
             llama_server_binary: "llama-server".into(),
-            flash_attention: true,
-            mlock: true,
-            batch_size: 256,
+            slot_save_path: String::new(),
+            // Safety: dangerous flags default to OFF. The orchestrator's
+            // `tune_for_tier()` opts in only when free RAM/VRAM is provably
+            // sufficient. Hardcoding mlock=true on a 16GB laptop with a 5GB
+            // model is a guaranteed system freeze.
+            flash_attention: false,
+            mlock: false,
+            batch_size: 128,
             graceful_stop_timeout_secs: 5,
             health_check_timeout_secs: 120,
             port_discovery_timeout_secs: 60,
@@ -379,6 +459,105 @@ impl Default for OrchestratorConfig {
             macos_emergency_ram_mb: 1024,
             macos_recover_ram_mb: 4096,
             model_profile: ModelProfile::default(),
+        }
+    }
+}
+
+impl OrchestratorConfig {
+    /// Adapt memory-sensitive defaults to the detected hardware tier.
+    ///
+    /// This is the **freeze prevention** layer: a 16 GB laptop loading a
+    /// 5 GB Qwen2.5-VL with `mlock=true` + `flash_attention=true` +
+    /// `batch_size=256` will OOM-freeze. Calling this method right after
+    /// hardware detection clamps the config to values that are safe for
+    /// the actual machine.
+    ///
+    /// Inputs:
+    /// * `tier` — coarse classification (Lite/Standard/Performance/High)
+    /// * `total_ram_mb` — physical RAM (system-wide)
+    /// * `vram_mb` — discrete GPU VRAM, if any
+    /// * `model_size_mb` — on-disk size of the active GGUF (used to decide
+    ///   whether `--mlock` would actually fit)
+    ///
+    /// Rules (conservative on purpose):
+    /// * `mlock` only enabled when `total_ram_mb >= model_size_mb * 2 + 4 GB`
+    ///   AND tier is Performance or High.
+    /// * `flash_attention` enabled only on Performance/High tiers (it adds
+    ///   intermediate VRAM allocations that can tip a 6 GB GPU into OOM).
+    /// * `batch_size` clamped per tier: 64 / 96 / 128 / 256.
+    /// * `safety_margin_mb` raised on lower tiers so the watchdog leaves
+    ///   more headroom for the desktop/browser/IDE.
+    /// * `poll_interval_secs` raised on Lite to reduce telemetry overhead.
+    pub fn tune_for_tier(
+        &mut self,
+        tier: crate::platform::detect::HardwareTier,
+        total_ram_mb: u64,
+        vram_mb: Option<u64>,
+        model_size_mb: u64,
+    ) {
+        use crate::platform::detect::HardwareTier;
+
+        // Clamp batch_size to a per-tier ceiling.
+        let max_batch: u32 = match tier {
+            HardwareTier::Lite => 64,
+            HardwareTier::Standard => 96,
+            HardwareTier::Performance => 128,
+            HardwareTier::High => 256,
+        };
+        if self.batch_size > max_batch {
+            self.batch_size = max_batch;
+        }
+
+        // flash_attention: only on tiers with discrete GPU and enough VRAM.
+        let flash_safe = matches!(tier, HardwareTier::Performance | HardwareTier::High)
+            && vram_mb.map(|v| v >= 6 * 1024).unwrap_or(false);
+        if !flash_safe {
+            self.flash_attention = false;
+        }
+
+        // mlock: requires headroom of model_size + 4 GB on top of model RAM,
+        // and only reliable on Performance/High tiers.
+        let mlock_safe = matches!(tier, HardwareTier::Performance | HardwareTier::High)
+            && total_ram_mb >= model_size_mb.saturating_add(4 * 1024).saturating_add(model_size_mb);
+        if !mlock_safe {
+            self.mlock = false;
+        }
+
+        // Safety margin (MB held back by the watchdog for OS/desktop apps).
+        // On low-RAM tiers we want a much larger margin to keep the system
+        // responsive even when the model spikes.
+        let min_safety = match tier {
+            HardwareTier::Lite => 1024,
+            HardwareTier::Standard => 768,
+            HardwareTier::Performance => 512,
+            HardwareTier::High => 256,
+        };
+        if self.safety_margin_mb < min_safety {
+            self.safety_margin_mb = min_safety;
+        }
+
+        // Telemetry poll interval — lower tiers should not hammer NVML/sysinfo.
+        if matches!(tier, HardwareTier::Lite) && self.poll_interval_secs < 5 {
+            self.poll_interval_secs = 5;
+        }
+
+        // Idle release: aggressive on Lite/Standard so the model is dropped
+        // when not in use; lazy on Performance/High where users want low
+        // first-token latency.
+        match tier {
+            HardwareTier::Lite => {
+                self.idle_release_enabled = true;
+                if self.idle_release_after_secs > 60 {
+                    self.idle_release_after_secs = 60;
+                }
+            }
+            HardwareTier::Standard => {
+                self.idle_release_enabled = true;
+                if self.idle_release_after_secs > 180 {
+                    self.idle_release_after_secs = 180;
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -469,12 +648,66 @@ impl Default for VoiceConfig {
             push_to_talk_key: "ctrl+space".into(),
             language: "auto".into(),
             partial_update_ms: 2000,
+            enable_partial_transcripts: false,
             confidence_threshold: 0.30,
             noise_suppression_mode: "off".into(),
             follow_system_default_mic: true,
             follow_system_default_speaker: true,
             persist_transcripts: true,
             persist_raw_audio: false,
+            engine: "v1".into(),
+            tier: "auto".into(),
+            stt_engine: "auto".into(),
+            tts_engine: "auto".into(),
+            wake_word: WakeWordConfig::default(),
+            aec: AecConfig::default(),
+            barge_in: BargeInConfig::default(),
+            post_edit: PostEditConfig::default(),
+        }
+    }
+}
+
+impl Default for WakeWordConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model_path: "models/wake/hey_ria.onnx".into(),
+            sensitivity: 0.5,
+            aliases: vec![
+                "hey ria".into(),
+                "hey riya".into(),
+                "hello ria".into(),
+                "hello riya".into(),
+            ],
+        }
+    }
+}
+
+impl Default for AecConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            aggressiveness: "medium".into(),
+        }
+    }
+}
+
+impl Default for BargeInConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_speech_ms: 180,
+        }
+    }
+}
+
+impl Default for PostEditConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            model: "qwen2.5-3b-instruct".into(),
+            mode: "on_low_confidence".into(),
+            timeout_ms: 0, // 0 = use tier default
         }
     }
 }
@@ -885,6 +1118,147 @@ impl Default for RoutingConfig {
             ood_z_threshold: 0.5,
             ood_entropy_threshold: 0.85,
             multi_intent_margin: 0.04,
+        }
+    }
+}
+
+// ─── Image Generation Configuration ──────────────────────────────────────────
+
+/// Image generation subsystem configuration.
+///
+/// Controls ComfyUI sidecar lifecycle, model selection, Tier B swap budget,
+/// cloud fallback policy, and background pre-warm strategy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ImageGenerationConfig {
+    /// Enable image generation tool. When false, `generate_image` returns a
+    /// friendly "feature disabled" message.
+    pub enabled: bool,
+
+    /// Manual image-gen tier override: "s_high_res" | "a_standard" |
+    /// "b_drop_swap" | "c_reject_or_cloud". Empty string = auto-detect from
+    /// VRAM at request time. Also overridable via KRIA_IMG_TIER env var.
+    pub tier_override: String,
+
+    /// Port for the headless ComfyUI API server.
+    pub comfy_port: u16,
+
+    /// Directory where ComfyUI venv is provisioned (`uv sync`).
+    /// Relative paths are expanded under `~/.kria/`.
+    pub comfy_venv_dir: String,
+
+    /// Directory for ComfyUI model checkpoints (GGUF).
+    pub comfy_models_dir: String,
+
+    /// Directory for generated image output.
+    pub output_dir: String,
+
+    /// Directory for conditioning tensor cache (SHA-256 indexed).
+    pub conditioning_cache_dir: String,
+
+    /// Maximum MiB for the conditioning tensor LRU cache.
+    pub conditioning_cache_max_mb: u64,
+
+    /// Idle timeout in seconds before the ComfyUI sidecar unloads Flux from
+    /// VRAM (keeping Python/CUDA context alive). 0 = never.
+    pub idle_unload_secs: u64,
+
+    /// Pre-warm strategy: "auto" | "always" | "never".
+    /// "auto" → Tier S/A pre-warm fully at boot (after 30s delay);
+    ///           Tier B pre-warm interpreter only.
+    pub prewarm: String,
+
+    /// Seconds after app window-ready to start the background pre-warm task.
+    pub prewarm_delay_secs: u64,
+
+    /// Cloud fallback policy on Tier C: "auto_offer" | "opt_in" | "off".
+    /// "auto_offer" = ask once per session then use without prompting.
+    pub cloud_fallback: String,
+
+    /// Pollinations.ai base URL (cloud fallback, no key required).
+    pub pollinations_base_url: String,
+
+    /// Maximum concurrent image jobs per session (Tier S/A only).
+    pub max_concurrent_jobs: usize,
+
+    /// Maximum Tier B drop-and-swap jobs queued before rejecting new ones.
+    pub max_queued_swap_jobs: usize,
+
+    /// Seconds to wait for the ComfyUI /system_stats health-check on startup.
+    pub health_check_timeout_secs: u64,
+
+    /// Swap defragmentation: restart the ComfyUI sidecar after this many
+    /// drop-and-swap cycles to clear VRAM fragmentation. 0 = disabled.
+    pub defrag_every_n_swaps: usize,
+
+    /// Per-style default LoRA strength (0.0–1.0).
+    pub default_lora_strength: f32,
+
+    /// Default quality profile when the caller does not specify one.
+    /// One of: "fast" | "balanced" | "high". Default: "balanced".
+    pub default_quality: String,
+
+    /// Checkpoint filename for SDXL high-quality path (JuggernautXL / Lightning variant).
+    pub sdxl_model_high: String,
+
+    /// Master switch for the SDXL High profile.  Requires Tier S + model file.
+    pub enable_sdxl_high_profile: bool,
+
+    /// Ordered list of cloud providers to try.  Recognised values: "pollinations", "hf_flux".
+    pub cloud_providers: Vec<String>,
+
+    /// Per-image timeout for local ComfyUI generation (seconds).
+    /// 0 = use hard-coded 5-minute cap.
+    pub local_timeout_secs: u64,
+
+    /// HuggingFace Inference API token for the hf_flux provider.
+    /// Empty string = provider silently skipped.
+    pub hf_inference_token: String,
+
+    /// Prompt enhancement mode: "auto" | "always" | "never".
+    /// "auto" = enhance only when the raw prompt is short (< 50 chars).
+    pub prompt_enhance_mode: String,
+
+    /// Image generation routing mode.
+    /// One of: "auto" | "local_only" | "cloud_only" |
+    ///         "local_with_cloud_fallback" | "cloud_with_local_fallback".
+    /// Override at runtime with `KRIA_IMAGE_MODE` env var (env takes priority).
+    pub image_mode: String,
+}
+
+impl Default for ImageGenerationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            tier_override: String::new(),
+            comfy_port: 8188,
+            comfy_venv_dir: "comfyui/.venv".into(),
+            comfy_models_dir: "comfyui/models".into(),
+            output_dir: "cache/images".into(),
+            conditioning_cache_dir: "cache/conditioning".into(),
+            conditioning_cache_max_mb: 500,
+            idle_unload_secs: 300,   // 5 minutes
+            prewarm: "auto".into(),
+            prewarm_delay_secs: 30,
+            cloud_fallback: "auto_offer".into(),
+            pollinations_base_url: "https://image.pollinations.ai".into(),
+            max_concurrent_jobs: 2,
+            max_queued_swap_jobs: 4,
+            // 60s was tight for cold ComfyUI starts: scanning models, importing
+            // ComfyUI-GGUF / ControlNet custom nodes, and CUDA context init can
+            // easily push past 90s on a cold disk or older GPU. 180s gives
+            // headroom; the early-exit detector still fast-fails on real errors.
+            health_check_timeout_secs: 180,
+            defrag_every_n_swaps: 15,
+            default_lora_strength: 0.85,
+            default_quality: "balanced".into(),
+            sdxl_model_high: "juggernautXL_v9Lightning.safetensors".into(),
+            enable_sdxl_high_profile: false,
+            cloud_providers: vec!["pollinations".into(), "hf_flux".into()],
+            local_timeout_secs: 180,
+            hf_inference_token: String::new(),
+            prompt_enhance_mode: "auto".into(),
+            image_mode: "auto".into(),
         }
     }
 }

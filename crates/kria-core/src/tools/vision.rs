@@ -410,12 +410,13 @@ impl ToolHandler for ScreenshotAnalyze {
 
         // Take screenshot first
         if cfg!(target_os = "linux") {
-            let tools = ["gnome-screenshot", "scrot", "import"];
+            let tools = ["maim", "scrot", "gnome-screenshot", "import"];
             let mut captured = false;
             for tool in &tools {
-                let args = match *tool {
-                    "gnome-screenshot" => vec!["-f", output_path],
+                let args: Vec<&str> = match *tool {
+                    "maim" => vec![output_path],
                     "scrot" => vec![output_path],
+                    "gnome-screenshot" => vec!["-f", output_path],
                     "import" => vec!["-window", "root", output_path],
                     _ => continue,
                 };
@@ -424,14 +425,14 @@ impl ToolHandler for ScreenshotAnalyze {
                     .output()
                     .await;
                 if let Ok(o) = out {
-                    if o.status.success() {
+                    if o.status.success() && std::path::Path::new(output_path).exists() {
                         captured = true;
                         break;
                     }
                 }
             }
             if !captured {
-                return ToolResult::err("no screenshot tool available");
+                return ToolResult::err("no screenshot tool available (install maim or scrot: sudo apt install maim)");
             }
         } else {
             return ToolResult::err("screenshot not supported on this OS");

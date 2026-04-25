@@ -196,7 +196,7 @@ mod tests {
             per_layer_vram_mb: 128,
             base_vram_overhead_mb: 200,
             kv_per_1k_ctx_mb: 100,
-            min_context: 2048,
+            min_context: 4096,
             max_context: 8192,
             has_vision_projector: true,
             mmproj_vram_mb: 0,

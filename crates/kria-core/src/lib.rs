@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod automation;
 pub mod config;
+pub mod image;
 pub mod infra;
 pub mod llm;
 pub mod mcp;

@@ -223,6 +223,18 @@ impl LlamaServerManager {
         cmd.arg("--n-gpu-layers").arg(ngl.to_string());
         cmd.arg("--batch-size").arg(tuning.batch_size.to_string());
 
+        // --slot-save-path enables `/slots/{id}?action=save|restore`, used
+        // by the Tier B drop-and-swap path to persist conversational KV
+        // cache across the hard process restart that frees VRAM. We always
+        // pass it (modern llama.cpp versions ignore it harmlessly when the
+        // endpoint is unused).
+        let slot_dir = self.resolve_slot_save_path();
+        if let Err(e) = std::fs::create_dir_all(&slot_dir) {
+            tracing::warn!(?e, path = %slot_dir.display(),
+                "server_manager: failed to create slot-save dir; KV restore across swaps may fail");
+        }
+        cmd.arg("--slot-save-path").arg(&slot_dir);
+
         if let Some(ubatch) = tuning.ubatch_size {
             cmd.arg("--ubatch-size").arg(ubatch.to_string());
         }
@@ -238,8 +250,20 @@ impl LlamaServerManager {
         if self.config.flash_attention {
             cmd.arg("--flash-attn").arg("on");
         }
+        // mlock pre-flight: even if config requests mlock, never pass --mlock
+        // to llama-server when the OS doesn't have enough headroom to pin the
+        // model file plus a 2 GB safety buffer. Doing so on a low-RAM box is a
+        // guaranteed system freeze.
         if self.config.mlock {
-            cmd.arg("--mlock");
+            if mlock_is_safe(&self.model_path) {
+                cmd.arg("--mlock");
+            } else {
+                tracing::warn!(
+                    model_path = %self.model_path,
+                    "server_manager: mlock requested but free RAM is insufficient — \
+                     dropping --mlock to avoid OOM/freeze"
+                );
+            }
         }
 
         // Vision projector (mmproj)
@@ -535,6 +559,144 @@ impl LlamaServerManager {
         self.state.store(STATE_STOPPED, Ordering::Release);
         self.swap_done.notify_waiters();
     }
+
+    /// Resolve the configured `--slot-save-path` to an absolute directory.
+    /// Empty / unset config falls back to `<system_tmp>/kria_llama_slots`.
+    pub fn resolve_slot_save_path(&self) -> std::path::PathBuf {
+        let raw = self.config.slot_save_path.trim();
+        if raw.is_empty() {
+            std::env::temp_dir().join("kria_llama_slots")
+        } else {
+            std::path::PathBuf::from(raw)
+        }
+    }
+
+    /// Best-effort: persist a single slot's KV cache to disk via
+    /// `POST /slots/{id_slot}?action=save` (llama.cpp HTTP API).
+    ///
+    /// Used by the Tier B swap to preserve conversational context across
+    /// the hard process restart that frees VRAM. Returns `true` on HTTP 200,
+    /// `false` on any failure (logged at debug level — this is an
+    /// optimisation, never a correctness requirement).
+    pub async fn save_slot_kv(&self, slot_id: u32, filename: &str) -> bool {
+        let api_url = self.api_url();
+        if api_url.is_empty() {
+            return false;
+        }
+        // api_url ends in "/v1" — slots endpoints are on the server root.
+        let root = api_url.strip_suffix("/v1").unwrap_or(&api_url);
+        let url = format!("{}/slots/{}?action=save", root, slot_id);
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        match client
+            .post(&url)
+            .json(&serde_json::json!({ "filename": filename }))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                tracing::info!(slot_id, filename, "server_manager: slot KV cache saved");
+                true
+            }
+            Ok(resp) => {
+                tracing::debug!(
+                    slot_id,
+                    filename,
+                    status = %resp.status(),
+                    "server_manager: slot save returned non-200 (continuing without snapshot)"
+                );
+                false
+            }
+            Err(e) => {
+                tracing::debug!(?e, slot_id, "server_manager: slot save request failed");
+                false
+            }
+        }
+    }
+
+    /// Best-effort counterpart to `save_slot_kv`. Restores the KV cache from
+    /// disk into slot `slot_id` after the server has been respawned. Failure
+    /// only means the user's prior turn context is lost — the next prompt
+    /// will simply re-prefill from scratch.
+    pub async fn restore_slot_kv(&self, slot_id: u32, filename: &str) -> bool {
+        let api_url = self.api_url();
+        if api_url.is_empty() {
+            return false;
+        }
+        let root = api_url.strip_suffix("/v1").unwrap_or(&api_url);
+        let url = format!("{}/slots/{}?action=restore", root, slot_id);
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        match client
+            .post(&url)
+            .json(&serde_json::json!({ "filename": filename }))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                tracing::info!(slot_id, filename, "server_manager: slot KV cache restored");
+                true
+            }
+            Ok(resp) => {
+                tracing::debug!(
+                    slot_id,
+                    filename,
+                    status = %resp.status(),
+                    "server_manager: slot restore returned non-200"
+                );
+                false
+            }
+            Err(e) => {
+                tracing::debug!(?e, slot_id, "server_manager: slot restore request failed");
+                false
+            }
+        }
+    }
+}
+
+/// Pre-flight check: is it safe to pass `--mlock` to llama-server?
+///
+/// Returns `true` only when the host has at least
+/// `model_size_bytes + 2 GiB` of *available* RAM (i.e. unused + reclaimable
+/// page cache). On any I/O error or detection failure we fail-closed and
+/// return `false`, so the worst case is "model loads without mlock" rather
+/// than "system freezes".
+fn mlock_is_safe(model_path: &str) -> bool {
+    let model_size = match std::fs::metadata(model_path) {
+        Ok(m) => m.len(),
+        Err(e) => {
+            tracing::debug!(?e, "mlock_is_safe: cannot stat model file");
+            return false;
+        }
+    };
+
+    // sysinfo::System::available_memory() returns bytes (sysinfo 0.32+).
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    let available_bytes = sys.available_memory();
+
+    let headroom: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+    let needed = model_size.saturating_add(headroom);
+    let safe = available_bytes >= needed;
+
+    tracing::debug!(
+        model_size_mb = model_size / (1024 * 1024),
+        available_mb = available_bytes / (1024 * 1024),
+        needed_mb = needed / (1024 * 1024),
+        safe,
+        "mlock_is_safe: pre-flight RAM check"
+    );
+    safe
 }
 
 #[cfg(test)]

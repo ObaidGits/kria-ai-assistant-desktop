@@ -80,7 +80,7 @@ async fn search_duckduckgo_lite(query: &str, max_results: usize) -> Result<Vec<S
         let resp = client
             .get("https://lite.duckduckgo.com/lite/")
             .query(&[("q", query)])
-            .header("User-Agent", "KRIA/0.1")
+            .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
             .send()
             .await;
 
@@ -174,7 +174,9 @@ impl ToolHandler for FetchWebpage {
         for attempt in 0..WEB_RETRY_ATTEMPTS {
             let resp = client
                 .get(safe_url.clone())
-                .header("User-Agent", "KRIA/0.1")
+                .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                .header("Accept-Language", "en-US,en;q=0.5")
                 .send()
                 .await;
 
@@ -186,14 +188,15 @@ impl ToolHandler for FetchWebpage {
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("")
                         .to_ascii_lowercase();
-                    if !content_type.is_empty()
-                        && !content_type.contains("text/")
-                        && !content_type.contains("html")
-                        && !content_type.contains("xml")
-                        && !content_type.contains("json")
-                    {
+                    // Only block binary formats; allow missing/empty CT (usually HTML)
+                    let is_binary = !content_type.is_empty()
+                        && (content_type.starts_with("image/")
+                            || content_type.starts_with("audio/")
+                            || content_type.starts_with("video/")
+                            || content_type.starts_with("font/"));
+                    if is_binary {
                         return ToolResult::err(format!(
-                            "unsupported content type: {content_type}"
+                            "unsupported binary content type: {content_type}"
                         ));
                     }
 
